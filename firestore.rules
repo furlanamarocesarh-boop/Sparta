@@ -7,8 +7,38 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    function isAdmin() {
+    // ADMIN AUTHORIZATION — TRANSITIONAL.
+    //
+    // Accepts EITHER:
+    //   1. the `admin` custom claim (the target state), OR
+    //   2. the legacy hard-coded administrator UID (temporary compatibility).
+    //
+    // The UID fallback exists ONLY so the existing administrator is not locked
+    // out the moment these rules are published. Removing it before the claim is
+    // live would be an outage, not a hardening.
+    //
+    // REMOVE THE UID FALLBACK ONLY AFTER ALL THREE ARE TRUE
+    // (full procedure in docs/admin-transition.md):
+    //   1. the `admin: true` custom claim has been assigned to the administrator;
+    //   2. that administrator's ID token has been REFRESHED — claims are baked
+    //      into the token, so an un-refreshed token still lacks the claim;
+    //   3. admin operations (testdeposit, payprize, tournament writes) have been
+    //      verified working with the claim alone.
+    //
+    // `== true` is deliberate: a truthy value such as the string "false" must
+    // never grant administrator access.
+    function hasAdminClaim() {
+      return signedIn() && request.auth.token.get('admin', false) == true;
+    }
+
+    // COMPATIBILITY CONSTANT — TEMPORARY. Mirrors LEGACY_ADMIN_UID in
+    // functions/src/domain/adminAuth.ts. Delete both together.
+    function isLegacyAdmin() {
       return signedIn() && request.auth.uid == "Fnj4w17GGeP7XgQ5yF3gXTL1yR42";
+    }
+
+    function isAdmin() {
+      return hasAdminClaim() || isLegacyAdmin();
     }
 
     function isOwnerByUid(uid) {

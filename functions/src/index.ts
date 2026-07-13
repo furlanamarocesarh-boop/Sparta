@@ -1,7 +1,62 @@
 import * as admin from "firebase-admin";
 import { auth, https } from "firebase-functions/v1";
 
+import { assertAdmin, assertSignedIn } from "./domain/adminAuth.js";
+import { DomainError } from "./domain/errors.js";
+import {
+  addCentavos,
+  centavosToReais,
+  storedReaisToCentavos,
+  toCentavos,
+} from "./domain/money.js";
+import {
+  credit,
+  debit,
+  validateDepositAmount,
+  validateEntryFee,
+  validatePrizeAmount,
+  validateWithdrawalAmount,
+} from "./domain/operations.js";
+import {
+  isFull,
+  newTournamentParticipantFields,
+  participantIncrementUpdate,
+  readParticipantCounts,
+} from "./domain/tournamentFields.js";
+
 admin.initializeApp();
+
+const db = admin.firestore();
+
+/**
+ * PHASE 2.5B HARDENING — what changed, and what deliberately did NOT.
+ *
+ * UNCHANGED (production compatibility — no data migration required):
+ *  - every exported function name, with its exact casing;
+ *  - callable argument names (`amount`, `externalid`, `pixkey`, `tournamentid`,
+ *    `winneruid`, `entry_fee`, `prize`, `max_players`, `game_mode`, ...);
+ *  - collection names, document ids, and transaction `category` values;
+ *  - Firestore money fields, which remain NUMBERS OF REAIS.
+ *
+ * CHANGED (internal only):
+ *  - all money arithmetic runs on exact integer centavos and is converted back
+ *    to reais only when written. Doubles drift; integers do not.
+ *  - the admin UID check, previously duplicated inside two functions, is now a
+ *    single transitional check that also accepts an `admin: true` custom claim.
+ *  - tournament participant counts are read canonically with a legacy fallback,
+ *    and both field pairs are advanced together.
+ */
+
+/** Converts a domain failure into the HttpsError the client already expects. */
+function toHttpsError(error: unknown): https.HttpsError {
+  if (error instanceof https.HttpsError) return error;
+  if (error instanceof DomainError) {
+    return new https.HttpsError(error.code, error.message);
+  }
+  console.error("Unexpected error:", error);
+  return new https.HttpsError("internal", "Erro interno.");
+}
+
 function generateExternalId(prefix: string): string {
   const timestamp = Date.now();
   const random = Math.random().toString(36).substring(2, 10);
@@ -18,13 +73,21 @@ function getExternalId(data: { externalid?: unknown }, prefix: string): string {
 
   return generateExternalId(prefix);
 }
-const db = admin.firestore();
 
 function generatePlayerId(): string {
   const rand = Math.floor(100000 + Math.random() * 900000);
   return `PLR-${rand}`;
 }
 
+/**
+ * Creates the user profile and wallet. UNCHANGED from the deployed version:
+ * this trigger remains the authoritative creator of `users/{uid}` and
+ * `wallets/{uid}`, and the mobile client writes neither.
+ *
+ * KNOWN ISSUE (see `docs/username.md`): `username` is seeded empty, and this
+ * trigger cannot reliably read a display name the client sets afterwards.
+ * Fixing that needs an authenticated callable, deliberately NOT added here.
+ */
 export const onUserCreated = auth.user().onCreate(async (user) => {
   const uid = user.uid;
   const email = user.email ?? "";
@@ -65,289 +128,178 @@ export const onUserCreated = auth.user().onCreate(async (user) => {
     );
   }
 });
+
 export const testdeposit = https.onCall(async (data, context) => {
-  console.log("========== testdeposit CALLED ==========");
-  console.log("auth exists:", !!context.auth);
-  console.log("data received:", data);
-
-  if (!context.auth) {
-    throw new https.HttpsError(
-      "unauthenticated",
-      "Você precisa estar logado para fazer depósito."
-    );
-  }
-
-  const uid = context.auth.uid;
-
-  const allowedAdminUid = "Fnj4w17GGeP7XgQ5yF3gXTL1yR42";
-
-  if (uid !== allowedAdminUid) {
-    throw new https.HttpsError(
-      "permission-denied",
+  try {
+    const callerAuth = assertAdmin(
+      context,
+      "Você precisa estar logado para fazer depósito.",
       "Apenas admin pode fazer depósito de teste."
     );
+
+    const uid = callerAuth.uid;
+
+    const amountCentavos = validateDepositAmount(data.amount);
+    const externalId = getExternalId(data, "deposit");
+
+    const walletRef = db.collection("wallets").doc(uid);
+    const userRef = db.collection("users").doc(uid);
+    const transactionRef = db.collection("transactions").doc(externalId);
+
+    await db.runTransaction(async (transaction) => {
+      const existingTransaction = await transaction.get(transactionRef);
+
+      // Idempotency: the same externalid must never be applied twice.
+      if (existingTransaction.exists) {
+        throw new DomainError(
+          "already-exists",
+          "Já existe uma transação com esse externalid."
+        );
+      }
+
+      const walletSnap = await transaction.get(walletRef);
+      const walletData = walletSnap.exists ? walletSnap.data() ?? {} : {};
+
+      const previousBalance = storedReaisToCentavos(
+        walletData.balance ?? 0,
+        "saldo da carteira"
+      );
+      const totalDeposited = storedReaisToCentavos(
+        walletData.total_deposited ?? 0,
+        "total depositado"
+      );
+
+      const newBalance = credit(previousBalance, amountCentavos);
+      const newTotalDeposited = addCentavos(totalDeposited, amountCentavos);
+
+      transaction.set(
+        walletRef,
+        {
+          balance: centavosToReais(newBalance),
+          total_deposited: centavosToReais(newTotalDeposited),
+          user_ref: userRef,
+        },
+        { merge: true }
+      );
+
+      transaction.set(transactionRef, {
+        amount: centavosToReais(amountCentavos),
+        category: "deposit",
+        user_ref: userRef,
+        display_name: "Test Deposit",
+        tournament_ref: null,
+        previous_balance: centavosToReais(previousBalance),
+        balance_after: centavosToReais(newBalance),
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        status: "completed",
+        external_id: externalId,
+      });
+    });
+
+    return {
+      success: true,
+      message: "Depósito de teste realizado com sucesso.",
+      externalid: externalId,
+      amount: centavosToReais(amountCentavos),
+    };
+  } catch (error) {
+    console.error("testdeposit error:", error);
+    throw toHttpsError(error);
   }
+});
 
-  const amount = Number(data.amount);
-  const externalId = getExternalId(data, "deposit");
-
-  console.log("uid:", uid);
-  console.log("amount:", amount);
-  console.log("externalId:", externalId);
-
-  if (!uid) {
-    throw new https.HttpsError(
-      "unauthenticated",
-      "UID não encontrado."
+export const requestwithdrawal = https.onCall(async (data, context) => {
+  try {
+    const callerAuth = assertSignedIn(
+      context,
+      "Você precisa estar logado para solicitar saque."
     );
-  }
 
-  if (!amount || amount <= 0) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "Amount precisa ser maior que zero."
-    );
-  }
-  const db = admin.firestore();
+    const uid = callerAuth.uid;
 
-  const walletRef = db.collection("wallets").doc(uid);
-  const userRef = db.collection("users").doc(uid);
-  const transactionRef = db.collection("transactions").doc(externalId);
+    // Enforces the R$5,00 minimum and R$10.000,00 maximum, unchanged.
+    const amountCentavos = validateWithdrawalAmount(data.amount);
 
-  console.log("walletRef path:", walletRef.path);
-  console.log("userRef path:", userRef.path);
-  console.log("transactionRef path:", transactionRef.path);
+    const pixkey = String(data.pixkey || "").trim();
 
-  await db.runTransaction(async (transaction) => {
-    console.log("Starting Firestore transaction");
+    if (!pixkey) {
+      throw new DomainError("invalid-argument", "A chave PIX é obrigatória.");
+    }
 
-    const existingTransaction = await transaction.get(transactionRef);
+    if (pixkey.length < 5 || pixkey.length > 140) {
+      throw new DomainError("invalid-argument", "Chave PIX inválida.");
+    }
 
-    if (existingTransaction.exists) {
-      throw new https.HttpsError(
-        "already-exists",
-        "Já existe uma transação com esse externalid."
+    // Blocks control characters and other invisible junk.
+    if (/[\x00-\x1F\x7F]/.test(pixkey)) {
+      throw new DomainError(
+        "invalid-argument",
+        "Chave PIX contém caracteres inválidos."
       );
     }
 
-    const walletSnap = await transaction.get(walletRef);
+    const userRef = db.collection("users").doc(uid);
+    const walletRef = db.collection("wallets").doc(uid);
 
-    let previousBalance = 0;
-    let totalDeposited = 0;
+    const externalid = generateExternalId("withdrawal");
 
-    if (walletSnap.exists) {
-      const walletData = walletSnap.data() || {};
+    const transactionRef = db.collection("transactions").doc(externalid);
+    const withdrawalRef = db.collection("withdrawals").doc(externalid);
 
-      previousBalance =
-        typeof walletData.balance === "number" ? walletData.balance : 0;
-
-      totalDeposited =
-        typeof walletData.total_deposited === "number"
-          ? walletData.total_deposited
-          : 0;
-    }
-
-    const newBalance = previousBalance + amount;
-    const newTotalDeposited = totalDeposited + amount;
-
-    transaction.set(
-      walletRef,
-      {
-        balance: newBalance,
-        total_deposited: newTotalDeposited,
-        user_ref: userRef,
-      },
-      { merge: true }
-    );
-
-    transaction.set(transactionRef, {
-      amount: amount,
-      category: "deposit",
-      user_ref: userRef,
-      display_name: "Test Deposit",
-      tournament_ref: null,
-      previous_balance: previousBalance,
-      balance_after: newBalance,
-      timestamp: admin.firestore.FieldValue.serverTimestamp(),
-      status: "completed",
-      external_id: externalId,
-    });
-
-    console.log("Deposit transaction prepared:", {
-      uid,
-      externalId,
-      previousBalance,
-      newBalance,
-    });
-  });
-
-  console.log("========== testdeposit SUCCESS ==========");
-
-  return {
-    success: true,
-    message: "Depósito de teste realizado com sucesso.",
-    externalid: externalId,
-    amount: amount,
-  };
-});
-exports.requestwithdrawal = https.onCall(async (data, context) => {
-  // 1. Precisa estar logado
-  if (!context.auth) {
-    throw new https.HttpsError(
-      "unauthenticated",
-      "Você precisa estar logado para solicitar saque."
-    );
-  }
-
-  const uid = context.auth.uid;
-
-  // 2. Ler parâmetros
-  const rawAmount = data.amount;
-  const rawPixkey = data.pixkey;
-
-  const amount = Number(rawAmount);
-  const pixkey = String(rawPixkey || "").trim();
-
-  // 3. Validações do amount
-  if (!Number.isFinite(amount)) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "Valor de saque inválido."
-    );
-  }
-
-  if (amount <= 0) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "O valor do saque precisa ser maior que zero."
-    );
-  }
-
-  const amountRounded = Math.round(amount * 100) / 100;
-
-  if (amount !== amountRounded) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "O valor do saque pode ter no máximo 2 casas decimais."
-    );
-  }
-
-  const minimumWithdrawal = 5;
-
-  if (amount < minimumWithdrawal) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      `O saque mínimo é R$${minimumWithdrawal}.`
-    );
-  }
-
-  const maximumWithdrawal = 10000;
-
-  if (amount > maximumWithdrawal) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "Valor de saque acima do limite permitido."
-    );
-  }
-
-  // 4. Validação básica da chave PIX
-  if (!pixkey) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "A chave PIX é obrigatória."
-    );
-  }
-
-  if (pixkey.length < 5 || pixkey.length > 140) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "Chave PIX inválida."
-    );
-  }
-
-  // Bloqueia caracteres invisíveis/estranhos
-  if (/[\x00-\x1F\x7F]/.test(pixkey)) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "Chave PIX contém caracteres inválidos."
-    );
-  }
-
-  const db = admin.firestore();
-
-  const userRef = db.collection("users").doc(uid);
-  const walletRef = db.collection("wallets").doc(uid);
-
-  // externalid automático
-  const externalid = generateExternalId("withdrawal");
-
-  const transactionRef = db.collection("transactions").doc(externalid);
-  const withdrawalRef = db.collection("withdrawals").doc(externalid);
-
-  try {
     await db.runTransaction(async (transaction) => {
       const walletSnap = await transaction.get(walletRef);
 
       if (!walletSnap.exists) {
-        throw new https.HttpsError(
+        throw new DomainError(
           "failed-precondition",
           "Carteira não encontrada."
         );
       }
 
-      const walletData = walletSnap.data() || {};
-      const currentBalance = Number(walletData.balance || 0);
+      const walletData = walletSnap.data() ?? {};
 
-      if (!Number.isFinite(currentBalance)) {
-        throw new https.HttpsError(
-          "failed-precondition",
-          "Saldo inválido na carteira."
-        );
-      }
+      const previousBalance = storedReaisToCentavos(
+        walletData.balance ?? 0,
+        "saldo da carteira"
+      );
+      const totalWithdrawn = storedReaisToCentavos(
+        walletData.total_withdrawn ?? 0,
+        "total sacado"
+      );
 
-      if (currentBalance < amount) {
-        throw new https.HttpsError(
-          "failed-precondition",
-          "Saldo insuficiente."
-        );
-      }
-
-      const balanceAfter = Math.round((currentBalance - amount) * 100) / 100;
-      const previousBalance = Math.round(currentBalance * 100) / 100;
-
-      if (balanceAfter < 0) {
-        throw new https.HttpsError(
-          "failed-precondition",
-          "Saldo insuficiente."
-        );
-      }
+      // Enforces "you cannot withdraw more than you have".
+      const balanceAfter = debit(previousBalance, amountCentavos);
 
       transaction.update(walletRef, {
-        balance: balanceAfter,
-        total_withdrawn: admin.firestore.FieldValue.increment(amount),
+        balance: centavosToReais(balanceAfter),
+        // Computed from the value read inside this transaction rather than
+        // FieldValue.increment(): increment() adds floats, which drift.
+        total_withdrawn: centavosToReais(
+          addCentavos(totalWithdrawn, amountCentavos)
+        ),
       });
 
       transaction.set(transactionRef, {
-        amount: amount,
+        amount: centavosToReais(amountCentavos),
         category: "withdrawal",
         user_ref: userRef,
         display_name: "Saque",
         tournament_ref: null,
-        previous_balance: previousBalance,
-        balance_after: balanceAfter,
+        previous_balance: centavosToReais(previousBalance),
+        balance_after: centavosToReais(balanceAfter),
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
         status: "pending",
         external_id: externalid,
       });
 
       transaction.set(withdrawalRef, {
-        amount: amount,
+        amount: centavosToReais(amountCentavos),
         user_ref: userRef,
         status: "pending",
         pix_key_snapshot: pixkey,
         transaction_ref: transactionRef,
 
-        // Campos preparados para API PIX futura
+        // Reserved for the future PIX provider integration.
         provider: null,
         provider_status: null,
         pix_tx_id: null,
@@ -362,212 +314,133 @@ exports.requestwithdrawal = https.onCall(async (data, context) => {
     return {
       success: true,
       externalid: externalid,
-      amount: amount,
+      amount: centavosToReais(amountCentavos),
       status: "pending",
     };
   } catch (error) {
     console.error("requestwithdrawal error:", error);
-
-    if (error instanceof https.HttpsError) {
-      throw error;
-    }
-
-    throw new https.HttpsError(
-      "internal",
-      "Erro ao solicitar saque."
-    );
+    throw toHttpsError(error);
   }
 });
-exports.jointournament = https.onCall(async (data, context) => {
-  // 1. Precisa estar logado
-  if (!context.auth) {
-    throw new https.HttpsError(
-      "unauthenticated",
+
+export const jointournament = https.onCall(async (data, context) => {
+  try {
+    const callerAuth = assertSignedIn(
+      context,
       "Você precisa estar logado para entrar no torneio."
     );
-  }
 
-  const uid = context.auth.uid;
+    const uid = callerAuth.uid;
 
-  // 2. Ler e validar tournamentid
-  const tournamentid = String(data.tournamentid || "").trim();
+    const tournamentid = String(data.tournamentid || "").trim();
 
-  if (!tournamentid) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "ID do torneio é obrigatório."
-    );
-  }
+    if (!tournamentid) {
+      throw new DomainError("invalid-argument", "ID do torneio é obrigatório.");
+    }
 
-  if (tournamentid.includes("/") || tournamentid.length > 200) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "ID do torneio inválido."
-    );
-  }
+    if (tournamentid.includes("/") || tournamentid.length > 200) {
+      throw new DomainError("invalid-argument", "ID do torneio inválido.");
+    }
 
-  const db = admin.firestore();
+    const userRef = db.collection("users").doc(uid);
+    const walletRef = db.collection("wallets").doc(uid);
+    const tournamentRef = db.collection("tournaments").doc(tournamentid);
 
-  const userRef = db.collection("users").doc(uid);
-  const walletRef = db.collection("wallets").doc(uid);
-  const tournamentRef = db.collection("tournaments").doc(tournamentid);
+    // Deterministic id — this is what makes double registration impossible.
+    const registrationid = `${uid}_${tournamentid}`;
+    const registrationRef = db.collection("registrations").doc(registrationid);
 
-  // ID determinístico impede inscrição duplicada no mesmo torneio
-  const registrationid = `${uid}_${tournamentid}`;
-  const registrationRef = db.collection("registrations").doc(registrationid);
+    const externalid = generateExternalId("entryfee");
+    const transactionRef = db.collection("transactions").doc(externalid);
 
-  // Transaction ID automático
-  const externalid = generateExternalId("entryfee");
-  const transactionRef = db.collection("transactions").doc(externalid);
-
-  try {
     await db.runTransaction(async (transaction) => {
-      // 3. Ler docs dentro da transaction
       const walletSnap = await transaction.get(walletRef);
       const tournamentSnap = await transaction.get(tournamentRef);
       const registrationSnap = await transaction.get(registrationRef);
 
-      // 4. Validar wallet
       if (!walletSnap.exists) {
-        throw new https.HttpsError(
+        throw new DomainError(
           "failed-precondition",
           "Carteira não encontrada."
         );
       }
 
-      const walletData = walletSnap.data() || {};
-      const currentBalance = Number(walletData.balance || 0);
-
-      if (!Number.isFinite(currentBalance)) {
-        throw new https.HttpsError(
-          "failed-precondition",
-          "Saldo inválido na carteira."
-        );
-      }
-
-      // 5. Validar torneio
       if (!tournamentSnap.exists) {
-        throw new https.HttpsError(
-          "not-found",
-          "Torneio não encontrado."
-        );
+        throw new DomainError("not-found", "Torneio não encontrado.");
       }
 
-      const tournamentData = tournamentSnap.data() || {};
-
-      const status = String(tournamentData.status || "").trim().toLowerCase();
-
-      if (status !== "open") {
-        throw new https.HttpsError(
-          "failed-precondition",
-          "Este torneio não está aberto para inscrições."
-        );
-      }
-
-      const entryFee = Number(tournamentData.entry_fee);
-
-      if (!Number.isFinite(entryFee)) {
-        throw new https.HttpsError(
-          "failed-precondition",
-          "Taxa de entrada inválida."
-        );
-      }
-
-      if (entryFee <= 0) {
-        throw new https.HttpsError(
-          "failed-precondition",
-          "Taxa de entrada precisa ser maior que zero."
-        );
-      }
-
-      const entryFeeRounded = Math.round(entryFee * 100) / 100;
-
-      if (entryFee !== entryFeeRounded) {
-        throw new https.HttpsError(
-          "failed-precondition",
-          "Taxa de entrada pode ter no máximo 2 casas decimais."
-        );
-      }
-
-      const currentParticipants = Number(tournamentData.current_participants || 0);
-      const maxParticipants = Number(tournamentData.max_participants || 0);
-
-      if (!Number.isFinite(currentParticipants) || currentParticipants < 0) {
-        throw new https.HttpsError(
-          "failed-precondition",
-          "Número atual de participantes inválido."
-        );
-      }
-
-      if (!Number.isFinite(maxParticipants) || maxParticipants <= 0) {
-        throw new https.HttpsError(
-          "failed-precondition",
-          "Limite de participantes inválido."
-        );
-      }
-
-      if (currentParticipants >= maxParticipants) {
-        throw new https.HttpsError(
-          "failed-precondition",
-          "Este torneio já está lotado."
-        );
-      }
-
-      // 6. Bloquear inscrição duplicada
+      // Duplicate registration is checked before any money is touched.
       if (registrationSnap.exists) {
-        throw new https.HttpsError(
+        throw new DomainError(
           "already-exists",
           "Você já está inscrito neste torneio."
         );
       }
 
-      // 7. Validar saldo
-      if (currentBalance < entryFee) {
-        throw new https.HttpsError(
+      const walletData = walletSnap.data() ?? {};
+      const tournamentData = tournamentSnap.data() ?? {};
+
+      const status = String(tournamentData.status || "")
+        .trim()
+        .toLowerCase();
+
+      if (status !== "open") {
+        throw new DomainError(
           "failed-precondition",
-          "Saldo insuficiente."
+          "Este torneio não está aberto para inscrições."
         );
       }
 
-      const previousBalance = Math.round(currentBalance * 100) / 100;
-      const balanceAfter = Math.round((currentBalance - entryFee) * 100) / 100;
+      const entryFeeCentavos = validateEntryFee(tournamentData.entry_fee);
 
-      if (balanceAfter < 0) {
-        throw new https.HttpsError(
+      // Canonical-first with a legacy fallback. Throws when the capacity is
+      // missing or the two field pairs disagree — never silently zero.
+      const counts = readParticipantCounts(tournamentData);
+
+      if (isFull(counts)) {
+        throw new DomainError(
           "failed-precondition",
-          "Saldo insuficiente."
+          "Este torneio já está lotado."
         );
       }
 
-      // 8. Atualizar wallet
+      const previousBalance = storedReaisToCentavos(
+        walletData.balance ?? 0,
+        "saldo da carteira"
+      );
+      const totalSpent = storedReaisToCentavos(
+        walletData.total_spent ?? 0,
+        "total gasto"
+      );
+
+      // Enforces "you cannot spend what you do not have".
+      const balanceAfter = debit(previousBalance, entryFeeCentavos);
+
       transaction.update(walletRef, {
-        balance: balanceAfter,
-        total_spent: admin.firestore.FieldValue.increment(entryFee),
+        balance: centavosToReais(balanceAfter),
+        total_spent: centavosToReais(addCentavos(totalSpent, entryFeeCentavos)),
       });
 
-      // 9. Atualizar torneio
-      transaction.update(tournamentRef, {
-        current_participants: admin.firestore.FieldValue.increment(1),
-      });
+      // Advances BOTH the canonical and the legacy counter together, so the two
+      // representations can never drift apart.
+      transaction.update(tournamentRef, participantIncrementUpdate(counts));
 
-      // 10. Criar registration
       transaction.set(registrationRef, {
         user_ref: userRef,
         tournament_ref: tournamentRef,
-        entry_fee: entryFee,
+        entry_fee: centavosToReais(entryFeeCentavos),
         status: "registered",
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      // 11. Criar transaction financeira
       transaction.set(transactionRef, {
-        amount: entryFee,
+        amount: centavosToReais(entryFeeCentavos),
         category: "entry_fee",
         user_ref: userRef,
         display_name: "Entrada em torneio",
         tournament_ref: tournamentRef,
-        previous_balance: previousBalance,
-        balance_after: balanceAfter,
+        previous_balance: centavosToReais(previousBalance),
+        balance_after: centavosToReais(balanceAfter),
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
         status: "completed",
         external_id: externalid,
@@ -583,316 +456,254 @@ exports.jointournament = https.onCall(async (data, context) => {
     };
   } catch (error) {
     console.error("jointournament error:", error);
-
-    if (error instanceof https.HttpsError) {
-      throw error;
-    }
-
-    throw new https.HttpsError(
-      "internal",
-      "Erro ao entrar no torneio."
-    );
+    throw toHttpsError(error);
   }
 });
+
 export const payprize = https.onCall(async (data, context) => {
-  console.log("payprize called");
-  console.log("auth uid:", context.auth?.uid);
-  console.log("data received:", data);
-
-  if (!context.auth) {
-    console.log("payprize error: unauthenticated");
-
-    throw new https.HttpsError(
-      "unauthenticated",
-      "Você precisa estar logado para pagar prêmio."
-    );
-  }
-
-  const adminUid = context.auth.uid;
-  const allowedAdminUid = "Fnj4w17GGeP7XgQ5yF3gXTL1yR42";
-
-  if (adminUid !== allowedAdminUid) {
-    console.log("payprize error: permission denied", adminUid);
-
-    throw new https.HttpsError(
-      "permission-denied",
+  try {
+    assertAdmin(
+      context,
+      "Você precisa estar logado para pagar prêmio.",
       "Você não tem permissão para pagar prêmio."
     );
-  }
 
-  const winneruid = data.winneruid;
-  const tournamentid = data.tournamentid;
-  const amount = Number(data.amount);
- const externalid =
-  typeof data.externalid === "string" && data.externalid.trim().length > 0
-    ? data.externalid.trim()
-    : `prize_${winneruid}_${tournamentid}`;
+    const winneruid = data.winneruid;
+    const tournamentid = data.tournamentid;
 
-  if (!winneruid || typeof winneruid !== "string") {
-    console.log("payprize error: invalid winneruid", winneruid);
+    if (!winneruid || typeof winneruid !== "string") {
+      throw new DomainError("invalid-argument", "Winner UID inválido.");
+    }
 
-    throw new https.HttpsError(
-      "invalid-argument",
-      "Winner UID inválido."
-    );
-  }
+    if (!tournamentid || typeof tournamentid !== "string") {
+      throw new DomainError("invalid-argument", "Tournament ID inválido.");
+    }
 
-  if (!tournamentid || typeof tournamentid !== "string") {
-    console.log("payprize error: invalid tournamentid", tournamentid);
+    const amountCentavos = validatePrizeAmount(data.amount);
 
-    throw new https.HttpsError(
-      "invalid-argument",
-      "Tournament ID inválido."
-    );
-  }
+    const externalid =
+      typeof data.externalid === "string" && data.externalid.trim().length > 0
+        ? data.externalid.trim()
+        : `prize_${winneruid}_${tournamentid}`;
 
-  if (!amount || amount <= 0) {
-    console.log("payprize error: invalid amount", amount);
+    const winnerUserRef = db.collection("users").doc(winneruid);
+    const winnerWalletRef = db.collection("wallets").doc(winneruid);
+    const tournamentRef = db.collection("tournaments").doc(tournamentid);
+    const transactionRef = db.collection("transactions").doc(externalid);
 
-    throw new https.HttpsError(
-      "invalid-argument",
-      "Valor do prêmio inválido."
-    );
-  }
-  const db = admin.firestore();
-
-  const winnerUserRef = db.collection("users").doc(winneruid);
-  const winnerWalletRef = db.collection("wallets").doc(winneruid);
-  const tournamentRef = db.collection("tournaments").doc(tournamentid);
-  const transactionRef = db.collection("transactions").doc(externalid);
-
-  try {
     const result = await db.runTransaction(async (transaction) => {
-      console.log("payprize transaction started");
-
       const winnerWalletSnap = await transaction.get(winnerWalletRef);
       const tournamentSnap = await transaction.get(tournamentRef);
       const existingTransactionSnap = await transaction.get(transactionRef);
 
+      // Idempotency: paying the same prize twice must be impossible.
       if (existingTransactionSnap.exists) {
-        console.log("payprize error: duplicate externalid", externalid);
-
-        throw new https.HttpsError(
+        throw new DomainError(
           "already-exists",
           "Já existe uma transação com esse external ID."
         );
       }
 
       if (!winnerWalletSnap.exists) {
-        console.log("payprize error: winner wallet not found", winneruid);
-
-        throw new https.HttpsError(
+        throw new DomainError(
           "not-found",
           "Carteira do vencedor não encontrada."
         );
       }
 
       if (!tournamentSnap.exists) {
-        console.log("payprize error: tournament not found", tournamentid);
-
-        throw new https.HttpsError(
-          "not-found",
-          "Torneio não encontrado."
-        );
+        throw new DomainError("not-found", "Torneio não encontrado.");
       }
 
-      const walletData = winnerWalletSnap.data();
+      const walletData = winnerWalletSnap.data() ?? {};
 
-      const previousBalance = Number(walletData?.balance || 0);
-      const previousTotalWon = Number(walletData?.total_won || 0);
+      const previousBalance = storedReaisToCentavos(
+        walletData.balance ?? 0,
+        "saldo da carteira"
+      );
+      const previousTotalWon = storedReaisToCentavos(
+        walletData.total_won ?? 0,
+        "total ganho"
+      );
 
-      const balanceAfter = previousBalance + amount;
-      const totalWonAfter = previousTotalWon + amount;
+      const balanceAfter = credit(previousBalance, amountCentavos);
+      const totalWonAfter = addCentavos(previousTotalWon, amountCentavos);
 
       transaction.update(winnerWalletRef, {
-        balance: balanceAfter,
-        total_won: totalWonAfter,
+        balance: centavosToReais(balanceAfter),
+        total_won: centavosToReais(totalWonAfter),
       });
 
       transaction.set(transactionRef, {
-        amount: amount,
+        amount: centavosToReais(amountCentavos),
         category: "prize",
         user_ref: winnerUserRef,
         display_name: "",
         tournament_ref: tournamentRef,
-        previous_balance: previousBalance,
-        balance_after: balanceAfter,
+        previous_balance: centavosToReais(previousBalance),
+        balance_after: centavosToReais(balanceAfter),
         timestamp: admin.firestore.FieldValue.serverTimestamp(),
         status: "completed",
         external_id: externalid,
-      });
-
-      console.log("payprize transaction success", {
-        adminUid,
-        winneruid,
-        tournamentid,
-        amount,
-        previousBalance,
-        balanceAfter,
-        externalid,
       });
 
       return {
         success: true,
         winner_uid: winneruid,
         tournament_id: tournamentid,
-        amount: amount,
-        previous_balance: previousBalance,
-        balance_after: balanceAfter,
+        amount: centavosToReais(amountCentavos),
+        previous_balance: centavosToReais(previousBalance),
+        balance_after: centavosToReais(balanceAfter),
         external_id: externalid,
       };
     });
 
     return result;
   } catch (error) {
-    console.error("payprize catch error:", error);
-
-    if (error instanceof https.HttpsError) {
-      throw error;
-    }
-
-    throw new https.HttpsError(
-      "internal",
-      "Erro interno ao pagar prêmio."
-    );
+    console.error("payprize error:", error);
+    throw toHttpsError(error);
   }
 });
 
-const createTournamentHandler = async (data: any, context: any) => {
-  if (!context.auth) {
-    throw new https.HttpsError(
-      "unauthenticated",
+const createTournamentHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertSignedIn(
+      context,
       "Você precisa estar logado para criar um campeonato."
     );
+
+    const uid = callerAuth.uid;
+
+    const name = String(data.name || "").trim();
+    const description = String(data.description || "").trim();
+
+    if (!name) {
+      throw new DomainError(
+        "invalid-argument",
+        "O nome do campeonato é obrigatório."
+      );
+    }
+
+    // Entry fee and prize may legitimately be zero (a free tournament), but
+    // never negative, and never finer than centavos.
+    const entryFeeCentavos = toCentavos(data.entry_fee, {
+      field: "valor da inscrição",
+      allowZero: true,
+    });
+    const prizeCentavos = toCentavos(data.prize, {
+      field: "valor da premiação",
+      allowZero: true,
+    });
+
+    const maxPlayers = Number(data.max_players);
+
+    if (!Number.isSafeInteger(maxPlayers) || maxPlayers <= 0) {
+      throw new DomainError(
+        "invalid-argument",
+        "O número máximo de jogadores precisa ser maior que zero."
+      );
+    }
+
+    const gameMode = String(data.game_mode || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "");
+
+    let teamSize = 0;
+    let gameModeLabel = "";
+    let formatType = "";
+
+    if (gameMode === "solo") {
+      teamSize = 1;
+      gameModeLabel = "Solo";
+      formatType = "battle_royale";
+    } else if (gameMode === "duo") {
+      teamSize = 2;
+      gameModeLabel = "Duo";
+      formatType = "battle_royale";
+    } else if (gameMode === "squad") {
+      teamSize = 4;
+      gameModeLabel = "Squad";
+      formatType = "battle_royale";
+    } else if (gameMode === "2v2") {
+      teamSize = 2;
+      gameModeLabel = "2v2";
+      formatType = "versus";
+    } else if (gameMode === "4v4") {
+      teamSize = 4;
+      gameModeLabel = "4v4";
+      formatType = "versus";
+    } else {
+      throw new DomainError(
+        "invalid-argument",
+        "Modo de jogo inválido. Use solo, duo, squad, 2v2 ou 4v4."
+      );
+    }
+
+    const userRef = db.collection("users").doc(uid);
+    const userSnap = await userRef.get();
+
+    if (!userSnap.exists) {
+      throw new DomainError("not-found", "Usuário criador não encontrado.");
+    }
+
+    const userData = userSnap.data() ?? {};
+
+    const creatorName =
+      userData.display_name ||
+      userData.username ||
+      userData.name ||
+      userData.nickname ||
+      context.auth?.token?.email ||
+      "Criador";
+
+    const tournamentRef = db.collection("tournaments").doc();
+
+    await tournamentRef.set({
+      name,
+      description,
+
+      entry_fee: centavosToReais(entryFeeCentavos),
+      prize: centavosToReais(prizeCentavos),
+
+      status: "open",
+
+      creator_ref: userRef,
+      creator_uid: uid,
+      creator_name: creatorName,
+
+      game_mode: gameMode,
+      game_mode_label: gameModeLabel,
+      team_size: teamSize,
+      format_type: formatType,
+
+      // Writes BOTH the canonical (`*_participants`) and the legacy
+      // (`*_players`) pairs with identical values. This is the fix for the
+      // deployed bug where createTournament wrote one pair and jointournament
+      // read the other, and it keeps old clients and queries working.
+      ...newTournamentParticipantFields(maxPlayers),
+
+      starts_at: null,
+      created_at: admin.firestore.FieldValue.serverTimestamp(),
+      updated_at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return {
+      success: true,
+      tournament_id: tournamentRef.id,
+      tournament_ref: tournamentRef.path,
+      message: "Campeonato criado com sucesso.",
+    };
+  } catch (error) {
+    console.error("createTournament error:", error);
+    throw toHttpsError(error);
   }
-  const uid = context.auth.uid;
-
-  const name = String(data.name || "").trim();
-  const description = String(data.description || "").trim();
-
-  const entryFee = Number(data.entry_fee);
-  const prize = Number(data.prize);
-  const maxPlayers = Number(data.max_players);
-
-  const gameMode = String(data.game_mode || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, "");
-
-  if (!name) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "O nome do campeonato é obrigatório."
-    );
-  }
-
-  if (Number.isNaN(entryFee) || entryFee < 0) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "O valor da inscrição precisa ser válido."
-    );
-  }
-
-  if (Number.isNaN(prize) || prize < 0) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "O valor da premiação precisa ser válido."
-    );
-  }
-
-  if (Number.isNaN(maxPlayers) || maxPlayers <= 0) {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "O número máximo de jogadores precisa ser maior que zero."
-    );
-  }
-
-  let teamSize = 0;
-  let gameModeLabel = "";
-  let formatType = "";
-
-  if (gameMode === "solo") {
-    teamSize = 1;
-    gameModeLabel = "Solo";
-    formatType = "battle_royale";
-  } else if (gameMode === "duo") {
-    teamSize = 2;
-    gameModeLabel = "Duo";
-    formatType = "battle_royale";
-  } else if (gameMode === "squad") {
-    teamSize = 4;
-    gameModeLabel = "Squad";
-    formatType = "battle_royale";
-  } else if (gameMode === "2v2") {
-    teamSize = 2;
-    gameModeLabel = "2v2";
-    formatType = "versus";
-  } else if (gameMode === "4v4") {
-    teamSize = 4;
-    gameModeLabel = "4v4";
-    formatType = "versus";
-  } else {
-    throw new https.HttpsError(
-      "invalid-argument",
-      "Modo de jogo inválido. Use solo, duo, squad, 2v2 ou 4v4."
-    );
-  }
-
-  const userRef = admin.firestore().collection("users").doc(uid);
-  const userSnap = await userRef.get();
-
-  if (!userSnap.exists) {
-    throw new https.HttpsError(
-      "not-found",
-      "Usuário criador não encontrado."
-    );
-  }
-
-  const userData = userSnap.data() || {};
-
-  const creatorName =
-    userData.display_name ||
-    userData.username ||
-    userData.name ||
-    userData.nickname ||
-    context.auth.token.email ||
-    "Criador";
-
-  const tournamentRef = admin.firestore().collection("tournaments").doc();
-
-  await tournamentRef.set({
-    name,
-    description,
-
-    entry_fee: entryFee,
-    prize,
-
-    status: "open",
-
-    creator_ref: userRef,
-    creator_uid: uid,
-    creator_name: creatorName,
-
-    game_mode: gameMode,
-    game_mode_label: gameModeLabel,
-    team_size: teamSize,
-    format_type: formatType,
-
-    current_players: 0,
-    max_players: maxPlayers,
-
-    starts_at: null,
-    created_at: admin.firestore.FieldValue.serverTimestamp(),
-    updated_at: admin.firestore.FieldValue.serverTimestamp(),
-  });
-
-  return {
-    success: true,
-    tournament_id: tournamentRef.id,
-    tournament_ref: tournamentRef.path,
-    message: "Campeonato criado com sucesso.",
-  };
 };
 
+// BOTH export names are preserved, with their exact casing. The previous client
+// calls one or the other; renaming or dropping either would break production.
 export const createTournament = https.onCall(createTournamentHandler);
 export const createtournament = https.onCall(createTournamentHandler);

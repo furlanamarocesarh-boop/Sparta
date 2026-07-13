@@ -1,0 +1,12 @@
+{
+  // Test build. Kept separate from `tsconfig.json` on purpose: the deploy build
+  // compiles ONLY `src` into `lib/`, so test code can never be bundled into the
+  // deployed function package.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "lib-test",
+    "types": ["node"]
+  },
+  "include": ["src", "test"]
+}

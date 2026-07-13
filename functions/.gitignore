@@ -2,6 +2,9 @@
 lib/**/*.js
 lib/**/*.js.map
 
+# Test build output (tsconfig.test.json). Reproducible via `npm run build:test`.
+lib-test/
+
 # TypeScript v1 declaration files
 typings/
 
