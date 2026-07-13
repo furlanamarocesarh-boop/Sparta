@@ -1,0 +1,85 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn() && request.auth.uid == "Fnj4w17GGeP7XgQ5yF3gXTL1yR42";
+    }
+
+    function isOwnerByUid(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function userRef() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function isOwnerByUserRef() {
+      return signedIn() && resource.data.user_ref == userRef();
+    }
+
+    // USERS
+    match /users/{userId} {
+      allow read: if isOwnerByUid(userId) || isAdmin();
+
+      // Por enquanto, bloqueia escrita direta.
+      // onUserCreated e outras Cloud Functions continuam funcionando.
+      allow create, update, delete: if false;
+    }
+
+    // WALLETS
+    match /wallets/{userId} {
+      // Usuário pode ler apenas a própria wallet.
+      allow read: if isOwnerByUid(userId) || isAdmin();
+
+      // Nunca permitir mexer em dinheiro direto pelo app.
+      allow create, update, delete: if false;
+    }
+
+    // TRANSACTIONS
+    match /transactions/{transactionId} {
+      // Usuário pode ler apenas transactions próprias.
+      allow read: if isOwnerByUserRef() || isAdmin();
+
+      // Transactions só podem ser criadas por Cloud Functions.
+      allow create, update, delete: if false;
+    }
+
+    // WITHDRAWALS
+    match /withdrawals/{withdrawalId} {
+      // Usuário pode ler apenas saques próprios.
+      allow read: if isOwnerByUserRef() || isAdmin();
+
+      // Saques só podem ser criados/alterados por Cloud Functions.
+      allow create, update, delete: if false;
+    }
+
+    // REGISTRATIONS
+    match /registrations/{registrationId} {
+      // Usuário pode ler apenas inscrições próprias.
+      allow read: if isOwnerByUserRef() || isAdmin();
+
+      // Inscrição só via jointournament.
+      allow create, update, delete: if false;
+    }
+
+    // TOURNAMENTS
+    match /tournaments/{tournamentId} {
+      // Todos logados podem ler torneios.
+      allow read: if signedIn();
+
+      // Só admin pode criar/editar/deletar torneios.
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Bloqueia qualquer collection não prevista.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
