@@ -44,31 +44,66 @@ export interface ToCentavosOptions {
 }
 
 /**
- * Converts a validated amount in reais into exact integer centavos.
+ * Everything that can be wrong with a monetary value, as data rather than as an
+ * exception.
  *
- * Rejects (never silently truncates): non-numbers, NaN, Infinity, negatives,
- * more than two decimal places, unsafe integers, and values above the limit.
+ * This exists so the read-only data audit can *classify* a bad value instead of
+ * merely failing on it — and, crucially, so it does so using THIS module's rules
+ * rather than a second copy of them. There is exactly one definition of "valid
+ * money" in the codebase: [inspectReais].
  */
-export function toCentavos(value: unknown, options: ToCentavosOptions): number {
-  const { field, allowZero = false, maxCentavos = MAX_CENTAVOS } = options;
+export type MoneyProblem =
+  | "missing"
+  | "not-a-number"
+  | "nan"
+  | "infinite"
+  | "negative"
+  | "zero-not-allowed"
+  | "too-many-decimals"
+  | "unsafe"
+  | "above-limit";
 
-  // `typeof NaN === "number"`, so this only rejects strings/null/undefined/
-  // booleans/objects. NaN and Infinity are caught by the isFinite check below.
-  if (typeof value !== "number") {
-    throw invalidArgument(`O ${field} precisa ser um número.`);
+export type MoneyInspection =
+  | { readonly ok: true; readonly centavos: number }
+  | { readonly ok: false; readonly problem: MoneyProblem };
+
+/**
+ * Inspects a value in reais WITHOUT throwing, returning either the exact
+ * centavos or the specific reason it is unusable.
+ *
+ * [toCentavos] is a thin wrapper over this, so the validation rules and their
+ * order are defined once and shared by the callables and the auditor.
+ */
+export function inspectReais(
+  value: unknown,
+  options: { allowZero?: boolean; maxCentavos?: number } = {}
+): MoneyInspection {
+  const { allowZero = false, maxCentavos = MAX_CENTAVOS } = options;
+
+  if (value === undefined || value === null) {
+    return { ok: false, problem: "missing" };
   }
 
-  // Covers NaN, Infinity and -Infinity in one check.
+  // `typeof NaN === "number"`, so this only rejects strings/booleans/objects.
+  // NaN and Infinity are caught below.
+  if (typeof value !== "number") {
+    return { ok: false, problem: "not-a-number" };
+  }
+
+  if (Number.isNaN(value)) {
+    return { ok: false, problem: "nan" };
+  }
+
   if (!Number.isFinite(value)) {
-    throw invalidArgument(`O ${field} é inválido.`);
+    return { ok: false, problem: "infinite" };
   }
 
   if (value < 0) {
-    throw invalidArgument(`O ${field} não pode ser negativo.`);
+    return { ok: false, problem: "negative" };
   }
 
   if (value === 0 && !allowZero) {
-    throw invalidArgument(`O ${field} precisa ser maior que zero.`);
+    return { ok: false, problem: "zero-not-allowed" };
   }
 
   const scaled = value * 100;
@@ -76,22 +111,64 @@ export function toCentavos(value: unknown, options: ToCentavosOptions): number {
   // Guard before rounding: a value large enough to lose integer precision
   // cannot be trusted, and Math.round would happily return a wrong answer.
   if (!Number.isSafeInteger(Math.round(scaled))) {
-    throw invalidArgument(`O ${field} é grande demais.`);
+    return { ok: false, problem: "unsafe" };
   }
 
   const centavos = Math.round(scaled);
 
   if (Math.abs(scaled - centavos) > SCALE_EPSILON) {
-    throw invalidArgument(
-      `O ${field} pode ter no máximo 2 casas decimais.`
-    );
+    return { ok: false, problem: "too-many-decimals" };
   }
 
   if (centavos > maxCentavos) {
-    throw invalidArgument(`O ${field} está acima do limite permitido.`);
+    return { ok: false, problem: "above-limit" };
   }
 
-  return centavos;
+  return { ok: true, centavos };
+}
+
+/**
+ * Converts a validated amount in reais into exact integer centavos.
+ *
+ * Rejects (never silently truncates): non-numbers, NaN, Infinity, negatives,
+ * more than two decimal places, unsafe integers, and values above the limit.
+ *
+ * The rules live in [inspectReais]; this only turns a problem into the
+ * DomainError (and the exact pt-BR message) the callables already return.
+ */
+export function toCentavos(value: unknown, options: ToCentavosOptions): number {
+  const { field, allowZero = false, maxCentavos = MAX_CENTAVOS } = options;
+
+  const inspection = inspectReais(value, { allowZero, maxCentavos });
+
+  if (inspection.ok) {
+    return inspection.centavos;
+  }
+
+  throw invalidArgument(messageFor(inspection.problem, field));
+}
+
+/** The player-facing message for each problem. Unchanged from before. */
+function messageFor(problem: MoneyProblem, field: string): string {
+  switch (problem) {
+    // A missing value and a non-number are the same mistake to a caller.
+    case "missing":
+    case "not-a-number":
+      return `O ${field} precisa ser um número.`;
+    case "nan":
+    case "infinite":
+      return `O ${field} é inválido.`;
+    case "negative":
+      return `O ${field} não pode ser negativo.`;
+    case "zero-not-allowed":
+      return `O ${field} precisa ser maior que zero.`;
+    case "unsafe":
+      return `O ${field} é grande demais.`;
+    case "too-many-decimals":
+      return `O ${field} pode ter no máximo 2 casas decimais.`;
+    case "above-limit":
+      return `O ${field} está acima do limite permitido.`;
+  }
 }
 
 /**
