@@ -24,6 +24,8 @@ export interface ReadOnlySnapshot {
 }
 
 export interface ReadOnlyQuery {
+  /** Equality filter. A read operation — it narrows, it never mutates. */
+  where(field: string, op: "==", value: unknown): ReadOnlyQuery;
   orderBy(field: unknown): ReadOnlyQuery;
   limit(count: number): ReadOnlyQuery;
   startAfter(cursor: unknown): ReadOnlyQuery;

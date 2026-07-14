@@ -22,6 +22,11 @@ export interface AuditArgs {
   readonly confirmProduction: boolean;
   /** Include document ids in the report. Off by default (ids are identifying). */
   readonly showIds: boolean;
+  /**
+   * Run the anonymized wallet reconciliation instead of the aggregate audit.
+   * Still read-only, still behind the same guard.
+   */
+  readonly reconcile: boolean;
   readonly help: boolean;
 }
 
@@ -40,6 +45,7 @@ export function parseArgs(argv: readonly string[]): AuditArgs {
   let project: string | undefined;
   let confirmProduction = false;
   let showIds = false;
+  let reconcile = false;
   let help = false;
 
   for (let i = 0; i < argv.length; i++) {
@@ -54,12 +60,14 @@ export function parseArgs(argv: readonly string[]): AuditArgs {
       confirmProduction = true;
     } else if (arg === "--show-ids") {
       showIds = true;
+    } else if (arg === "--reconcile") {
+      reconcile = true;
     } else if (arg === "--help" || arg === "-h") {
       help = true;
     }
   }
 
-  return { project, confirmProduction, showIds, help };
+  return { project, confirmProduction, showIds, reconcile, help };
 }
 
 export interface GuardEnv {

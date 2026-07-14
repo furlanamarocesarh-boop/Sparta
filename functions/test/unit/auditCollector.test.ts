@@ -42,6 +42,14 @@ class ExplodingFakeCollection {
     }
   }
 
+  where(field: string, op: "==", value: unknown): this {
+    this.calls.push("where");
+    void field;
+    void op;
+    void value;
+    return this;
+  }
+
   orderBy(field: unknown): this {
     this.calls.push("orderBy");
     this.orderByField = field;
@@ -114,9 +122,12 @@ describe("scanCollection — read-only guarantee", () => {
 
   it("the ReadOnlyQuery type does not expose a write method", () => {
     // A compile-time property, asserted at runtime for visibility: the object
-    // the collector is handed is only ever used through orderBy/limit/
+    // the collector is handed is only ever used through where/orderBy/limit/
     // startAfter/get. Anything else is a type error at build time.
+    //
+    // `where` is a READ operation: it narrows a query, it never mutates.
     const surface: (keyof ReadOnlyQuery)[] = [
+      "where",
       "orderBy",
       "limit",
       "startAfter",
@@ -126,6 +137,29 @@ describe("scanCollection — read-only guarantee", () => {
       assert.ok(
         !surface.includes(method as unknown as keyof ReadOnlyQuery),
         `${method} must not be on the read-only surface`
+      );
+    }
+  });
+
+  it("a filtered (where) scan also never writes", async () => {
+    // The reconciliation reads transactions/withdrawals/registrations through a
+    // where(user_ref == ...) query. That path must be as read-only as the rest.
+    const fake = new ExplodingFakeCollection(makeDocs(5));
+
+    const filtered = fake.where("user_ref", "==", "users/u1");
+    const seen: string[] = [];
+    await scanCollection(
+      filtered as unknown as ReadOnlyQuery,
+      { orderByField: "__name__", pageSize: 2 },
+      (id) => seen.push(id)
+    );
+
+    assert.equal(seen.length, 5);
+    assert.ok(fake.calls.includes("where"));
+    for (const method of WRITE_METHODS) {
+      assert.ok(
+        !fake.calls.includes(method),
+        `filtered scan must never call ${method}()`
       );
     }
   });

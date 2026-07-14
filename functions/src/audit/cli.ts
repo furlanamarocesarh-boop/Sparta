@@ -9,6 +9,18 @@ import {
   PRODUCTION_CONFIRM_FLAG,
   PRODUCTION_PROJECT_ID,
 } from "./guard.js";
+import { inspectReais, MAX_BALANCE_CENTAVOS } from "../domain/money.js";
+import {
+  reconcileWallet,
+  ReconciliationResult,
+  TransactionRecord,
+  UserRefStatus,
+} from "./reconcile.js";
+import {
+  anonymousLabel,
+  reconciliationExitCode,
+  renderReconciliation,
+} from "./reconcileReport.js";
 import {
   EXIT_FAILURE,
   exitCodeFor,
@@ -16,7 +28,12 @@ import {
   summarize,
 } from "./report.js";
 import { auditTournamentDocument, TournamentFinding } from "./tournamentAudit.js";
-import { auditWalletDocument, WalletFinding } from "./walletAudit.js";
+import {
+  auditWalletDocument,
+  WalletField,
+  WALLET_MONEY_FIELDS,
+  WalletFinding,
+} from "./walletAudit.js";
 
 /**
  * Entry point for the read-only data audit.
@@ -116,6 +133,115 @@ async function main(): Promise<number> {
       tournamentFindings.push(auditTournamentDocument(id, data));
     }
   );
+
+  // --- Reconciliation mode --------------------------------------------------
+  //
+  // Only wallets with MISSING monetary fields are reconciled. Ids are used here,
+  // internally, purely to correlate a wallet with its user and its related
+  // documents — and they are dropped before anything is rendered. The report
+  // layer only ever sees "Wallet A".
+  if (args.reconcile) {
+    const results: ReconciliationResult[] = [];
+
+    for (const [index, finding] of walletFindings.entries()) {
+      const missingFields = finding.issues
+        .filter((issue) => issue.problem === "missing")
+        .map((issue) => issue.field);
+
+      // Only missing-field wallets are in scope for this step.
+      if (missingFields.length === 0) continue;
+
+      const walletId = finding.id;
+      const userRefPath = `users/${walletId}`;
+      const userRef = db.doc(userRefPath);
+
+      const walletSnap = await db.doc(`wallets/${walletId}`).get();
+      const walletData = walletSnap.data() ?? {};
+
+      const userSnap = await userRef.get();
+
+      // user_ref must exist AND point at this wallet's own owner. The REASON it
+      // fails is captured too — an absent ref is a very different problem from
+      // one pointing at another user — but the offending path is never carried
+      // out of this scope.
+      const storedUserRef = walletData.user_ref as { path?: string } | undefined;
+
+      let userRefStatus: UserRefStatus;
+      if (storedUserRef === undefined || storedUserRef === null) {
+        userRefStatus = "missing";
+      } else if (typeof storedUserRef.path !== "string") {
+        userRefStatus = "not-a-reference";
+      } else if (storedUserRef.path !== userRefPath) {
+        userRefStatus = "points-elsewhere";
+      } else {
+        userRefStatus = "valid";
+      }
+      const userRefValid = userRefStatus === "valid";
+
+      const presentCentavos: Partial<Record<WalletField, number | null>> = {};
+      for (const field of WALLET_MONEY_FIELDS) {
+        if (missingFields.includes(field)) continue;
+        const inspection = inspectReais(walletData[field], {
+          allowZero: true,
+          maxCentavos: MAX_BALANCE_CENTAVOS,
+        });
+        presentCentavos[field] = inspection.ok ? inspection.centavos : null;
+      }
+
+      const transactions: TransactionRecord[] = [];
+      await scanCollection(
+        db
+          .collection("transactions")
+          .where("user_ref", "==", userRef) as unknown as ReadOnlyQuery,
+        { orderByField: documentId },
+        (_id, data) => {
+          transactions.push({
+            category: data.category,
+            status: data.status,
+            amount: data.amount,
+          });
+        }
+      );
+
+      const withdrawalStatuses: string[] = [];
+      await scanCollection(
+        db
+          .collection("withdrawals")
+          .where("user_ref", "==", userRef) as unknown as ReadOnlyQuery,
+        { orderByField: documentId },
+        (_id, data) => {
+          withdrawalStatuses.push(
+            typeof data.status === "string" ? data.status : "(inválido)"
+          );
+        }
+      );
+
+      let registrationCount = 0;
+      await scanCollection(
+        db
+          .collection("registrations")
+          .where("user_ref", "==", userRef) as unknown as ReadOnlyQuery,
+        { orderByField: documentId },
+        () => {
+          registrationCount++;
+        }
+      );
+
+      results.push(
+        reconcileWallet(anonymousLabel(index), {
+          missingFields,
+          presentCentavos,
+          userDocExists: userSnap.exists,
+          userRefValid,
+          userRefStatus,
+          related: { transactions, withdrawalStatuses, registrationCount },
+        })
+      );
+    }
+
+    console.log(renderReconciliation(results));
+    return reconciliationExitCode(results);
+  }
 
   const summary = summarize(
     walletsScanned,

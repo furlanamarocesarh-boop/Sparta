@@ -40,6 +40,28 @@ describe("parseArgs", () => {
     const args = parseArgs(["--project", PRODUCTION_PROJECT_ID, "--confirm"]);
     assert.equal(args.confirmProduction, false);
   });
+
+  it("recognizes --reconcile, and it defaults to off", () => {
+    assert.equal(parseArgs([]).reconcile, false);
+    assert.equal(parseArgs(["--reconcile"]).reconcile, true);
+  });
+
+  it("--reconcile does NOT bypass the production guard", () => {
+    // The reconciliation reads more collections, so it must be at least as
+    // guarded as the plain audit — never a back door around the confirmation.
+    const decision = decide(
+      parseArgs(["--project", PRODUCTION_PROJECT_ID, "--reconcile"]),
+      NO_EMULATOR
+    );
+    assert.equal(decision.allowed, false);
+    assert.equal(
+      decision.allowed === false && decision.reason,
+      "unconfirmed-production"
+    );
+
+    const noProject = decide(parseArgs(["--reconcile"]), NO_EMULATOR);
+    assert.equal(noProject.allowed, false);
+  });
 });
 
 describe("decide — refuses by default", () => {
