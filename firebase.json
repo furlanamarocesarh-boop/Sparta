@@ -16,7 +16,8 @@
         "lib-test",
         "test",
         "audit-reports",
-        "lib/audit"
+        "lib/audit",
+        "lib/cleanup"
       ],
       "predeploy": [
         "npm --prefix \"$RESOURCE_DIR\" run build"
