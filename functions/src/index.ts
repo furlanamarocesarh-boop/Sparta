@@ -1,5 +1,5 @@
 import * as admin from "firebase-admin";
-import { auth, https } from "firebase-functions/v1";
+import { https, region } from "firebase-functions/v1";
 
 import { assertAdmin, assertSignedIn } from "./domain/adminAuth.js";
 import { DomainError } from "./domain/errors.js";
@@ -27,6 +27,24 @@ import {
 admin.initializeApp();
 
 const db = admin.firestore();
+
+/**
+ * Deployment regions, made EXPLICIT so a deploy targets exactly the region each
+ * function already runs in — never the SDK default (us-central1).
+ *
+ * `onUserCreated` is deployed in `us-east1` in production; leaving it implicit
+ * would make a deploy create a SECOND copy in us-central1. Pinning it here means
+ * a future `--only functions:onUserCreated` updates the us-east1 function in
+ * place. The six callables are pinned to `us-central1`, matching production.
+ *
+ * These change ONLY the region — not the trigger type, name, casing, arguments,
+ * memory, timeout, runtime or generation.
+ */
+const REGION_CALLABLES = "us-central1";
+const REGION_ON_USER_CREATED = "us-east1";
+
+const central = region(REGION_CALLABLES);
+const east = region(REGION_ON_USER_CREATED);
 
 /**
  * PHASE 2.5B HARDENING — what changed, and what deliberately did NOT.
@@ -88,7 +106,7 @@ function generatePlayerId(): string {
  * trigger cannot reliably read a display name the client sets afterwards.
  * Fixing that needs an authenticated callable, deliberately NOT added here.
  */
-export const onUserCreated = auth.user().onCreate(async (user) => {
+export const onUserCreated = east.auth.user().onCreate(async (user) => {
   const uid = user.uid;
   const email = user.email ?? "";
 
@@ -129,7 +147,7 @@ export const onUserCreated = auth.user().onCreate(async (user) => {
   }
 });
 
-export const testdeposit = https.onCall(async (data, context) => {
+export const testdeposit = central.https.onCall(async (data, context) => {
   try {
     const callerAuth = assertAdmin(
       context,
@@ -208,7 +226,7 @@ export const testdeposit = https.onCall(async (data, context) => {
   }
 });
 
-export const requestwithdrawal = https.onCall(async (data, context) => {
+export const requestwithdrawal = central.https.onCall(async (data, context) => {
   try {
     const callerAuth = assertSignedIn(
       context,
@@ -323,7 +341,7 @@ export const requestwithdrawal = https.onCall(async (data, context) => {
   }
 });
 
-export const jointournament = https.onCall(async (data, context) => {
+export const jointournament = central.https.onCall(async (data, context) => {
   try {
     const callerAuth = assertSignedIn(
       context,
@@ -460,7 +478,7 @@ export const jointournament = https.onCall(async (data, context) => {
   }
 });
 
-export const payprize = https.onCall(async (data, context) => {
+export const payprize = central.https.onCall(async (data, context) => {
   try {
     assertAdmin(
       context,
@@ -705,5 +723,5 @@ const createTournamentHandler = async (
 
 // BOTH export names are preserved, with their exact casing. The previous client
 // calls one or the other; renaming or dropping either would break production.
-export const createTournament = https.onCall(createTournamentHandler);
-export const createtournament = https.onCall(createTournamentHandler);
+export const createTournament = central.https.onCall(createTournamentHandler);
+export const createtournament = central.https.onCall(createTournamentHandler);

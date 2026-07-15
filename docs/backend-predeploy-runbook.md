@@ -533,3 +533,71 @@ A exclusão continua exigindo **autorização separada**.
 
 - ❌ **Nunca** `firebase deploy` amplo nem `--only functions` (todas): excluiria as
   camelCase de forma não controlada. Todo deploy é **por função**.
+
+---
+
+## 17. Resolução dos bloqueadores (branch `fix/backend-predeploy-blockers`)
+
+Etapa **local, sem deploy**. Endereça os Bloqueadores B (região) e C (high de
+runtime). O Bloqueador A (funções fantasma) permanece — sua remoção exige
+autorização separada (§13, §16).
+
+### 17.1 Dependências high de runtime — RESOLVIDAS
+
+Adicionados **overrides** mínimos e não-breaking (mesma major) para os três
+pacotes transitivos com advisory high, via `package.json`. **Nenhuma dependência
+direta mudou** (`firebase-admin ^13.6.0`, `firebase-functions ^7.0.0`
+inalteradas). Sem `npm audit fix --force`, sem major, sem migração Gen 2, sem
+mudar Node 20 nem `firebase-functions/v1`.
+
+| Pacote (transitivo) | Antes | Depois | Advisory coberto |
+|---|---|---|---|
+| `@grpc/grpc-js` (sob `google-gax`, runtime) | 1.14.3 | 1.14.4 | GHSA-5375-pq7m-f5r2 (high) |
+| `form-data` (runtime) | 2.5.5 | 2.5.6 | GHSA-hmw2-7cc7-3qxx (high) |
+| `protobufjs` (runtime) | 7.5.7 | 7.6.5 | GHSA-wcpc-wj8m-hjx6 (high) + GHSA-jggg-4jg4-v7c6 |
+
+- O override de `@grpc/grpc-js` é **escopado** sob `google-gax` para não tocar o
+  `@grpc/grpc-js@1.9.x` de **dev** (rules-testing), que não é vulnerável.
+- `protobufjs` foi para **7.6.5** (última 7.x) porque, além do advisory original
+  (`<=7.5.7`), a base publicou um segundo high `<=7.6.0`; 7.6.5 cobre ambos sem ir
+  para a major 8.
+
+**Resultado:** runtime com **0 critical, 0 high**. Restam **10 moderate de
+runtime** (todas transitivas via `firebase-admin`; correção só em
+`firebase-admin@14.x`, que é **major/breaking** — deixadas **documentadas, não
+mascaradas**, para uma etapa própria de upgrade com plano de teste). Vulns
+somente-dev (fora do pacote de deploy): não bloqueiam.
+
+### 17.2 Regiões explícitas — FIXADAS
+
+O `src/index.ts` agora declara a região de **cada** export, via `region(...)` do
+`firebase-functions/v1`, centralizada em duas constantes:
+
+- `onUserCreated` → **us-east1** (igual à produção);
+- as seis callables → **us-central1** (igual à produção).
+
+Mudou **apenas a região** — nome, casing, argumentos, trigger, memória, timeout,
+runtime e geração intactos; nenhum export novo; nenhum alias camelCase. Testes
+comprovam a região produzida por cada export (via `__trigger.regions`).
+
+**Confirmação (Bloqueador B):** com `onUserCreated` fixado em us-east1, um futuro
+`firebase deploy --only functions:onUserCreated --project sparta-battle`
+**atualiza a função existente em us-east1**, sem criar cópia em us-central1.
+
+### 17.3 Funções legadas camelCase — decisão registrada
+
+Classificação de precaução: **security-critical-retirement** para
+`joinTournament`, `payPrize`, `requestWithdrawal`, mesmo sem source e sem
+métricas (bloqueio TLS de observabilidade — §14), porque são operações
+financeiras, seu código não está versionado, não há referência no backend nem no
+app Flutter atual, não há usuários/dinheiro reais, e as substitutas lowercase
+endurecidas existem.
+
+- **Nenhuma exclusão aconteceu nesta etapa.**
+- As **lowercase endurecidas serão implantadas e testadas primeiro** (§6, §16).
+- A exclusão de **cada** camelCase exige **autorização separada** (§13.7, §16.5).
+- O **bloqueio TLS** (§14) limita a **observabilidade** (metadata/source/logs via
+  gcloud), **não** o deploy seletivo por função via **Firebase CLI**, que
+  independe daquele canal TLS. Ou seja: o deploy das lowercase pode prosseguir sob
+  autorização mesmo com o gcloud bloqueado.
+- ❌ Nunca recomendar deploy amplo.
