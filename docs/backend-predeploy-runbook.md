@@ -299,3 +299,122 @@ Detalhe completo em `docs/admin-transition.md`. Resumo:
 - ❌ `npm audit fix` / `npm update` / bump de `firebase-admin` sem plano de teste.
 - ❌ atribuir custom claim nesta etapa.
 - ❌ publicar regras antes de estabilizar as funções.
+
+---
+
+## 13. Investigação das funções legadas camelCase (read-only)
+
+Investigação **estritamente read-only** das três funções que existem apenas em
+produção. **Nenhuma foi deletada, atualizada, implantada ou invocada.**
+
+### 13.1 Tabela das três funções legadas
+
+| Legada (produção) | Substituta (código local) | Geração | Região | Runtime | Trigger | Memória |
+|---|---|---|---|---|---|---|
+| `joinTournament` | `jointournament` | Gen 1 (v1) | us-central1 | nodejs20 | callable | 256 MB |
+| `payPrize` | `payprize` | Gen 1 (v1) | us-central1 | nodejs20 | callable | 256 MB |
+| `requestWithdrawal` | `requestwithdrawal` | Gen 1 (v1) | us-central1 | nodejs20 | callable | 256 MB |
+
+Metadados adicionais (entry point, service account, nomes de variáveis de
+ambiente, timeout, datas de criação/atualização, source archive) **não puderam
+ser obtidos** — ver "Bloqueio de evidências".
+
+### 13.2 Referências locais encontradas (busca case-sensitive nos dois repos)
+
+| Origem | camelCase (`joinTournament`/`payPrize`/`requestWithdrawal`) | lowercase (substitutas) |
+|---|---|---|
+| Backend `functions/src/**` | **nenhuma** (só as lowercase são exportadas) | exports `jointournament`, `payprize`, `requestwithdrawal` |
+| Backend docs | só neste runbook | `backend_contract.md` (documentação) |
+| App Flutter `lib/**` | **nenhuma chamada** — `AppStrings.joinTournament` é um **rótulo de UI** ("Participar do torneio"), não uma função | nenhuma |
+| App Flutter — invocações de callable | **zero** (`httpsCallable`/`cloud_functions`/`FirebaseFunctions`/`.call(` ausentes) | zero |
+
+**Nenhum cliente local — backend ou Flutter — chama as versões camelCase (nem as
+lowercase).** O app Flutter atual (fase de autenticação) não invoca nenhuma
+Cloud Function.
+
+Achado adicional: as três funções camelCase **nunca existiram no histórico do Git
+deste repositório**. Foram implantadas a partir de um source que jamais foi
+versionado aqui — sua fonte de verdade é desconhecida/perdida.
+
+### 13.3 Resumo do código implantado
+
+**Não recuperado.** A recuperação do source implantado depende de
+`gcloud functions describe` (para obter o source archive) e do IAM apropriado —
+e o `gcloud` **não está instalado**. O `firebase` CLI não expõe `functions:describe`.
+Como as camelCase também não estão no Git, **não há cópia local** para inspecionar.
+
+Consequência: a comparação de segurança par a par (auth obrigatória, autorização
+admin, UID legado, custom claim, transaction, idempotência, inscrição duplicada,
+capacidade, `current_players`/`current_participants`, float vs centavos, validação
+de valores, collections/campos escritos, caminhos de alteração de saldo, bypasses)
+**não pôde ser feita ao nível de código-fonte**. O que segue é análise de **risco
+por assinatura**, não verificação de código.
+
+### 13.4 Atividade agregada (30 e 90 dias)
+
+**Não obtida.** Métricas agregadas de invocação exigem Cloud Logging/Monitoring
+via `gcloud`, indisponível. O `firebase functions:log` existe, mas (a) esta etapa
+proíbe ler mensagens/payloads de log, e (b) ele não produz contagens agregadas
+sem risco de PII. **Não foi possível distinguir invocação real de ruído interno**,
+nem determinar data da última invocação.
+
+### 13.5 Riscos (análise por assinatura, sem código-fonte)
+
+As três são callables **financeiras** rodando código **não versionado aqui** e que
+**provavelmente antecede o endurecimento** (float, UID admin fixo, bug dos campos
+de participante). Elas continuam **vivas e chamáveis agora**, e permanecerão vivas
+mesmo após o deploy das versões lowercase endurecidas (deploy por função não as
+toca). Isso é uma **superfície de bypass do hardening**:
+
+- `requestWithdrawal` — débito chamável por **qualquer usuário autenticado**. Se
+  rodar a lógica antiga em float, um cliente poderia sacar pela versão não
+  endurecida, contornando a aritmética em centavos. **Maior preocupação.**
+- `joinTournament` — débito de entry fee chamável por **qualquer usuário
+  autenticado**. Mesmo risco de bypass financeiro.
+- `payPrize` — crédito de prêmio **admin-gated** (UID fixo). Exposição limitada a
+  quem detém o UID admin, mas ainda é um caminho de escrita financeira não
+  endurecido.
+
+### 13.6 Classificação e recomendação por função
+
+| Função | Classificação | Recomendação |
+|---|---|---|
+| `joinTournament` | **insufficient-evidence** (inclina a *security-critical-retirement*) | Não deixar viva indefinidamente após o deploy endurecido; aposentar após verificação (13.7). |
+| `payPrize` | **insufficient-evidence** (inclina a *security-critical-retirement*) | Idem; exposição menor (admin-gated), mas é escrita financeira. |
+| `requestWithdrawal` | **insufficient-evidence** (inclina a *security-critical-retirement*) | Prioridade de aposentadoria — débito chamável por usuário. |
+
+**Por que nenhuma é `safe-to-retire`:** a regra exige comprovar "sem atividade
+recente relevante", o que a Fase 4 (bloqueada) **não permite verificar**. Sem
+source (Fase 3) nem métricas (Fase 4), a evidência é insuficiente para o selo
+`safe-to-retire` — apesar de não haver cliente local conhecido.
+
+### 13.7 Pré-condições para futura exclusão (autorização separada obrigatória)
+
+Exclusão **NÃO** é autorizada aqui. Antes de qualquer exclusão futura:
+
+1. Instalar e autenticar o `gcloud` com IAM de **leitura** (sem ampliar permissões).
+2. Recuperar e inspecionar o source implantado de cada camelCase (confirmar que
+   não têm lógica única e que a lowercase endurecida preserva o contrato).
+3. Confirmar **zero invocações nos últimos 90 dias** (Cloud Monitoring).
+4. Confirmar que **nenhum cliente** (qualquer app FlutterFlow/web) chama os nomes
+   camelCase.
+5. Só então excluir **deliberadamente, uma por vez**, por função:
+   `gcloud functions delete <NOME> --region us-central1 --project sparta-battle`
+   — **nunca** por `firebase deploy` amplo.
+
+### 13.8 Plano de verificação após a exclusão
+
+- `firebase functions:list --project sparta-battle`: a função excluída some, e as
+  **7 funções pretendidas permanecem intactas** (casing correto).
+- Auditoria estrutural read-only → **exit 0**.
+- Smoke test das lowercase endurecidas equivalentes com dados de teste.
+
+### 13.9 Bloqueio de evidências
+
+`gcloud` não instalado ⇒ Fases 3 (source implantado) e 4 (métricas de uso)
+**bloqueadas**. Não ampliar IAM, não contornar permissões, não instalar nem
+autenticar nada como parte desta etapa read-only. A classificação
+`insufficient-evidence` reflete diretamente esse bloqueio.
+
+> **AVISO:** a exclusão de qualquer função exige **autorização explícita e
+> separada**. Este documento é uma investigação; não autoriza remoção.
