@@ -2,6 +2,13 @@
 lib/**/*.js
 lib/**/*.js.map
 
+# Test build output (tsconfig.test.json). Reproducible via `npm run build:test`.
+lib-test/
+
+# Data-audit output. NEVER commit: even without document bodies, the reports can
+# contain wallet and tournament document ids, which identify real users.
+audit-reports/
+
 # TypeScript v1 declaration files
 typings/
 
