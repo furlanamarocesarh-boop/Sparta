@@ -418,3 +418,118 @@ autenticar nada como parte desta etapa read-only. A classificação
 
 > **AVISO:** a exclusão de qualquer função exige **autorização explícita e
 > separada**. Este documento é uma investigação; não autoriza remoção.
+
+---
+
+## 14. Atualização da investigação — gcloud instalado, conectividade TLS bloqueada
+
+O Google Cloud CLI (575.0.1) está **instalado e autenticado** (há conta ativa com
+acesso pretendido ao projeto). Porém, **toda chamada às APIs do Google falha na
+camada TLS** antes de chegar ao IAM.
+
+### 14.1 Bloqueio observado (sanitizado)
+
+Erro consistente: **falha de verificação de certificado TLS** (o CA bundle do
+gcloud não valida a conexão — sintoma clássico de proxy/firewall corporativo com
+inspeção TLS). Confirmado em **três** endpoints independentes:
+
+| Comando (read-only) | Endpoint | Resultado |
+|---|---|---|
+| `gcloud projects describe` | cloudresourcemanager | falha de certificado TLS |
+| `gcloud functions describe` | cloudfunctions | falha de certificado TLS |
+| `gcloud logging read` | cloudlogging | falha de certificado TLS |
+
+Não é `PERMISSION_DENIED` nem problema de flag — é transporte (TLS). O e-mail da
+conta, tokens e qualquer valor sensível **não foram impressos**.
+
+### 14.2 O que NÃO foi feito (por segurança)
+
+Deliberadamente **não** foi feito, pois seria contornar controles de segurança ou
+ampliar superfície de confiança sem autorização:
+
+- **não** desabilitar verificação de certificado (`REQUESTS_CA_BUNDLE`,
+  `SSL_CERT_FILE`, `--no-verify` ou equivalente);
+- **não** apontar `core/custom_ca_certs_file` para um CA arbitrário (o CA
+  corporativo legítimo não está disponível para este processo);
+- **não** reinstalar/reconfigurar o gcloud;
+- **não** alterar IAM nem ampliar permissões.
+
+### 14.3 Efeito nas fases bloqueadas
+
+| Fase | Status | Causa |
+|---|---|---|
+| 1 — metadados completos (`functions describe`) | **bloqueada** | falha TLS |
+| 2 — source implantado (download do archive) | **bloqueada** | falha TLS |
+| 3 — atividade agregada (Cloud Logging 30/90 dias) | **bloqueada** | falha TLS |
+
+Nenhum source foi recuperado; nenhuma contagem de invocação (30/90 dias) pôde ser
+apurada; nenhuma última-data-de-execução foi determinada. Sem `execution_id`
+acessível, **não** foram inventadas contagens.
+
+### 14.4 Pré-condição para desbloquear (fora desta etapa)
+
+Configurar uma **cadeia de confiança TLS válida para este ambiente** — tipicamente
+apontar o gcloud ao **CA raiz corporativo legítimo** via
+`gcloud config set core/custom_ca_certs_file <caminho-do-CA-corporativo>` (com o CA
+fornecido pela TI), **ou** executar a investigação de uma rede sem proxy de
+inspeção TLS. Isso exige o CA correto e autorização — não é uma decisão a tomar
+por conta própria contra APIs de produção financeira.
+
+---
+
+## 15. Veredito definitivo desta etapa
+
+Com metadados completos, source e métricas **todos bloqueados** (agora por TLS, não
+por ausência de ferramenta), a evidência continua **insuficiente** para o selo
+`safe-to-retire` das três funções.
+
+| Função | Classificação (definitiva nesta etapa) | Observação |
+|---|---|---|
+| `joinTournament` | **insufficient-evidence** | débito chamável por usuário; risco de bypass não verificável |
+| `payPrize` | **insufficient-evidence** | crédito admin-gated; escrita financeira não verificável |
+| `requestWithdrawal` | **insufficient-evidence** | débito chamável por usuário; prioridade de aposentadoria |
+
+O que **já está estabelecido** (Fase 1 anterior, sem rede): **zero referências**
+no backend e no app Flutter atual; nenhum cliente local as invoca; nenhum usuário
+ou dinheiro real; todo dado atual é de teste; as substitutas lowercase endurecidas
+existem e preservam o contrato. O que **falta** para fechar o veredito: código
+implantado (Fase 2) e atividade agregada (Fase 3) — ambos bloqueados por TLS.
+
+### Recomendação
+
+Não deixar as camelCase vivas indefinidamente após o deploy endurecido; porém
+**não excluir** sem antes: (a) restaurar conectividade TLS e recuperar o source
+implantado + as métricas de 90 dias; ou (b) uma decisão explícita e autorizada de
+aposentar mesmo sem esses dados, aceitando o risco — justificável porque não há
+cliente local, nem usuários/dinheiro reais, e as substitutas endurecidas existem.
+A exclusão continua exigindo **autorização separada**.
+
+---
+
+## 16. Ordem futura segura (aposentadoria das camelCase)
+
+1. **Resolver as dependências high** de runtime (grpc-js, form-data, protobufjs) —
+   fix não-breaking, com `npm audit` revisto e suíte reexecutada (etapa própria).
+2. **Fixar as regiões no código** — em especial `onUserCreated` (`.region('us-east1')`)
+   antes de qualquer deploy dele; confirmar us-central1 para as callables.
+3. **Implantar as substitutas lowercase** endurecidas, **por função**
+   (`--only functions:NOME`), na ordem do §6.
+4. **Executar os smoke tests** (dados de teste) e a **auditoria read-only** após
+   cada etapa financeira, exigindo exit 0.
+5. **Excluir as camelCase somente com autorização separada**, uma por vez, por
+   função (`gcloud functions delete <NOME> --region us-central1 --project
+   sparta-battle`) — **nunca** por `firebase deploy` amplo. Pré-condições em §13.7.
+6. **Verificar** `firebase functions:list` (as 7 pretendidas intactas, casing
+   correto; camelCase ausentes) e a **auditoria estrutural read-only** (exit 0).
+
+### Rollback (reforço)
+
+- Por função: reverter o código ao estado `b70c159` e redeployar **só** aquela
+  função. Contrato externo idêntico ⇒ sem migração de dados, sem efeito nas demais.
+- A exclusão de uma camelCase **não** tem rollback trivial (recriar exigiria o
+  source perdido) — por isso ela vem **por último** e só após verificação completa.
+
+### Proibição (reforço)
+
+- ❌ **Nunca** `firebase deploy` amplo nem `--only functions` (todas): excluiria as
+  camelCase de forma não controlada. Todo deploy é **por função**.
