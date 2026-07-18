@@ -601,3 +601,116 @@ endurecidas existem.
   independe daquele canal TLS. Ou seja: o deploy das lowercase pode prosseguir sob
   autorização mesmo com o gcloud bloqueado.
 - ❌ Nunca recomendar deploy amplo.
+
+---
+
+## 18. Aposentadoria das funções legadas camelCase — PREPARADA (não executada)
+
+Preparação para excluir as três funções antigas camelCase. **Nada foi excluído.**
+A exclusão exige **autorização literal separada**.
+
+### 18.1 Resultado do smoke (sanitizado)
+
+O smoke autenticado de produção, limitado às seis funções lowercase implantadas,
+foi concluído com sucesso pelo operador (dados e valores exclusivamente de teste):
+
+- **9 chamadas HTTPS**: **6 sucessos** + **3 already-exists** esperados;
+- **segunda execução**: estado `completed`, **zero** novas chamadas e **zero**
+  novas escritas (idempotência comprovada);
+- **auditoria estrutural read-only final: exit 0**;
+- carteiras e torneios validados; identidade contábil do jogador exata em centavos;
+- credenciais temporárias removidas do ambiente após o uso.
+
+Nenhum e-mail, UID, token, API key, id de documento ou valor individual é registrado.
+
+**Conclusão prática:** as substitutas lowercase endurecidas — `requestwithdrawal`,
+`jointournament`, `payprize` — foram exercidas de ponta a ponta e comprovadas
+corretas em produção. Elas cobrem integralmente o contrato das camelCase.
+
+### 18.2 Inventário de produção (confirmado)
+
+`firebase functions:list --project sparta-battle` → **10 funções** (todas Gen 1
+`v1`, `nodejs20`, 256 MB):
+
+| Grupo | Funções | Região |
+|---|---|---|
+| 7 pretendidas — callables | `createTournament`, `createtournament`, `jointournament`, `payprize`, `requestwithdrawal`, `testdeposit` | us-central1 |
+| 7 pretendidas — trigger | `onUserCreated` | **us-east1** |
+| 3 legadas camelCase | `joinTournament`, `payPrize`, `requestWithdrawal` | us-central1 |
+
+### 18.3 Referências (busca case-sensitive nos dois repositórios)
+
+**Nenhum cliente ou código ativo chama as três camelCase:**
+
+- Backend (`functions/src/**`): **não** exporta nenhuma camelCase; as ocorrências
+  estão só em documentação e num teste que **assere que os aliases não existem**.
+- App Flutter (`D:\sparta_battle\lib/**`): `AppStrings.joinTournament` é um
+  **rótulo de UI** ("Participar do torneio"), não uma chamada de função;
+  `payPrize` e `requestWithdrawal` têm **zero** ocorrências; o app não invoca
+  nenhuma callable.
+
+### 18.4 Motivo de segurança para aposentar
+
+As três camelCase são callables **financeiras** cujo **source nunca foi
+versionado** neste repositório (não estão no histórico do Git) e que
+**provavelmente antecedem o endurecimento** (aritmética em float, UID admin fixo,
+bug dos campos de participante). Enquanto vivas, são uma **superfície de bypass do
+hardening**: um cliente que conheça o nome camelCase poderia chamar a versão **não
+endurecida** em vez da lowercase corrigida — em especial `requestWithdrawal` e
+`joinTournament`, que são débitos chamáveis por qualquer usuário autenticado.
+Agora que as lowercase estão implantadas e comprovadas pelo smoke, manter as
+camelCase vivas é um risco sem contrapartida.
+
+### 18.5 Ordem de exclusão proposta
+
+Por prioridade de risco (débito chamável por usuário primeiro; admin-gated por
+último):
+
+1. **`requestWithdrawal`** — débito de saque chamável por qualquer usuário.
+2. **`joinTournament`** — débito de entry fee chamável por qualquer usuário.
+3. **`payPrize`** — crédito admin-gated (exposição menor).
+
+### 18.6 Comandos exatos de exclusão (individuais, us-central1) — NÃO executar
+
+Cada função é excluída **individualmente**, **por nome**, na região `us-central1`.
+Nunca um comando amplo. Rodar de `D:\Projects\spartagg`.
+
+```
+firebase functions:delete requestWithdrawal --region us-central1 --project sparta-battle
+firebase functions:delete joinTournament    --region us-central1 --project sparta-battle
+firebase functions:delete payPrize          --region us-central1 --project sparta-battle
+```
+
+O `functions:delete` pede confirmação interativa; acrescente `--force` apenas se a
+execução for não interativa e já autorizada. **As sete funções pretendidas nunca
+aparecem nestes comandos.**
+
+### 18.7 Verificação após CADA exclusão
+
+Depois de excluir **cada** função, antes de prosseguir para a próxima:
+
+1. `firebase functions:list --project sparta-battle` — confirmar que:
+   - a função camelCase excluída **sumiu**;
+   - as **7 funções pretendidas continuam presentes** com casing e região corretos;
+   - as demais camelCase ainda não excluídas continuam presentes;
+   - a contagem total caiu exatamente **1**.
+2. Auditoria estrutural read-only:
+   `cd functions && node lib/audit/cli.js --project sparta-battle --confirm-read-only-production-audit`
+   — deve retornar **exit 0** (a exclusão de função não altera dados).
+
+Se qualquer verificação falhar, **PARAR** e não excluir a próxima.
+
+### 18.8 Rollback — NÃO é automático
+
+O source das camelCase **não existe localmente** (nunca foi versionado). Portanto
+uma exclusão **não tem rollback trivial**: recriar exigiria reconstruir o código
+perdido. Por isso a exclusão vem **por último** em todo o processo, **uma por
+vez**, e **somente** após o smoke ter comprovado as lowercase — como já ocorreu.
+A mitigação de risco é a ordem individual + verificação a cada passo, não um
+rollback.
+
+### 18.9 Autorização
+
+A exclusão de **cada** função exige **autorização literal e separada**. Este
+documento apenas **prepara** os comandos e a verificação; **nenhuma exclusão foi
+executada**.
