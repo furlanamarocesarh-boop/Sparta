@@ -22,13 +22,14 @@
     "firebase-admin": "^13.6.0",
     "firebase-functions": "^7.0.0"
   },
-  "//overrides": "Bump só os pacotes transitivos com advisory high de runtime para a última versão patch/minor da mesma major (não-breaking). grpc-js é escopado sob google-gax para não tocar o @grpc/grpc-js@1.9.x dev (não vulnerável). protobufjs em 7.6.5 (última 7.x) cobre GHSA-wcpc-wj8m-hjx6 (high, <=7.6.0) sem ir para a major 8. Direct deps inalteradas. Remover quando firebase-admin trouxer estas versões por conta própria.",
+  "//overrides": "Bump só os pacotes transitivos com advisory high/critical de runtime para a última versão patch/minor da mesma major (não-breaking). grpc-js é escopado sob google-gax para não tocar o @grpc/grpc-js@1.9.x dev (não vulnerável). protobufjs em 7.6.5 (última 7.x) cobre GHSA-wcpc-wj8m-hjx6 (high, <=7.6.0) sem ir para a major 8. websocket-driver em 0.7.5 cobre GHSA-mp7j-qc5w-4988 / CVE-2026-54490 (critical, <0.7.5) na cadeia firebase-admin>@firebase/database-compat>@firebase/database>faye-websocket; patch da mesma major 0.7.x, não-breaking; RTDB/WebSocket não é usado pelo source (só admin.firestore()). Direct deps inalteradas. Remover quando firebase-admin trouxer estas versões por conta própria.",
   "overrides": {
     "google-gax": {
       "@grpc/grpc-js": "1.14.4"
     },
     "form-data": "2.5.6",
-    "protobufjs": "7.6.5"
+    "protobufjs": "7.6.5",
+    "websocket-driver": "0.7.5"
   },
   "devDependencies": {
     "@firebase/rules-unit-testing": "5.0.1",

@@ -576,9 +576,10 @@ master**. Chega por `firebase-admin → @firebase/database (Realtime Database) �
 faye-websocket → websocket-driver`; como estas funções usam **Firestore, não
 RTDB**, ele **não é alcançável** por este código na prática. Fix é **não-breaking**
 (override `websocket-driver@0.7.5`), mas é uma mudança de dependência — deliberadamente
-**fora** do commit de documentação da aposentadoria. **Pendência:** resolver numa
-etapa própria de manutenção de dependências (junto com as 10 moderate), com
-`npm audit` revisto e suíte reexecutada.
+**fora** do commit de documentação da aposentadoria. **Resolvido em §20** (branch
+`fix/websocket-driver-advisory`), numa etapa própria de manutenção de dependências,
+com `npm audit` revisto e suíte reexecutada. As **10 moderate** permanecem
+documentadas (fix só em `firebase-admin@14.x`, major/breaking).
 
 ### 17.2 Regiões explícitas — FIXADAS
 
@@ -778,3 +779,97 @@ O source das camelCase **nunca foi versionado**, então as exclusões são
 **definitivas**: elas não podem ser recriadas a partir do repositório. Isso era
 esperado e mitigado pela ordem individual + verificação por etapa + smoke prévio,
 não por um rollback. As lowercase endurecidas continuam sendo a fonte de verdade.
+
+---
+
+## 20. Advisory websocket-driver — CORRIGIDO localmente (branch `fix/websocket-driver-advisory`)
+
+Correção **mínima e não-breaking** do critical transitivo rastreado em §17.1.
+**Nenhum deploy** nesta etapa — só alteração local de `package.json` +
+`package-lock.json` + esta documentação.
+
+### 20.1 O advisory
+
+- **ID:** GHSA-mp7j-qc5w-4988 / **CVE-2026-54490**.
+- **Tipo:** **CWE-770** — bypass do limite de recursos via a extensão
+  `permessage-deflate`. O limite de tamanho é conferido contra o *length header*
+  dos frames (tamanho **comprimido**), não o tamanho **após** a descompressão,
+  permitindo mensagens sobredimensionadas escaparem do controle de recursos
+  (classe de negação de serviço / exaustão de memória).
+- **Pacote:** `websocket-driver`. **Afetadas:** `< 0.7.5`. **Corrigida:** `0.7.5`.
+
+### 20.2 Divergência de severidade — registrada sem minimizar
+
+| Fonte | Severidade | Base |
+|---|---|---|
+| `npm audit` | **critical** | classificação da base do npm |
+| GitHub Advisory (Reviewed) | **Moderate** | **CVSS 6.3 (v4)** |
+
+As duas fontes **divergem**: o npm marca **critical**; o GitHub-Reviewed marca
+**Moderate (6.3)**. **Não usamos a nota menor para minimizar o problema** — a
+correção foi tratada com a **urgência da severidade maior (critical do npm)** e
+aplicada de imediato. A menor exploração prática (ver 20.4) é anotada como
+**contexto de alcançabilidade**, não como desculpa para adiar: o pacote foi
+corrigido mesmo assim.
+
+### 20.3 Correção aplicada (menor mudança possível)
+
+- Adicionado `"websocket-driver": "0.7.5"` ao bloco **`overrides`** já existente em
+  `functions/package.json` (mesma major `0.7.x`; **patch**, não-breaking).
+- Lockfile **regenerado com `npm install` normal** — sem `npm audit fix`, sem
+  `--force`, sem edição manual do `package-lock.json`.
+- **Direct deps inalteradas:** `firebase-admin ^13.6.0`, `firebase-functions ^7.0.0`.
+  Sem upgrade major, sem tocar `src/index.ts`.
+
+| Pacote (transitivo) | Antes | Depois | Advisory coberto |
+|---|---|---|---|
+| `websocket-driver` (runtime) | 0.7.4 | 0.7.5 | GHSA-mp7j-qc5w-4988 / CVE-2026-54490 (critical no npm / Moderate 6.3 no GitHub) |
+
+**Cadeia transitiva (runtime, `--omit=dev`):**
+
+```
+firebase-admin@13.9.0
+  └─ @firebase/database-compat@2.1.4
+     └─ @firebase/database@1.1.3            (Realtime Database)
+        └─ faye-websocket@0.11.4
+           └─ websocket-driver@0.7.4 → 0.7.5 (overridden)
+```
+
+(A mesma folha também aparece pela via **dev** `@firebase/rules-unit-testing →
+firebase@12.16.0 → @firebase/database`; o override cobre **ambas** — `npm ls`
+resolve `0.7.5 overridden` em toda a árvore, nenhuma `<0.7.5` remanescente.)
+
+### 20.4 Ausência de uso de RTDB/WebSocket no source
+
+O código das funções usa **exclusivamente `admin.firestore()`** — **não** há
+`admin.database()`, `getDatabase()`, `.ref(...)`, `onDisconnect`, nem qualquer
+servidor/cliente WebSocket, e **nenhum import direto** de `websocket-driver` ou
+`faye-websocket`. O pacote entra **apenas** como transitivo do subsistema Realtime
+Database do `firebase-admin`, que este backend **não exercita**. Portanto o vetor
+`permessage-deflate` **não é alcançável** por este código na prática — ainda assim
+a dependência foi corrigida (20.2).
+
+### 20.5 Resultado da auditoria
+
+- **Runtime (`npm audit --omit=dev`): 0 critical, 0 high.** O critical do
+  websocket-driver **saiu**. Restam **10 moderate** (todas transitivas via
+  `firebase-admin`; correção só em `firebase-admin@14.x`, **major/breaking** —
+  mantidas documentadas, não mascaradas, para uma etapa própria de upgrade).
+- `npm ls websocket-driver` → **somente `0.7.5 overridden`**; nenhuma `<0.7.5`.
+
+### 20.6 Plano seletivo futuro das 7 funções (quando houver deploy autorizado)
+
+A correção é local; para chegar em produção, **cada** função precisa ser
+reimplantada, pois **todas as 7 compartilham o mesmo pacote de dependências**
+(`functions/node_modules`). O deploy deve ser **seletivo, função a função**, com
+verificação após cada uma — **nunca deploy amplo**:
+
+- **`onUserCreated`** — atualizada **individualmente** em **us-east1**
+  (`firebase deploy --only functions:onUserCreated`).
+- **Seis callables** (`testdeposit`, `requestwithdrawal`, `jointournament`,
+  `payprize`, `createTournament`, `createtournament`) — atualizadas
+  **individualmente** em **us-central1**, uma por vez.
+- Entre cada deploy: `functions:list` + auditoria estrutural read-only (exit 0).
+- ❌ Nunca `firebase deploy --only functions` sem alvo (deploy amplo).
+- **Autorização literal e separada** é obrigatória para cada deploy (nada nesta
+  etapa autoriza deploy).
