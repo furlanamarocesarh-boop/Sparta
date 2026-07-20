@@ -562,11 +562,23 @@ mudar Node 20 nem `firebase-functions/v1`.
   (`<=7.5.7`), a base publicou um segundo high `<=7.6.0`; 7.6.5 cobre ambos sem ir
   para a major 8.
 
-**Resultado:** runtime com **0 critical, 0 high**. Restam **10 moderate de
-runtime** (todas transitivas via `firebase-admin`; correção só em
+**Resultado (na data do §17):** runtime com **0 critical, 0 high**. Restam
+**10 moderate de runtime** (todas transitivas via `firebase-admin`; correção só em
 `firebase-admin@14.x`, que é **major/breaking** — deixadas **documentadas, não
 mascaradas**, para uma etapa própria de upgrade com plano de teste). Vulns
 somente-dev (fora do pacote de deploy): não bloqueiam.
+
+**Atualização (2026-07-18) — novo critical transitivo, RASTREADO à parte.** Um
+advisory publicado **depois** do §17 passou a sinalizar `websocket-driver@0.7.4`
+como **critical** (GHSA-mp7j-qc5w-4988, corrigido em `0.7.5`). Não decorre de
+nenhuma mudança de dependência (o lockfile não mudou) e **já está presente em
+master**. Chega por `firebase-admin → @firebase/database (Realtime Database) →
+faye-websocket → websocket-driver`; como estas funções usam **Firestore, não
+RTDB**, ele **não é alcançável** por este código na prática. Fix é **não-breaking**
+(override `websocket-driver@0.7.5`), mas é uma mudança de dependência — deliberadamente
+**fora** do commit de documentação da aposentadoria. **Pendência:** resolver numa
+etapa própria de manutenção de dependências (junto com as 10 moderate), com
+`npm audit` revisto e suíte reexecutada.
 
 ### 17.2 Regiões explícitas — FIXADAS
 
@@ -713,4 +725,56 @@ rollback.
 
 A exclusão de **cada** função exige **autorização literal e separada**. Este
 documento apenas **prepara** os comandos e a verificação; **nenhuma exclusão foi
-executada**.
+executada** (na §18).
+
+---
+
+## 19. Aposentadoria das funções legadas camelCase — CONCLUÍDA
+
+**Data de conclusão: 2026-07-18.**
+
+As três funções legadas camelCase foram **excluídas de produção**, cada uma sob
+**autorização literal e separada**, na ordem preparada (§18.5). O **smoke
+autenticado de produção foi aprovado ANTES** de qualquer exclusão, comprovando de
+ponta a ponta as substitutas lowercase endurecidas.
+
+### 19.1 Exclusões executadas
+
+Cada função foi excluída **individualmente, por nome, em `us-central1`**
+(`firebase functions:delete <nome> --region us-central1 --project sparta-battle`),
+com `functions:list` + auditoria estrutural read-only (**exit 0**) após **cada**
+etapa:
+
+| Ordem | Função (camelCase) | Resultado | Total |
+|---|---|---|---|
+| 1 | `requestWithdrawal` | removida | 10 → 9 |
+| 2 | `joinTournament` | removida | 9 → 8 |
+| 3 | `payPrize` | removida | 8 → 7 |
+
+Verificação case-sensitive após cada exclusão: a camelCase alvo **removida**, a
+lowercase correspondente **preservada**, as sete pretendidas intactas, e a
+auditoria de dados **exit 0** ("Nenhum documento foi alterado").
+
+### 19.2 Substitutas lowercase preservadas
+
+`requestwithdrawal`, `jointournament`, `payprize` — implantadas, aprovadas no
+smoke e **intocadas** pelas exclusões. Cobrem integralmente o contrato das
+camelCase removidas.
+
+### 19.3 Estado final de produção — 7 funções
+
+| Grupo | Funções | Região |
+|---|---|---|
+| Callables | `createTournament`, `createtournament`, `jointournament`, `payprize`, `requestwithdrawal`, `testdeposit` | us-central1 |
+| Trigger | `onUserCreated` | us-east1 |
+
+**Nenhuma função camelCase legada permanece.** A superfície de bypass do
+hardening foi eliminada: só rodam em produção as sete funções pretendidas, todas
+correspondendo ao source endurecido em `master`.
+
+### 19.4 Rollback — não há rollback trivial
+
+O source das camelCase **nunca foi versionado**, então as exclusões são
+**definitivas**: elas não podem ser recriadas a partir do repositório. Isso era
+esperado e mitigado pela ordem individual + verificação por etapa + smoke prévio,
+não por um rollback. As lowercase endurecidas continuam sendo a fonte de verdade.
