@@ -1,4 +1,3 @@
-import { LEGACY_ADMIN_UID } from "../domain/adminAuth.js";
 import { computeFingerprint } from "./fingerprint.js";
 import {
   APPLY_FLAG,
@@ -21,6 +20,7 @@ import {
   renderDryRun,
   renderWriteSuccess,
 } from "./plan.js";
+import { ADMIN_ACCOUNT_UID } from "./target.js";
 
 /**
  * Local, guarded, NON-DEPLOYABLE tool that assigns the `admin: true` custom claim
@@ -30,8 +30,8 @@ import {
  *  - The guard runs and must approve BEFORE firebase-admin is even imported. The
  *    import is dynamic for exactly this reason: a refused or help run never loads
  *    the SDK, resolves credentials, or opens a connection.
- *  - The target is ALWAYS LEGACY_ADMIN_UID from the central module. It cannot be
- *    passed by argument.
+ *  - The target is ALWAYS ADMIN_ACCOUNT_UID from this tool's local `target.ts`.
+ *    It cannot be passed by argument, and it is not an authorization mechanism.
  *  - Dry-run is the default and only ever reads (Auth + `users`/`wallets` docs).
  *  - The ONLY possible write in the entire file is a single setCustomUserClaims,
  *    reached only in --apply, only after every confirmation, only after a fresh
@@ -145,7 +145,7 @@ async function main(): Promise<number> {
   const admin = await loadAdmin();
   admin.initializeApp({ projectId: PRODUCTION_PROJECT_ID });
 
-  const uid = LEGACY_ADMIN_UID;
+  const uid = ADMIN_ACCOUNT_UID;
 
   if (decision.mode === "dry-run") {
     const { state, fingerprint } = await readState(admin, uid);

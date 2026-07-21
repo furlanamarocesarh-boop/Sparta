@@ -10,7 +10,7 @@ import {
   RulesTestEnvironment,
 } from "@firebase/rules-unit-testing";
 
-import { LEGACY_ADMIN_UID } from "../../src/domain/adminAuth.js";
+import { ADMIN_ACCOUNT_UID } from "../../src/adminclaim/target.js";
 
 /**
  * Firestore security-rules tests, run against the LOCAL emulator.
@@ -96,8 +96,10 @@ const asOwner = () => testEnv.authenticatedContext(OWNER).firestore();
 const asOther = () => testEnv.authenticatedContext(OTHER).firestore();
 const asClaimAdmin = () =>
   testEnv.authenticatedContext(CLAIM_ADMIN, { admin: true }).firestore();
-const asLegacyAdmin = () =>
-  testEnv.authenticatedContext(LEGACY_ADMIN_UID).firestore();
+// Phase 2: the historical admin uid, signed in WITHOUT the admin claim. It must
+// now be treated as an ordinary user — the UID fallback is gone.
+const asLegacyUidNoClaim = () =>
+  testEnv.authenticatedContext(ADMIN_ACCOUNT_UID).firestore();
 
 describe("signed-out access", () => {
   it("denies reading users, wallets and tournaments", async () => {
@@ -220,10 +222,13 @@ describe("tournaments", () => {
     );
   });
 
-  it("still lets the legacy admin write tournaments during the transition", async () => {
-    // If this fails, publishing these rules would lock the existing admin out.
-    await assertSucceeds(
-      asLegacyAdmin().doc("tournaments/t1").update({ status: "closed" })
+  it("denies the historical admin uid (no claim) writing tournaments", async () => {
+    // Phase 2: without the claim, the legacy uid is just a user and is denied.
+    await assertFails(
+      asLegacyUidNoClaim().doc("tournaments/t1").update({ status: "closed" })
+    );
+    await assertFails(
+      asLegacyUidNoClaim().doc("tournaments/t9").set({ name: "Fake" })
     );
   });
 });
@@ -234,17 +239,19 @@ describe("admin reads", () => {
     await assertSucceeds(asClaimAdmin().doc(`wallets/${OWNER}`).get());
   });
 
-  it("lets the legacy admin read any user and wallet during the transition", async () => {
-    await assertSucceeds(asLegacyAdmin().doc(userPath(OWNER)).get());
-    await assertSucceeds(asLegacyAdmin().doc(`wallets/${OWNER}`).get());
+  it("denies the historical admin uid (no claim) reading any user or wallet", async () => {
+    await assertFails(asLegacyUidNoClaim().doc(userPath(OWNER)).get());
+    await assertFails(asLegacyUidNoClaim().doc(`wallets/${OWNER}`).get());
   });
 
-  it("does not grant admin for a truthy-but-not-true claim", async () => {
-    const fake = testEnv
-      .authenticatedContext("fake-admin", { admin: "true" })
-      .firestore();
-    await assertFails(fake.doc(userPath(OWNER)).get());
-    await assertFails(fake.doc("tournaments/t1").set({ name: "Fake" }));
+  it("does not grant admin for a truthy-but-not-true or falsy claim", async () => {
+    for (const claim of [{ admin: "true" }, { admin: "false" }, { admin: 1 }]) {
+      const fake = testEnv
+        .authenticatedContext("fake-admin", claim)
+        .firestore();
+      await assertFails(fake.doc(userPath(OWNER)).get());
+      await assertFails(fake.doc("tournaments/t1").set({ name: "Fake" }));
+    }
   });
 });
 
@@ -256,19 +263,21 @@ describe("unknown collections", () => {
   });
 
   it("keeps the deny-all fallback even for an admin", async () => {
-    await assertFails(asLegacyAdmin().doc("anything/else").set({ a: 1 }));
+    await assertFails(asClaimAdmin().doc("anything/else").set({ a: 1 }));
   });
 });
 
-// Sanity: the rules file we loaded really is the one under test.
+// Sanity: the rules file we loaded really is the one under test, and it no
+// longer contains the legacy UID fallback.
 describe("rules file", () => {
-  it("is version 2 and contains the transitional admin check", () => {
+  it("is version 2, checks the claim, and has NO legacy UID fallback", () => {
     const rules = readFileSync(
       resolve(process.cwd(), "..", "firestore.rules"),
       "utf8"
     );
     assert.match(rules, /rules_version = '2'/);
     assert.match(rules, /hasAdminClaim/);
-    assert.match(rules, /isLegacyAdmin/);
+    assert.doesNotMatch(rules, /isLegacyAdmin/);
+    assert.doesNotMatch(rules, /Fnj4w17/);
   });
 });
