@@ -3,8 +3,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import { LEGACY_ADMIN_UID } from "../../src/domain/adminAuth.js";
 import { computeFingerprint } from "../../src/adminclaim/fingerprint.js";
+import { ADMIN_ACCOUNT_UID } from "../../src/adminclaim/target.js";
 import {
   APPLY_FLAG,
   CONFIRM_FLAG,
@@ -395,7 +395,7 @@ describe("output — never leaks uid, email, token, or full claims", () => {
       state,
       plan: planAdminClaim(state),
     });
-    assert.ok(!out.includes(LEGACY_ADMIN_UID), "must not print the legacy uid");
+    assert.ok(!out.includes(ADMIN_ACCOUNT_UID), "must not print the account uid");
     assert.ok(!out.includes(SENSITIVE_VALUE), "must not print a claim value");
     assert.ok(!out.includes(SENSITIVE_KEY), "must not print a claim key");
     // It DOES surface the safe, non-identifying facts.
@@ -418,7 +418,7 @@ describe("output — never leaks uid, email, token, or full claims", () => {
     assert.ok(cmd.includes(CONFIRMATION_PHRASE));
     assert.ok(cmd.includes("FP-HASH"));
     assert.ok(cmd.includes(`--project ${PRODUCTION_PROJECT_ID}`));
-    assert.ok(!cmd.includes(LEGACY_ADMIN_UID));
+    assert.ok(!cmd.includes(ADMIN_ACCOUNT_UID));
   });
 });
 

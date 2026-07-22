@@ -9,8 +9,8 @@
  * Default posture: DRY-RUN, and REFUSE anything unsafe. A write to production
  * Auth is only reachable when the operator names the exact project AND passes
  * every confirmation flag AND an expected fingerprint. Nothing is implicit, and
- * the target UID can NEVER come from an argument — it is always LEGACY_ADMIN_UID
- * from the central module.
+ * the target UID can NEVER come from an argument — it is always ADMIN_ACCOUNT_UID
+ * from this tool's local `target.ts`.
  */
 
 /** The one project this tool may ever touch. Never a default, never inferred. */
@@ -24,10 +24,10 @@ export const CONFIRMATION_PHRASE = "ADD_ADMIN_CLAIM_KEEP_LEGACY_FALLBACK";
 export const EXPECTED_FINGERPRINT_FLAG = "--expected-fingerprint";
 
 /**
- * Flags that would name a target. The target is ALWAYS `LEGACY_ADMIN_UID` from
- * the central module — accepting any of these, even to "double-check", would let
- * a caller point this tool at an arbitrary account. Their mere presence is
- * refused, and their VALUE is never read.
+ * Flags that would name a target. The target is ALWAYS `ADMIN_ACCOUNT_UID` from
+ * this tool's local `target.ts` — accepting any of these, even to "double-check",
+ * would let a caller point this tool at an arbitrary account. Their mere presence
+ * is refused, and their VALUE is never read.
  */
 export const FORBIDDEN_TARGET_FLAGS = [
   "--uid",
