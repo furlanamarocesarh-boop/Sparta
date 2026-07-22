@@ -583,14 +583,25 @@ export const payprize = central.https.onCall(async (data, context) => {
   }
 });
 
-const createTournamentHandler = async (
+// Exported for behavioral tests of the authorization ordering. This is a plain
+// function (no trigger metadata), so it is NOT a deployable endpoint — only the
+// `createTournament` / `createtournament` onCall wrappers below are. Both wrap
+// this same guarded handler.
+export const createTournamentHandler = async (
   data: any,
   context: any
 ): Promise<Record<string, unknown>> => {
   try {
-    const callerAuth = assertSignedIn(
+    // ADMIN-ONLY. Authorization runs BEFORE any payload validation, document
+    // read, persistent-reference creation, transaction, batch, or write. It uses
+    // the same centralized claim check as the other admin callables: a UID or an
+    // email grants nothing, and `admin` must be boolean true. An unauthenticated
+    // caller gets `unauthenticated`; an authenticated non-admin gets
+    // `permission-denied` — both before the handler touches Firestore.
+    const callerAuth = assertAdmin(
       context,
-      "Você precisa estar logado para criar um campeonato."
+      "Você precisa estar logado para criar um campeonato.",
+      "Apenas admin pode criar campeonatos."
     );
 
     const uid = callerAuth.uid;

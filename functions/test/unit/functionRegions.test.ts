@@ -81,10 +81,11 @@ describe("regiões explícitas por função", () => {
 
   it("os sete exports originais existem, com casing idêntico", async () => {
     const fns = await loadFunctions();
-    // Só exports que SÃO função — ignora `default`/`__esModule` do interop
-    // CommonJS↔ESM ao importar dinamicamente o módulo compilado.
+    // Só exports que SÃO gatilho implantável (têm `__trigger`) — ignora
+    // `default`/`__esModule` do interop CommonJS↔ESM e quaisquer helpers
+    // exportados que NÃO são funções deployáveis (ex.: createTournamentHandler).
     const exported = Object.keys(fns)
-      .filter((k) => typeof (fns as Record<string, unknown>)[k] === "function")
+      .filter((k) => (fns[k] as ExportedFn).__trigger != null)
       .sort();
     assert.deepEqual(exported, [
       "createTournament",
