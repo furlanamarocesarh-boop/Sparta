@@ -2,40 +2,37 @@
 
 ## Where we are
 
-**Phase 1 is COMPLETE.** The `admin: true` custom claim was assigned to the
-administrator account by the guarded tool and **confirmed in a real app ID
-token** — the in-app diagnostic returned `ADMIN: TRUE` after a forced token
-refresh. (That temporary in-app button has since been removed.)
+**Both phases are COMPLETE and verified in production.** Administrator access is
+now granted by the `admin: true` custom claim ALONE — in the deployed Cloud
+Functions and in the published Firestore Rules. The legacy-UID fallback has been
+removed from production.
 
-**Phase 2 is prepared IN CODE, but NOT in production.** On this branch the
-deployable authorization has been reduced to the claim alone:
+- **Phase 1 — grant the claim (done).** The `admin: true` custom claim was
+  assigned to the administrator account by the guarded `admin:claim` tool and
+  **confirmed in a real app ID token** — the in-app diagnostic returned
+  `ADMIN: TRUE` after a forced token refresh. (That temporary in-app button has
+  since been removed.)
+- **Phase 2 — remove the fallback (done in production).** The claim-only code was
+  merged to `master`, then rolled out: the seven functions were redeployed and
+  `firestore.rules` was republished, all claim-only. See "Stage 2" below for the
+  full rollout record.
 
-| Where | Deployable code (this branch) | Production right now |
-|---|---|---|
-| `functions/src/domain/adminAuth.ts` | `hasAdminClaim()`, `isAdmin() = hasAdminClaim()` — no UID | still runs the **deployed** build, which **accepts the legacy UID** |
-| `firestore.rules` | claim-only `isAdmin()`; `isLegacyAdmin()` deleted | the **published** rules **still accept the legacy UID** |
+| Where | Authorization now |
+|---|---|
+| `functions/src/domain/adminAuth.ts` (deployed) | `isAdmin() = hasAdminClaim()` — claim only, no UID |
+| `firestore.rules` (published) | `isAdmin()` claim-only; `isLegacyAdmin()` removed |
 
 The legacy identifier no longer exists in any deployable path. It survives ONLY
 inside the local, non-deployable `admin:claim` tool
 (`functions/src/adminclaim/target.ts` → `ADMIN_ACCOUNT_UID`), which uses it only
 to name which account to grant/verify the claim — **never to authorize**.
 
-## Why production still accepts the legacy UID
+## Current authorization
 
-Because removing it from production first would be an outage, not a hardening.
-
-A custom claim is **baked into the ID token at sign-in**. Assigning the claim
-server-side does *not* retroactively change a token the administrator is already
-holding. So if the UID fallback were removed from production before the claim was
-live and the token refreshed, the only administrator could be locked out of
-`testdeposit`, `payprize`, and every tournament write — with no way back in
-through the app.
-
-Phase 1 has now removed that risk (the claim is live and confirmed), but the
-code change of phase 2 only takes effect in production once the claim-only
-functions are **deployed** and the claim-only rules are **published** — together
-(see the coordinated rollout below). Until that authorized rollout, production
-keeps both routes.
+Only `admin === true` as a **boolean** authorizes administrative operations.
+Nothing else does: a **UID**, an **email**, or `admin` as the **string** `"true"`
+(or any other truthy non-boolean) grants no access. This holds identically in the
+Cloud Functions (`=== true`) and the Firestore Rules (`== true`).
 
 ## Stage 1 — grant the claim (does not change any behavior)
 
@@ -77,7 +74,8 @@ value.
   the target's uid + disabled + existing claims, and the plan (add-claim,
   no-op, or an abort). If `admin` is already exactly `true`, it is a **no-op**.
 
-- **Apply** (a future step — do not run yet) requires, simultaneously:
+- **Apply** (performed in phase 1; shown here for reference) requires,
+  simultaneously:
 
   ```
   npm run admin:claim -- --project sparta-battle --apply \
@@ -114,53 +112,76 @@ and the fallback is simply redundant.
   after the claim has been tested for real — see below. Stage 1 never touches the
   fallback in either `adminAuth.ts` or `firestore.rules`.
 
-## Stage 2 — remove the fallback (code-complete; production PENDING)
+## Stage 2 — remove the fallback (COMPLETE in production)
 
-**The code change is done on branch `feature/remove-legacy-admin-fallback`:**
+The claim-only code (branch `feature/remove-legacy-admin-fallback`, merged to
+`master`) removed the fallback from every deployable path:
 
 - `functions/src/domain/adminAuth.ts` — `LEGACY_ADMIN_UID` and `isLegacyAdmin()`
-  are gone; `isAdmin()` is now exactly `hasAdminClaim()`.
-- `firestore.rules` — `isLegacyAdmin()` and the UID literal are gone; `isAdmin()`
+  removed; `isAdmin()` is exactly `hasAdminClaim()`.
+- `firestore.rules` — `isLegacyAdmin()` and the UID literal removed; `isAdmin()`
   is claim-only.
 - The historical UID moved to `functions/src/adminclaim/target.ts`
   (`ADMIN_ACCOUNT_UID`), used only by the non-deployable tool.
-- Unit + rules tests assert the new contract; a structural test asserts no
-  deployable path carries the fallback.
 
-**This has NOT been applied to production.** No deploy and no rules publish were
-done. Production still authorizes by both the claim and the legacy UID.
+### Rollout performed (selective, coordinated)
 
-### Coordinated rollout (requires explicit, separate authorization)
+Doing phase 1 first — the claim live and confirmed — is what made dropping the
+UID safe: the admin was already authorized by the claim before either side
+stopped honoring the UID, so there was no lockout window.
 
-Functions and rules **must go out together** — if one side drops the UID while
-the other still grants it, they disagree about who is admin.
+- **Pre-flight:** an `admin:claim` dry-run confirmed `admin=true` (boolean) with a
+  no-op plan immediately before the rollout.
+- **Seven functions updated individually** (never a broad deploy):
+  - six callables in **us-central1**: `testdeposit`, `requestwithdrawal`,
+    `jointournament`, `payprize`, `createTournament`, `createtournament`;
+  - **`onUserCreated` in us-east1**, last.
+- After **each** function: `functions:list` + read-only data audit (exit 0).
+- **`firestore.rules` (claim-only) published separately** (`--only
+  firestore:rules`) in the **same** rollout window — compiled and released
+  successfully.
+- **No callable was invoked during the rollout.**
 
-1. Pre-flight: re-confirm the admin's token carries `admin: true` (the in-app
-   check, or `admin:claim` dry-run showing the claim present). This is what makes
-   dropping the UID safe.
-2. Deploy the six callables + `onUserCreated` (claim-only functions),
-   individually, per the selective plan in the runbook — never a broad deploy.
-3. Publish `firestore.rules` (claim-only) in the **same** rollout window.
-4. Verify with a real admin token: `testdeposit`, `payprize`, a tournament
-   write, and an admin read all succeed **via the claim**; a non-admin is denied.
+### Verification
+
+- `functions:list` showed **exactly 7 functions** in their expected regions
+  (six callables in us-central1, `onUserCreated` in us-east1).
+- Read-only data audit: **exit 0** — **0 wallets with problems**, **5 tournaments
+  both-matching**, no document altered.
+- Final `admin:claim` dry-run: **`admin=true` (boolean)**, plan **no-op**.
+- Supporting local tests: **184/184 unit** and **24/24 emulator rules** (claim
+  accepted regardless of uid; the legacy uid without the claim is denied; a
+  truthy-non-boolean claim is denied).
+
+### Still pending — behavioral smoke
+
+A manual end-to-end smoke in the app is still recommended: signed in as the real
+admin, an administrative action (e.g. create/edit a tournament) should succeed;
+an ordinary account should be denied. This was **not** part of the rollout — no
+callable was invoked from here.
 
 ### Rollback
 
-The pre-change state is recoverable because it is fully in git history (the
-commit before this branch keeps both routes). If, after the coordinated rollout,
-the admin cannot perform an admin action:
+The pre-change state is fully in git history (the commit before the claim-only
+branch keeps both routes). If the admin cannot perform an admin action:
 
-1. **Fastest mitigation, no deploy:** ensure the claim is present (`admin:claim`
+1. **Fastest mitigation, no deploy:** confirm the claim is present (`admin:claim`
    dry-run) and refresh the admin's token — the claim path should authorize.
-2. **If the claim path is genuinely broken:** re-deploy the previous
-   (fallback-bearing) functions build **and** re-publish the previous rules
-   **together** from the prior commit, restoring the legacy-UID acceptance. Do
-   not roll back only one side.
-3. Never fix a lockout by weakening rules ad hoc; roll back to the known-good
-   pair instead.
+2. **If the claim path is genuinely broken:** restore **both** sides together —
+   re-deploy the previous (fallback-bearing) functions build **and** re-publish
+   the previous rules — from the prior history. **Never roll back only one side.**
+3. Never fix a lockout by weakening rules ad hoc; restore the known-good pair.
 
-Do not mark phase 2 complete until the coordinated rollout has been authorized,
-executed, and verified in production.
+## Separate future maintenance
+
+Tracked apart from this transition, not part of it:
+
+- **Migrate off Node.js 20 before 2026-10-30** — it is deprecated and will be
+  decommissioned then; after that date a deploy requires a newer runtime.
+- **Update `firebase-functions` / `firebase-admin`** — the deploy warns both are
+  outdated.
+- **Address the remaining dependency advisories** (the runtime baseline of 1 low
+  + 10 moderate) in dedicated dependency-maintenance work.
 
 ## Rules that must not be relaxed
 
