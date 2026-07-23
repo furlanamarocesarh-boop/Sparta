@@ -159,7 +159,10 @@ describe("createTournamentHandler — structural guarantees", () => {
     const src = indexSrc();
     const start = src.indexOf("createTournamentHandler = async");
     assert.ok(start !== -1, "handler not found");
-    const body = src.slice(start);
+    // Bound to the handler body only (up to its onCall export), so later
+    // handlers in the file are not scanned.
+    const end = src.indexOf("export const createTournament =", start);
+    const body = src.slice(start, end === -1 ? undefined : end);
     const idxAdmin = body.indexOf("assertAdmin(");
     const firstDb = ["db.collection", "db.doc", "db.runTransaction", ".set(", ".get("]
       .map((token) => body.indexOf(token))
@@ -175,7 +178,8 @@ describe("createTournamentHandler — structural guarantees", () => {
   it("the handler does not call assertSignedIn (admin gate replaced it)", () => {
     const src = indexSrc();
     const start = src.indexOf("createTournamentHandler = async");
-    const body = src.slice(start);
+    const end = src.indexOf("export const createTournament =", start);
+    const body = src.slice(start, end === -1 ? undefined : end);
     assert.equal(body.includes("assertSignedIn("), false);
   });
 });

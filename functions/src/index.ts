@@ -4,6 +4,12 @@ import { https, region } from "firebase-functions/v1";
 import { assertAdmin, assertSignedIn } from "./domain/adminAuth.js";
 import { DomainError } from "./domain/errors.js";
 import {
+  decideRoomAccess,
+  registrationId,
+  validateGetRoomPayload,
+  validateSetRoomPayload,
+} from "./domain/room.js";
+import {
   addCentavos,
   centavosToReais,
   storedReaisToCentavos,
@@ -736,3 +742,141 @@ export const createTournamentHandler = async (
 // calls one or the other; renaming or dropping either would break production.
 export const createTournament = central.https.onCall(createTournamentHandler);
 export const createtournament = central.https.onCall(createTournamentHandler);
+
+/** The error code alone — logged instead of the error/payload, so room
+ * credentials can never reach the logs. */
+function safeErrorCode(error: unknown): string {
+  if (error instanceof https.HttpsError) return error.code;
+  if (error instanceof DomainError) return error.code;
+  return "internal";
+}
+
+/**
+ * ADMIN-ONLY: publishes (or updates) a tournament's room credentials into
+ * `tournament_rooms/{tournamentId}` — a document the client can never read or
+ * write directly (see firestore.rules). Credentials are never logged and never
+ * echoed back in the response.
+ *
+ * Exported for behavioral tests of the authorization/validation ordering; a
+ * plain function with no trigger metadata is NOT a deployable endpoint.
+ */
+export const setTournamentRoomHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    assertAdmin(
+      context,
+      "Você precisa estar logado para publicar a sala.",
+      "Apenas admin pode publicar a sala."
+    );
+
+    const { tournamentid, roomid, roompassword } =
+      validateSetRoomPayload(data);
+
+    const tournamentRef = db.collection("tournaments").doc(tournamentid);
+    const roomRef = db.collection("tournament_rooms").doc(tournamentid);
+
+    await db.runTransaction(async (transaction) => {
+      const tournamentSnap = await transaction.get(tournamentRef);
+      if (!tournamentSnap.exists) {
+        throw new DomainError("not-found", "Torneio não encontrado.");
+      }
+
+      // Preserve created_at across re-publishes; only updated_at moves.
+      const roomSnap = await transaction.get(roomRef);
+      const createdAt =
+        (roomSnap.exists && roomSnap.data()?.created_at) ||
+        admin.firestore.FieldValue.serverTimestamp();
+
+      transaction.set(roomRef, {
+        tournament_ref: tournamentRef,
+        room_id: roomid,
+        room_password: roompassword,
+        created_at: createdAt,
+        updated_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    // NOTE: no room_id / room_password in the response.
+    return { success: true, tournamentid: tournamentid, published: true };
+  } catch (error) {
+    // Log only the error CODE — never the error object or the payload, which
+    // would leak the room credentials.
+    console.error("setTournamentRoom error:", safeErrorCode(error));
+    throw toHttpsError(error);
+  }
+};
+
+/**
+ * AUTHENTICATED player access: returns the room credentials for a tournament,
+ * but ONLY to a caller who is registered (deterministic `{uid}_{tournamentId}`)
+ * AND only once the room has been published. Failures carry an allowlisted
+ * `details.reason` and never any internal detail.
+ *
+ * Exported for behavioral tests; not a deployable endpoint (no trigger).
+ */
+export const getTournamentRoomHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertSignedIn(
+      context,
+      "Você precisa estar logado para acessar a sala."
+    );
+    const uid = callerAuth.uid;
+    const tournamentid = validateGetRoomPayload(data);
+
+    // Registration is checked FIRST — a non-participant never even reads the
+    // room document, and cannot learn whether it exists.
+    const registrationRef = db
+      .collection("registrations")
+      .doc(registrationId(uid, tournamentid));
+    const registrationSnap = await registrationRef.get();
+
+    if (!registrationSnap.exists) {
+      const decision = decideRoomAccess({
+        registrationExists: false,
+        roomExists: false,
+        roomId: null,
+        roomPassword: null,
+      });
+      // decision.ok is false here.
+      if (!decision.ok) {
+        throw new https.HttpsError(decision.code, decision.message, {
+          reason: decision.reason,
+        });
+      }
+    }
+
+    const roomRef = db.collection("tournament_rooms").doc(tournamentid);
+    const roomSnap = await roomRef.get();
+    const roomData = roomSnap.exists ? roomSnap.data() ?? {} : {};
+
+    const decision = decideRoomAccess({
+      registrationExists: true,
+      roomExists: roomSnap.exists,
+      roomId: roomData.room_id,
+      roomPassword: roomData.room_password,
+    });
+
+    if (!decision.ok) {
+      throw new https.HttpsError(decision.code, decision.message, {
+        reason: decision.reason,
+      });
+    }
+
+    return {
+      room_id: decision.credentials.room_id,
+      room_password: decision.credentials.room_password,
+    };
+  } catch (error) {
+    console.error("getTournamentRoom error:", safeErrorCode(error));
+    throw toHttpsError(error);
+  }
+};
+
+// Two NEW callables in us-central1 — the deployable endpoint count goes 7 -> 9.
+export const setTournamentRoom = central.https.onCall(setTournamentRoomHandler);
+export const getTournamentRoom = central.https.onCall(getTournamentRoomHandler);
