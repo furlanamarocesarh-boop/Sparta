@@ -270,8 +270,12 @@ describe("unknown collections", () => {
 describe("tournament rooms", () => {
   it("denies ALL direct client read and write, even for an admin", async () => {
     // Room credentials are reachable only through the getTournamentRoom callable
-    // (Admin SDK, which bypasses rules). No client — owner or admin — may touch
-    // the document directly.
+    // (Admin SDK, which bypasses rules). No client — signed-out, owner, or
+    // admin — may touch the document directly.
+    await assertFails(signedOut().doc("tournament_rooms/t1").get());
+    await assertFails(
+      signedOut().doc("tournament_rooms/t1").set({ room_id: "R" })
+    );
     await assertFails(asOwner().doc("tournament_rooms/t1").get());
     await assertFails(asClaimAdmin().doc("tournament_rooms/t1").get());
     await assertFails(

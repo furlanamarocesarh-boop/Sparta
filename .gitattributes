@@ -1,0 +1,6 @@
+# Force a textual diff for the tournament-room test. Its predecessor blob
+# (commit 8365220) contained a stray NUL byte and was stored as binary; the
+# byte is gone now, but Git would still render the transition diff as binary
+# because the preimage is binary. The `diff` attribute makes Git diff this path
+# as text regardless. It does not change file contents or line endings.
+functions/test/unit/room.test.ts diff

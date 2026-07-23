@@ -798,8 +798,8 @@ export const setTournamentRoomHandler = async (
       });
     });
 
-    // NOTE: no room_id / room_password in the response.
-    return { success: true, tournamentid: tournamentid, published: true };
+    // Exactly { success: true } — no id/password, and no extra fields.
+    return { success: true };
   } catch (error) {
     // Log only the error CODE — never the error object or the payload, which
     // would leak the room credentials.
@@ -828,8 +828,16 @@ export const getTournamentRoomHandler = async (
     const uid = callerAuth.uid;
     const tournamentid = validateGetRoomPayload(data);
 
-    // Registration is checked FIRST — a non-participant never even reads the
-    // room document, and cannot learn whether it exists.
+    // Contract order: confirm the tournament exists FIRST (not-found), before
+    // touching the registration or the room document.
+    const tournamentRef = db.collection("tournaments").doc(tournamentid);
+    const tournamentSnap = await tournamentRef.get();
+    if (!tournamentSnap.exists) {
+      throw new DomainError("not-found", "Torneio não encontrado.");
+    }
+
+    // Registration is then checked via the deterministic id ONLY — no query, no
+    // field scan, no fallback. A non-participant never reads the room document.
     const registrationRef = db
       .collection("registrations")
       .doc(registrationId(uid, tournamentid));
@@ -867,9 +875,13 @@ export const getTournamentRoomHandler = async (
       });
     }
 
+    // Public contract: exactly { success, roomid, roompassword } — mapped from
+    // the stored room_id / room_password, with no snake_case keys, no
+    // tournament_ref, no timestamps, and no other fields.
     return {
-      room_id: decision.credentials.room_id,
-      room_password: decision.credentials.room_password,
+      success: true,
+      roomid: decision.credentials.room_id,
+      roompassword: decision.credentials.room_password,
     };
   } catch (error) {
     console.error("getTournamentRoom error:", safeErrorCode(error));
