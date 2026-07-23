@@ -91,6 +91,16 @@ service cloud.firestore {
       allow create, update, delete: if isAdmin();
     }
 
+    // TOURNAMENT ROOMS — credentials (room id + password).
+    //
+    // NEVER readable or writable by any client, admin included. The id/password
+    // are sensitive: they are published ONLY by the setTournamentRoom callable
+    // (Admin SDK, which bypasses rules) and handed to a registered player ONLY
+    // by the getTournamentRoom callable. There is no direct client path.
+    match /tournament_rooms/{tournamentId} {
+      allow read, write: if false;
+    }
+
     // Bloqueia qualquer collection não prevista.
     match /{document=**} {
       allow read, write: if false;
