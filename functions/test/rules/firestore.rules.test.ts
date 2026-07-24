@@ -207,8 +207,12 @@ describe("tournaments", () => {
     await assertFails(asOwner().doc("tournaments/t1").delete());
   });
 
-  it("lets a custom-claim admin write tournaments", async () => {
-    await assertSucceeds(
+  it("denies even a custom-claim admin writing tournaments directly", async () => {
+    // Hardened: tournaments are created and advanced ONLY by Cloud Functions
+    // (Admin SDK, which bypasses rules). No client — admin included — may write a
+    // tournament directly; otherwise an admin-client could forge an in_progress
+    // tournament with an arbitrary prize/result and bypass the callables.
+    await assertFails(
       asClaimAdmin().doc("tournaments/t2").set({
         name: "Nova Copa",
         status: "open",
@@ -217,9 +221,10 @@ describe("tournaments", () => {
         max_participants: 16,
       })
     );
-    await assertSucceeds(
-      asClaimAdmin().doc("tournaments/t1").update({ status: "closed" })
+    await assertFails(
+      asClaimAdmin().doc("tournaments/t1").update({ status: "in_progress" })
     );
+    await assertFails(asClaimAdmin().doc("tournaments/t1").delete());
   });
 
   it("denies the historical admin uid (no claim) writing tournaments", async () => {

@@ -42,7 +42,7 @@ describe("regiões explícitas por função", () => {
     assert.deepEqual(regionOf(fns.onUserCreated), [EAST]);
   });
 
-  it("as oito callables estão em us-central1", async () => {
+  it("as dez callables estão em us-central1", async () => {
     const fns = await loadFunctions();
     for (const name of [
       "testdeposit",
@@ -53,6 +53,8 @@ describe("regiões explícitas por função", () => {
       "createtournament",
       "setTournamentRoom",
       "getTournamentRoom",
+      "startTournament",
+      "declareTournamentResult",
     ]) {
       assert.deepEqual(
         regionOf(fns[name]),
@@ -74,6 +76,8 @@ describe("regiões explícitas por função", () => {
       "createtournament",
       "setTournamentRoom",
       "getTournamentRoom",
+      "startTournament",
+      "declareTournamentResult",
     ]) {
       const regions = regionOf(fns[name]);
       assert.ok(
@@ -83,24 +87,27 @@ describe("regiões explícitas por função", () => {
     }
   });
 
-  it("os nove exports implantáveis existem, com casing idêntico", async () => {
+  it("os onze exports implantáveis existem, com casing idêntico", async () => {
     const fns = await loadFunctions();
     // Só exports que SÃO gatilho implantável (têm `__trigger`) — ignora
     // `default`/`__esModule` do interop CommonJS↔ESM e quaisquer helpers
     // exportados que NÃO são funções deployáveis (ex.: createTournamentHandler,
-    // setTournamentRoomHandler, getTournamentRoomHandler).
+    // setTournamentRoomHandler, getTournamentRoomHandler,
+    // startTournamentHandler, declareTournamentResultHandler).
     const exported = Object.keys(fns)
       .filter((k) => (fns[k] as ExportedFn).__trigger != null)
       .sort();
     assert.deepEqual(exported, [
       "createTournament",
       "createtournament",
+      "declareTournamentResult",
       "getTournamentRoom",
       "jointournament",
       "onUserCreated",
       "payprize",
       "requestwithdrawal",
       "setTournamentRoom",
+      "startTournament",
       "testdeposit",
     ]);
   });
