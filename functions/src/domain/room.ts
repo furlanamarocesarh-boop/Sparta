@@ -14,6 +14,33 @@ import { DomainError } from "./errors.js";
 /** Blocks control characters and other invisible junk in room fields. */
 const CONTROL_CHARS = /[\x00-\x1F\x7F]/;
 
+/** Upper bound for a room id / password, shared by the input and stored checks. */
+const MAX_ROOM_FIELD = 200;
+
+/** True when a room field is a non-empty, bounded, control-char-free string. */
+function isValidRoomField(value: unknown): boolean {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= MAX_ROOM_FIELD &&
+    !CONTROL_CHARS.test(value)
+  );
+}
+
+/**
+ * Validates the credentials ALREADY STORED in `tournament_rooms/{id}` against the
+ * exact same rules `validateSetRoomPayload` enforces on input. Used by
+ * `startTournament` to require a genuinely publishable room before a tournament
+ * may move to `in_progress`. Non-throwing: returns a boolean so the caller can
+ * raise `failed-precondition` (stored data), not `invalid-argument` (input).
+ */
+export function hasValidPublishedCredentials(
+  roomId: unknown,
+  roomPassword: unknown
+): boolean {
+  return isValidRoomField(roomId) && isValidRoomField(roomPassword);
+}
+
 export interface SetRoomInput {
   readonly tournamentid: string;
   readonly roomid: string;

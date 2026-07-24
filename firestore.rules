@@ -87,8 +87,15 @@ service cloud.firestore {
       // Todos logados podem ler torneios.
       allow read: if signedIn();
 
-      // Só admin pode criar/editar/deletar torneios.
-      allow create, update, delete: if isAdmin();
+      // NENHUMA escrita direta de cliente, admin incluído. Bloquear apenas
+      // `update` não basta: um admin-cliente poderia CRIAR um torneio já
+      // `in_progress`, com `prize`/`result`/`status` arbitrário, contornando
+      // completamente as callables. Todo torneio nasce e evolui somente via
+      // Cloud Functions (Admin SDK, que ignora as Rules) — createTournament/
+      // createtournament, jointournament, startTournament e
+      // declareTournamentResult. Isso protege prize, entry_fee, status, result,
+      // contagens de participantes e os campos de identidade/criação.
+      allow create, update, delete: if false;
     }
 
     // TOURNAMENT ROOMS — credentials (room id + password).

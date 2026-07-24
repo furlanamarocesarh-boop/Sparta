@@ -18,11 +18,23 @@ import {
 import {
   credit,
   debit,
+  inspectStoredPrize,
   validateDepositAmount,
   validateEntryFee,
-  validatePrizeAmount,
   validateWithdrawalAmount,
 } from "./domain/operations.js";
+import {
+  assertExactPayload,
+  checkRegistration,
+  checkStartPreconditions,
+  decideCompletedReplay,
+  documentPath,
+  gateSettlementStatus,
+  gateStartStatus,
+  normalizeTournamentId,
+  normalizeWinnerUid,
+  prizeTransactionId,
+} from "./domain/settlement.js";
 import {
   isFull,
   newTournamentParticipantFields,
@@ -484,63 +496,239 @@ export const jointournament = central.https.onCall(async (data, context) => {
   }
 });
 
-export const payprize = central.https.onCall(async (data, context) => {
+/**
+ * ADMIN-ONLY: moves a tournament `open -> in_progress`, the safe pre-state that
+ * must exist before a result can be declared. A tournament may only start once
+ * its room is genuinely published (valid credentials pointing at it) and its
+ * prize is a valid, strictly-positive amount — so the settlement that follows
+ * can never run against a broken tournament.
+ *
+ * Exported for behavioral tests; a plain function with no trigger metadata is
+ * NOT a deployable endpoint.
+ */
+export const startTournamentHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
   try {
     assertAdmin(
       context,
-      "Você precisa estar logado para pagar prêmio.",
-      "Você não tem permissão para pagar prêmio."
+      "Você precisa estar logado para iniciar o torneio.",
+      "Apenas admin pode iniciar o torneio."
     );
 
-    const winneruid = data.winneruid;
-    const tournamentid = data.tournamentid;
+    // Exactly `{ tournamentid }`; any extra key is invalid-argument.
+    assertExactPayload(data, ["tournamentid"]);
+    const tournamentid = normalizeTournamentId(data.tournamentid);
 
-    if (!winneruid || typeof winneruid !== "string") {
-      throw new DomainError("invalid-argument", "Winner UID inválido.");
-    }
-
-    if (!tournamentid || typeof tournamentid !== "string") {
-      throw new DomainError("invalid-argument", "Tournament ID inválido.");
-    }
-
-    const amountCentavos = validatePrizeAmount(data.amount);
-
-    const externalid =
-      typeof data.externalid === "string" && data.externalid.trim().length > 0
-        ? data.externalid.trim()
-        : `prize_${winneruid}_${tournamentid}`;
-
-    const winnerUserRef = db.collection("users").doc(winneruid);
-    const winnerWalletRef = db.collection("wallets").doc(winneruid);
     const tournamentRef = db.collection("tournaments").doc(tournamentid);
-    const transactionRef = db.collection("transactions").doc(externalid);
+    const roomRef = db.collection("tournament_rooms").doc(tournamentid);
 
-    const result = await db.runTransaction(async (transaction) => {
-      const winnerWalletSnap = await transaction.get(winnerWalletRef);
+    await db.runTransaction(async (transaction) => {
+      // Reads first — every read before any write.
       const tournamentSnap = await transaction.get(tournamentRef);
-      const existingTransactionSnap = await transaction.get(transactionRef);
+      const roomSnap = await transaction.get(roomRef);
 
-      // Idempotency: paying the same prize twice must be impossible.
-      if (existingTransactionSnap.exists) {
-        throw new DomainError(
-          "already-exists",
-          "Já existe uma transação com esse external ID."
-        );
+      if (!tournamentSnap.exists) {
+        throw new DomainError("not-found", "Torneio não encontrado.");
       }
 
-      if (!winnerWalletSnap.exists) {
+      const tournamentData = tournamentSnap.data() ?? {};
+      const status = String(tournamentData.status || "")
+        .trim()
+        .toLowerCase();
+
+      const gate = gateStartStatus(status);
+      if (gate.kind === "fail") {
+        // completed or any status other than open/in_progress.
+        throw new DomainError("failed-precondition", gate.message);
+      }
+
+      // Structural preconditions apply to BOTH the first start and the
+      // idempotent replay: a published, matching room and a valid prize.
+      const roomData = roomSnap.exists ? roomSnap.data() ?? {} : {};
+      const preconditions = checkStartPreconditions({
+        tournamentid,
+        roomExists: roomSnap.exists,
+        roomId: roomData.room_id,
+        roomPassword: roomData.room_password,
+        roomTournamentRefPath: documentPath(roomData.tournament_ref),
+        prize: tournamentData.prize,
+      });
+      if (!preconditions.ok) {
+        throw new DomainError("failed-precondition", preconditions.message);
+      }
+
+      // Idempotent replay: already in_progress and still structurally valid.
+      // Return success WITHOUT rewriting any field — no timestamp churn.
+      if (gate.kind === "replay") {
+        return;
+      }
+
+      // First execution: open -> in_progress. Only status + updated_at move;
+      // created_at and starts_at are deliberately left untouched.
+      transaction.update(tournamentRef, {
+        status: "in_progress",
+        updated_at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    return { success: true };
+  } catch (error) {
+    console.error("startTournament error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+/**
+ * ADMIN-ONLY, CANONICAL settlement: declares the single MVP winner and pays the
+ * prize atomically, moving a tournament `in_progress -> completed`.
+ *
+ * SECURITY: the client supplies ONLY `{ tournamentid, winneruid }`. The prize
+ * comes from `tournaments/{id}.prize`, the financial id is the deterministic
+ * `prize_{tournamentid}`, and the winner's identity is verified against the
+ * canonical registration — nothing financial is ever taken from the caller.
+ *
+ * IDEMPOTENCY & CONCURRENCY: the tournament and the deterministic prize
+ * transaction are read INSIDE the transaction, so Firestore's optimistic retry
+ * re-evaluates the state after a concurrent commit. Two identical calls yield two
+ * successes and exactly one credit; two different winners yield one success and
+ * one failed-precondition.
+ *
+ * Exported for behavioral tests; not a deployable endpoint (no trigger).
+ */
+export const declareTournamentResultHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    assertAdmin(
+      context,
+      "Você precisa estar logado para declarar o resultado.",
+      "Apenas admin pode declarar o resultado."
+    );
+
+    // Exactly `{ tournamentid, winneruid }`. amount/externalid/prize/
+    // transactionid/status/refs are NOT accepted keys → invalid-argument.
+    assertExactPayload(data, ["tournamentid", "winneruid"]);
+    const tournamentid = normalizeTournamentId(data.tournamentid);
+    const winneruid = normalizeWinnerUid(data.winneruid);
+
+    const tournamentRef = db.collection("tournaments").doc(tournamentid);
+    const winnerUserRef = db.collection("users").doc(winneruid);
+    const winnerWalletRef = db.collection("wallets").doc(winneruid);
+    const registrationRef = db
+      .collection("registrations")
+      .doc(registrationId(winneruid, tournamentid));
+    const prizeTxRef = db
+      .collection("transactions")
+      .doc(prizeTransactionId(tournamentid));
+
+    await db.runTransaction(async (transaction) => {
+      // ── Reads that gate the decision (before any write) ──
+      const tournamentSnap = await transaction.get(tournamentRef);
+      const prizeTxSnap = await transaction.get(prizeTxRef);
+
+      if (!tournamentSnap.exists) {
+        throw new DomainError("not-found", "Torneio não encontrado.");
+      }
+
+      const tournamentData = tournamentSnap.data() ?? {};
+      const status = String(tournamentData.status || "")
+        .trim()
+        .toLowerCase();
+      const resultExists =
+        tournamentData.result !== undefined && tournamentData.result !== null;
+
+      const gate = gateSettlementStatus(
+        status,
+        resultExists,
+        prizeTxSnap.exists
+      );
+
+      if (gate.kind === "fail") {
+        throw new DomainError("failed-precondition", gate.message);
+      }
+
+      // ── Idempotent replay: status === completed ──
+      if (gate.kind === "replay") {
+        const persistedResult = resultExists
+          ? (tournamentData.result as Record<string, unknown>)
+          : null;
+        const persistedTx = prizeTxSnap.exists
+          ? prizeTxSnap.data() ?? {}
+          : null;
+
+        const replay = decideCompletedReplay({
+          winneruid,
+          tournamentid,
+          resultExists,
+          txExists: prizeTxSnap.exists,
+          result: persistedResult
+            ? {
+                winner_uid: persistedResult.winner_uid,
+                winner_ref: documentPath(persistedResult.winner_ref),
+                registration_ref: documentPath(
+                  persistedResult.registration_ref
+                ),
+                transaction_ref: documentPath(
+                  persistedResult.transaction_ref
+                ),
+                prize: persistedResult.prize,
+              }
+            : null,
+          tx: persistedTx
+            ? {
+                category: persistedTx.category,
+                external_id: persistedTx.external_id,
+                user_ref: documentPath(persistedTx.user_ref),
+                tournament_ref: documentPath(persistedTx.tournament_ref),
+                amount: persistedTx.amount,
+              }
+            : null,
+        });
+
+        if (!replay.ok) {
+          throw new DomainError("failed-precondition", replay.message);
+        }
+        // Fully equivalent: success with NO credit and NO write.
+        return;
+      }
+
+      // ── Mutating path: status === in_progress, no result, no transaction ──
+      const registrationSnap = await transaction.get(registrationRef);
+      const walletSnap = await transaction.get(winnerWalletRef);
+
+      const registrationData = registrationSnap.exists
+        ? registrationSnap.data() ?? {}
+        : {};
+      const registration = checkRegistration({
+        exists: registrationSnap.exists,
+        status: registrationData.status,
+        userRefPath: documentPath(registrationData.user_ref),
+        tournamentRefPath: documentPath(registrationData.tournament_ref),
+        winneruid,
+        tournamentid,
+      });
+      if (!registration.ok) {
+        throw new DomainError("failed-precondition", registration.message);
+      }
+
+      if (!walletSnap.exists) {
         throw new DomainError(
           "not-found",
           "Carteira do vencedor não encontrada."
         );
       }
 
-      if (!tournamentSnap.exists) {
-        throw new DomainError("not-found", "Torneio não encontrado.");
+      // The prize comes from the tournament, never the client.
+      const prize = inspectStoredPrize(tournamentData.prize);
+      if (!prize.ok) {
+        throw new DomainError("failed-precondition", prize.message);
       }
+      const prizeCentavos = prize.centavos;
 
-      const walletData = winnerWalletSnap.data() ?? {};
-
+      const walletData = walletSnap.data() ?? {};
       const previousBalance = storedReaisToCentavos(
         walletData.balance ?? 0,
         "saldo da carteira"
@@ -550,44 +738,62 @@ export const payprize = central.https.onCall(async (data, context) => {
         "total ganho"
       );
 
-      const balanceAfter = credit(previousBalance, amountCentavos);
-      const totalWonAfter = addCentavos(previousTotalWon, amountCentavos);
+      const balanceAfter = credit(previousBalance, prizeCentavos);
+      const totalWonAfter = addCentavos(previousTotalWon, prizeCentavos);
 
+      const externalId = prizeTransactionId(tournamentid);
+      const prizeReais = centavosToReais(prizeCentavos);
+      // ONE server-timestamp sentinel, reused so every stamp written in this
+      // commit resolves to the exact same time.
+      const stampedAt = admin.firestore.FieldValue.serverTimestamp();
+
+      // 1 + 2. Credit the wallet and stamp its updated_at.
       transaction.update(winnerWalletRef, {
         balance: centavosToReais(balanceAfter),
         total_won: centavosToReais(totalWonAfter),
+        updated_at: stampedAt,
       });
 
-      transaction.set(transactionRef, {
-        amount: centavosToReais(amountCentavos),
+      // 3. Deterministic prize transaction — the canonical prize schema. The
+      // ONLY changes from the legacy path: the id is prize_{tournamentid}, the
+      // external_id is derived internally, and the amount comes from the
+      // tournament. No field is added or removed.
+      transaction.set(prizeTxRef, {
+        amount: prizeReais,
         category: "prize",
         user_ref: winnerUserRef,
         display_name: "",
         tournament_ref: tournamentRef,
         previous_balance: centavosToReais(previousBalance),
         balance_after: centavosToReais(balanceAfter),
-        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        timestamp: stampedAt,
         status: "completed",
-        external_id: externalid,
+        external_id: externalId,
       });
 
-      return {
-        success: true,
-        winner_uid: winneruid,
-        tournament_id: tournamentid,
-        amount: centavosToReais(amountCentavos),
-        previous_balance: centavosToReais(previousBalance),
-        balance_after: centavosToReais(balanceAfter),
-        external_id: externalid,
-      };
+      // 4 + 5 + 6. Persist the result, move to completed, stamp updated_at.
+      transaction.update(tournamentRef, {
+        status: "completed",
+        result: {
+          placement: 1,
+          winner_uid: winneruid,
+          winner_ref: winnerUserRef,
+          registration_ref: registrationRef,
+          prize: prizeReais,
+          transaction_ref: prizeTxRef,
+          declared_at: stampedAt,
+          paid_at: stampedAt,
+        },
+        updated_at: stampedAt,
+      });
     });
 
-    return result;
+    return { success: true };
   } catch (error) {
-    console.error("payprize error:", error);
+    console.error("declareTournamentResult error:", error);
     throw toHttpsError(error);
   }
-});
+};
 
 // Exported for behavioral tests of the authorization ordering. This is a plain
 // function (no trigger metadata), so it is NOT a deployable endpoint — only the
@@ -889,6 +1095,19 @@ export const getTournamentRoomHandler = async (
   }
 };
 
-// Two NEW callables in us-central1 — the deployable endpoint count goes 7 -> 9.
 export const setTournamentRoom = central.https.onCall(setTournamentRoomHandler);
 export const getTournamentRoom = central.https.onCall(getTournamentRoomHandler);
+
+// Secure start/result/settlement module — the deployable endpoint count goes
+// 9 -> 11. `startTournament` opens the safe pre-state; `declareTournamentResult`
+// is the canonical settlement.
+export const startTournament = central.https.onCall(startTournamentHandler);
+export const declareTournamentResult = central.https.onCall(
+  declareTournamentResultHandler
+);
+
+// `payprize` is now a STRICT ALIAS of the same secure handler. It keeps its
+// public name and region for compatibility, but accepts ONLY the new contract
+// `{ tournamentid, winneruid }` and never `amount`/`externalid`. The legacy
+// insecure body is gone — there is no deployable path to the old behavior.
+export const payprize = central.https.onCall(declareTournamentResultHandler);

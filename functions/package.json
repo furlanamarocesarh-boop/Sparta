@@ -5,7 +5,7 @@
     "build:watch": "tsc --watch",
     "build:test": "tsc -p tsconfig.test.json",
     "test": "npm run build:test && node --test \"lib-test/test/unit/*.test.js\"",
-    "test:rules": "npm run build:test && firebase emulators:exec --project demo-sparta-battle --only firestore \"node --test lib-test/test/rules/*.test.js\"",
+    "test:rules": "npm run build:test && firebase emulators:exec --project demo-sparta-battle --only firestore \"node --test --test-concurrency=1 lib-test/test/rules/*.test.js\"",
     "audit:data": "npm run build && node lib/audit/cli.js",
     "admin:claim": "npm run build && node lib/adminclaim/cli.js",
     "audit:data:emulator": "npm run build && firebase emulators:exec --project demo-sparta-battle --only firestore \"node lib/audit/cli.js --project demo-sparta-battle\"",
