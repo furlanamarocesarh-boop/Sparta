@@ -1,0 +1,14 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "transactions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "category", "order": "ASCENDING" },
+        { "fieldPath": "user_ref", "order": "ASCENDING" },
+        { "fieldPath": "tournament_ref", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

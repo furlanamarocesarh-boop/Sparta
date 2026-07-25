@@ -25,8 +25,17 @@ export const WALLET_MONEY_FIELDS = [
 
 export type WalletField = (typeof WALLET_MONEY_FIELDS)[number];
 
+/**
+ * OPTIONAL monetary fields: legal to be absent (a pre-beta wallet reads
+ * `beta_balance` as zero — absence is NOT a finding), but when PRESENT they
+ * must be valid money like any other field.
+ */
+export const OPTIONAL_WALLET_MONEY_FIELDS = ["beta_balance"] as const;
+
+export type OptionalWalletField = (typeof OPTIONAL_WALLET_MONEY_FIELDS)[number];
+
 export interface WalletFieldIssue {
-  readonly field: WalletField;
+  readonly field: WalletField | OptionalWalletField;
   readonly problem: MoneyProblem;
 }
 
@@ -55,6 +64,19 @@ export function auditWalletDocument(
       maxCentavos: MAX_BALANCE_CENTAVOS,
     });
 
+    if (!inspection.ok) {
+      issues.push({ field, problem: inspection.problem });
+    }
+  }
+
+  // Optional fields: absence is legal (never a "missing" finding); a present
+  // but invalid value is a finding like any other.
+  for (const field of OPTIONAL_WALLET_MONEY_FIELDS) {
+    if (data[field] === undefined) continue;
+    const inspection = inspectReais(data[field], {
+      allowZero: true,
+      maxCentavos: MAX_BALANCE_CENTAVOS,
+    });
     if (!inspection.ok) {
       issues.push({ field, problem: inspection.problem });
     }

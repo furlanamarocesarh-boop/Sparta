@@ -144,8 +144,14 @@ async function main(): Promise<number> {
     const results: ReconciliationResult[] = [];
 
     for (const [index, finding] of walletFindings.entries()) {
+      // Optional fields (beta_balance) never produce "missing", so this keeps
+      // its original WalletField domain; the guard makes that explicit.
       const missingFields = finding.issues
-        .filter((issue) => issue.problem === "missing")
+        .filter(
+          (issue): issue is { field: WalletField; problem: "missing" } =>
+            issue.problem === "missing" &&
+            (WALLET_MONEY_FIELDS as readonly string[]).includes(issue.field)
+        )
         .map((issue) => issue.field);
 
       // Only missing-field wallets are in scope for this step.
@@ -188,17 +194,34 @@ async function main(): Promise<number> {
         presentCentavos[field] = inspection.ok ? inspection.centavos : null;
       }
 
+      // The `.path` of a stored DocumentReference, or null for anything else.
+      const refPath = (value: unknown): string | null => {
+        const path = (value as { path?: unknown } | null | undefined)?.path;
+        return typeof path === "string" ? path : null;
+      };
+
       const transactions: TransactionRecord[] = [];
       await scanCollection(
         db
           .collection("transactions")
           .where("user_ref", "==", userRef) as unknown as ReadOnlyQuery,
         { orderByField: documentId },
-        (_id, data) => {
+        (txId, data) => {
           transactions.push({
             category: data.category,
             status: data.status,
             amount: data.amount,
+            path: `transactions/${txId}`,
+            economyType: data.economy_type,
+            tournamentRefPath: refPath(data.tournament_ref),
+            registrationRefPath: refPath(data.registration_ref),
+            entryTransactionRefPath: refPath(data.entry_transaction_ref),
+            hasCashStamps:
+              data.previous_balance !== undefined ||
+              data.balance_after !== undefined,
+            hasBetaStamps:
+              data.beta_previous_balance !== undefined ||
+              data.beta_balance_after !== undefined,
           });
         }
       );
@@ -227,6 +250,18 @@ async function main(): Promise<number> {
         }
       );
 
+      // beta_balance: absence is legal (reads as zero); when present its value
+      // is inspected like any stored money field.
+      const betaBalancePresent = walletData.beta_balance !== undefined;
+      let betaBalanceCentavos: number | null = null;
+      if (betaBalancePresent) {
+        const inspection = inspectReais(walletData.beta_balance, {
+          allowZero: true,
+          maxCentavos: MAX_BALANCE_CENTAVOS,
+        });
+        betaBalanceCentavos = inspection.ok ? inspection.centavos : null;
+      }
+
       results.push(
         reconcileWallet(anonymousLabel(index), {
           missingFields,
@@ -234,6 +269,8 @@ async function main(): Promise<number> {
           userDocExists: userSnap.exists,
           userRefValid,
           userRefStatus,
+          betaBalancePresent,
+          betaBalanceCentavos,
           related: { transactions, withdrawalStatuses, registrationCount },
         })
       );
