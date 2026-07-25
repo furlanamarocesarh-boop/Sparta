@@ -41,6 +41,17 @@ import {
   participantIncrementUpdate,
   readParticipantCounts,
 } from "./domain/tournamentFields.js";
+import {
+  BETA_ECONOMY_TYPE,
+  BETA_GRANT_CATEGORY,
+  betaGrantTransactionId,
+  checkBetaGrantReplay,
+  normalizeBetaGrantUid,
+  normalizeCampaignId,
+  normalizeGrantId,
+  normalizeReason,
+  validateBetaGrantAmount,
+} from "./domain/betaCredit.js";
 
 admin.initializeApp();
 
@@ -147,6 +158,10 @@ export const onUserCreated = east.auth.user().onCreate(async (user) => {
     total_won: 0,
     total_spent: 0,
     total_withdrawn: 0,
+    // Beta Credits (closed beta): non-monetary, never withdrawable, and kept
+    // strictly apart from the five cash fields above. Old wallets without this
+    // field are READ as zero — no migration writes it retroactively.
+    beta_balance: 0,
     user_ref: userRef,
   };
 
@@ -1111,3 +1126,163 @@ export const declareTournamentResult = central.https.onCall(
 // `{ tournamentid, winneruid }` and never `amount`/`externalid`. The legacy
 // insecure body is gone — there is no deployable path to the old behavior.
 export const payprize = central.https.onCall(declareTournamentResultHandler);
+
+/**
+ * ADMIN-ONLY, IDEMPOTENT: grants non-withdrawable Beta Credits to a player's
+ * `wallets/{uid}.beta_balance` for the closed beta.
+ *
+ * ECONOMY ISOLATION (the whole point): this is the ONLY flow that writes
+ * `beta_balance`, and it touches NOTHING else — never `balance`,
+ * `total_deposited`, `total_won`, `total_spent` or `total_withdrawn`. Beta
+ * Credits have no monetary value, no conversion to `balance` exists, and
+ * `requestwithdrawal` never reads `beta_balance`, so a Beta Credit can never
+ * become withdrawable money. `testdeposit` is NOT part of the beta flow.
+ *
+ * IDEMPOTENCY: the transaction id is the deterministic `beta_grant_{grant_id}`,
+ * read INSIDE the Firestore transaction. First valid call credits exactly once;
+ * an identical replay returns success with NO write; the same `grant_id` with
+ * different data is failed-precondition with NO write. `granted_by` comes
+ * EXCLUSIVELY from the verified token (`context.auth.uid`) — it is not an
+ * accepted payload key.
+ *
+ * Exported for behavioral tests; a plain function with no trigger metadata is
+ * NOT a deployable endpoint.
+ */
+export const grantBetaCreditHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertAdmin(
+      context,
+      "Você precisa estar logado para conceder créditos beta.",
+      "Apenas admin pode conceder créditos beta."
+    );
+
+    // Exactly these five keys; `granted_by` (or anything else) is rejected.
+    assertExactPayload(data, [
+      "uid",
+      "amount",
+      "grant_id",
+      "campaign_id",
+      "reason",
+    ]);
+    const uid = normalizeBetaGrantUid(data.uid);
+    const amountCentavos = validateBetaGrantAmount(data.amount);
+    const grantId = normalizeGrantId(data.grant_id);
+    const campaignId = normalizeCampaignId(data.campaign_id);
+    const reason = normalizeReason(data.reason);
+
+    // Provenance comes from the verified token ONLY — never from the payload.
+    const grantedBy = callerAuth.uid;
+
+    const walletRef = db.collection("wallets").doc(uid);
+    const userRef = db.collection("users").doc(uid);
+    const grantTxRef = db
+      .collection("transactions")
+      .doc(betaGrantTransactionId(grantId));
+
+    const outcome = await db.runTransaction(async (transaction) => {
+      // Reads first — every read before any write.
+      const grantTxSnap = await transaction.get(grantTxRef);
+      const walletSnap = await transaction.get(walletRef);
+
+      if (!walletSnap.exists) {
+        throw new DomainError(
+          "not-found",
+          "Carteira do destinatário não encontrada."
+        );
+      }
+
+      const walletData = walletSnap.data() ?? {};
+      // An old wallet without the field MEANS zero — read-side default only;
+      // nothing is written just to normalize old documents.
+      const previousBeta = storedReaisToCentavos(
+        walletData.beta_balance ?? 0,
+        "saldo beta"
+      );
+
+      // ── Idempotent replay: the deterministic grant transaction exists ──
+      if (grantTxSnap.exists) {
+        const stored = grantTxSnap.data() ?? {};
+        const replay = checkBetaGrantReplay({
+          grantId,
+          uid,
+          amountReais: centavosToReais(amountCentavos),
+          campaignId,
+          reason,
+          stored: {
+            category: stored.category,
+            economyType: stored.economy_type,
+            grantId: stored.grant_id,
+            amountReais: stored.amount,
+            campaignId: stored.campaign_id,
+            reason: stored.reason,
+            userRefPath: documentPath(stored.user_ref),
+          },
+        });
+        if (!replay.ok) {
+          throw new DomainError("failed-precondition", replay.message);
+        }
+        // Fully equivalent: success with NO credit and NO write — balances and
+        // timestamps stay exactly as they were.
+        return {
+          idempotent: true,
+          betaBalanceReais: centavosToReais(previousBeta),
+        };
+      }
+
+      // ── First execution: credit exactly once ──
+      // addCentavos enforces the safe ceiling atomically: an overflow throws
+      // before any write, so a failed grant leaves no partial state.
+      const afterBeta = addCentavos(previousBeta, amountCentavos);
+
+      // ONE server-timestamp sentinel, reused so every stamp in this commit
+      // resolves to the exact same time.
+      const stampedAt = admin.firestore.FieldValue.serverTimestamp();
+
+      // The ONLY wallet field this flow may touch is beta_balance.
+      transaction.update(walletRef, {
+        beta_balance: centavosToReais(afterBeta),
+      });
+
+      transaction.set(grantTxRef, {
+        amount: centavosToReais(amountCentavos),
+        category: BETA_GRANT_CATEGORY,
+        economy_type: BETA_ECONOMY_TYPE,
+        grant_id: grantId,
+        campaign_id: campaignId,
+        reason: reason,
+        granted_by: grantedBy,
+        user_ref: userRef,
+        display_name: "Crédito Beta",
+        tournament_ref: null,
+        // Beta-pool stamps — deliberately NOT previous_balance/balance_after,
+        // which in every cash transaction refer to the real `balance`.
+        beta_previous_balance: centavosToReais(previousBeta),
+        beta_balance_after: centavosToReais(afterBeta),
+        timestamp: stampedAt,
+        created_at: stampedAt,
+        status: "completed",
+        external_id: betaGrantTransactionId(grantId),
+      });
+
+      return {
+        idempotent: false,
+        betaBalanceReais: centavosToReais(afterBeta),
+      };
+    });
+
+    return {
+      success: true,
+      idempotent: outcome.idempotent,
+      grant_id: grantId,
+      beta_balance: outcome.betaBalanceReais,
+    };
+  } catch (error) {
+    console.error("grantBetaCredit error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const grantBetaCredit = central.https.onCall(grantBetaCreditHandler);
