@@ -13,8 +13,22 @@ import {
   addCentavos,
   centavosToReais,
   storedReaisToCentavos,
+  subtractCentavos,
   toCentavos,
 } from "./domain/money.js";
+import {
+  BETA_REFUND_CATEGORY,
+  canCancelAtomically,
+  checkOriginalEntryLedger,
+  checkRefundedRegistration,
+  checkRefundLedger,
+  ENTRY_REFUND_CATEGORY,
+  refundTransactionId,
+  resolveRefundPlanItem,
+  STATUS_CANCELLED,
+  sumRefundCentavos,
+  type RefundPlanItem,
+} from "./domain/cancellation.js";
 import {
   credit,
   debit,
@@ -1212,6 +1226,17 @@ export const setTournamentRoomHandler = async (
         throw new DomainError("not-found", "Torneio não encontrado.");
       }
 
+      // A cancelled tournament is TERMINAL: it never receives a (new) room.
+      const tournamentStatus = String(tournamentSnap.data()?.status || "")
+        .trim()
+        .toLowerCase();
+      if (tournamentStatus === STATUS_CANCELLED) {
+        throw new DomainError(
+          "failed-precondition",
+          "Não é possível definir a sala de um torneio cancelado."
+        );
+      }
+
       // Preserve created_at across re-publishes; only updated_at moves.
       const roomSnap = await transaction.get(roomRef);
       const createdAt =
@@ -1272,7 +1297,14 @@ export const getTournamentRoomHandler = async (
       .doc(registrationId(uid, tournamentid));
     const registrationSnap = await registrationRef.get();
 
-    if (!registrationSnap.exists) {
+    // Only an ACTIVE registration grants access: a refunded one (cancelled
+    // tournament) — or any other non-"registered" state — is treated exactly
+    // like no registration at all, fail-closed.
+    const registrationActive =
+      registrationSnap.exists &&
+      (registrationSnap.data() ?? {}).status === "registered";
+
+    if (!registrationActive) {
       const decision = decideRoomAccess({
         registrationExists: false,
         roomExists: false,
@@ -1334,6 +1366,419 @@ export const declareTournamentResult = central.https.onCall(
 // `{ tournamentid, winneruid }` and never `amount`/`externalid`. The legacy
 // insecure body is gone — there is no deployable path to the old behavior.
 export const payprize = central.https.onCall(declareTournamentResultHandler);
+
+/**
+ * ADMIN-ONLY, ATOMIC, IDEMPOTENT: cancels a not-yet-started tournament and
+ * refunds EVERY paid registration to the exact bucket that paid it — cash
+ * entries back to `balance` (reducing `total_spent`), beta entries back to
+ * `beta_balance` — in ONE Firestore transaction. All or nothing: a failure of
+ * any single validation leaves every wallet, registration, ledger and the
+ * tournament byte-for-byte unchanged.
+ *
+ * TERMINAL: `cancelled` can never be joined, started, settled, paid or given
+ * a room again, and no handler reopens it.
+ *
+ * SERVER-AUTHORITATIVE: the caller sends ONLY `{ tournamentid }`. Amounts come
+ * from each registration's `entry_fee_snapshot` (or the provably safe cash
+ * legacy `entry_fee`), cross-checked against the original entry ledger —
+ * never from the tournament's current price, never from the client.
+ *
+ * IDEMPOTENT: refund ledgers use the deterministic id
+ * `refund_{uid}_{tournamentid}`. A replay on an already-cancelled tournament
+ * verifies every persisted artifact and returns success WITHOUT writing;
+ * any missing or divergent artifact is failed-precondition, never repaired
+ * silently.
+ *
+ * Exported for behavioral tests; a plain function with no trigger metadata is
+ * NOT a deployable endpoint.
+ */
+export const cancelTournamentHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertAdmin(
+      context,
+      "Você precisa estar logado para cancelar o torneio.",
+      "Apenas admin pode cancelar o torneio."
+    );
+
+    // Exactly `{ tournamentid }`; any extra key is invalid-argument.
+    assertExactPayload(data, ["tournamentid"]);
+    const tournamentid = normalizeTournamentId(data.tournamentid);
+
+    const tournamentRef = db.collection("tournaments").doc(tournamentid);
+    const prizeTxRef = db
+      .collection("transactions")
+      .doc(prizeTransactionId(tournamentid));
+
+    const outcome = await db.runTransaction(async (transaction) => {
+      // ── READS — every read happens before the first write ──
+      const tournamentSnap = await transaction.get(tournamentRef);
+      const prizeTxSnap = await transaction.get(prizeTxRef);
+
+      if (!tournamentSnap.exists) {
+        throw new DomainError("not-found", "Torneio não encontrado.");
+      }
+      const tournamentData = tournamentSnap.data() ?? {};
+
+      // Economy (type + durable lock), fail-closed on divergence/corruption.
+      const economy = resolveTournamentEconomy(tournamentData);
+
+      // Settlement evidence blocks cancellation EVEN IF the status was
+      // tampered back to "open": a persisted result or the deterministic
+      // prize ledger prove a settlement happened.
+      const resultExists =
+        tournamentData.result !== undefined && tournamentData.result !== null;
+      if (resultExists || prizeTxSnap.exists) {
+        throw new DomainError(
+          "failed-precondition",
+          "O torneio possui liquidação registrada e não pode ser cancelado."
+        );
+      }
+
+      const status = String(tournamentData.status || "")
+        .trim()
+        .toLowerCase();
+
+      // All registrations of this tournament, read INSIDE the transaction so
+      // a concurrent join/cancel serializes against this decision.
+      const registrationsSnap = await transaction.get(
+        db
+          .collection("registrations")
+          .where("tournament_ref", "==", tournamentRef)
+      );
+
+      // ── Idempotent replay: already cancelled ──
+      if (status === STATUS_CANCELLED) {
+        const refundedCount = tournamentData.refunded_registration_count;
+        const refundedTotal = tournamentData.refunded_total;
+        const refundEconomy = tournamentData.refund_economy_type;
+        if (
+          !Number.isSafeInteger(refundedCount) ||
+          (refundedCount as number) < 0 ||
+          typeof refundedTotal !== "number" ||
+          refundEconomy !== economy
+        ) {
+          throw new DomainError(
+            "failed-precondition",
+            "Torneio cancelado com marcadores de reembolso divergentes."
+          );
+        }
+        if (registrationsSnap.size !== refundedCount) {
+          throw new DomainError(
+            "failed-precondition",
+            "Torneio cancelado com inscrições divergentes do registrado."
+          );
+        }
+
+        let verifiedTotalCentavos = 0;
+        for (const doc of registrationsSnap.docs) {
+          const reg = doc.data() ?? {};
+          const refunded = checkRefundedRegistration({
+            docId: doc.id,
+            status: reg.status,
+            refundEconomy: reg.refund_economy_type,
+            tournamentEconomy: economy,
+            refundedAmount: reg.refunded_amount,
+            refundTransactionRefPath: documentPath(
+              reg.refund_transaction_ref
+            ),
+          });
+          if (!refunded.ok) {
+            throw new DomainError("failed-precondition", refunded.message);
+          }
+
+          const uid = doc.id.slice(0, doc.id.length - tournamentid.length - 1);
+          const refundTxSnap = await transaction.get(
+            db.collection("transactions").doc(refundTransactionId(doc.id))
+          );
+          const refundTx = refundTxSnap.exists ? refundTxSnap.data() ?? {} : {};
+          const ledger = checkRefundLedger({
+            registrationDocId: doc.id,
+            tournamentid,
+            tournamentEconomy: economy,
+            uid,
+            expectedAmountReais: reg.refunded_amount as number,
+            txExists: refundTxSnap.exists,
+            category: refundTx.category,
+            economyType: refundTx.economy_type,
+            amountReais: refundTx.amount,
+            userRefPath: documentPath(refundTx.user_ref),
+            tournamentRefPath: documentPath(refundTx.tournament_ref),
+            registrationRefPath: documentPath(refundTx.registration_ref),
+          });
+          if (!ledger.ok) {
+            throw new DomainError("failed-precondition", ledger.message);
+          }
+          verifiedTotalCentavos += Math.round(
+            (reg.refunded_amount as number) * 100
+          );
+        }
+        if (centavosToReais(verifiedTotalCentavos) !== refundedTotal) {
+          throw new DomainError(
+            "failed-precondition",
+            "Total reembolsado diverge dos artefatos persistidos."
+          );
+        }
+
+        // Fully equivalent: success with NO write and NO timestamp change.
+        return {
+          idempotent: true,
+          economy,
+          refundedCount: refundedCount as number,
+          refundedTotalReais: refundedTotal as number,
+        };
+      }
+
+      // ── First execution: only the canonical pre-start state cancels ──
+      if (status !== "open") {
+        throw new DomainError(
+          "failed-precondition",
+          "Só é possível cancelar um torneio que ainda não começou."
+        );
+      }
+
+      // Write-limit guard BEFORE any further work: the whole refund must fit
+      // one atomic transaction — partial refunds are never attempted.
+      if (!canCancelAtomically(registrationsSnap.size)) {
+        throw new DomainError(
+          "failed-precondition",
+          "O torneio tem inscrições demais para um cancelamento atômico."
+        );
+      }
+
+      // The persisted participant counters must reconcile with the actual
+      // registrations — a divergent count is corrupt state, never guessed at.
+      const counts = readParticipantCounts(tournamentData);
+      if (counts.current !== registrationsSnap.size) {
+        throw new DomainError(
+          "failed-precondition",
+          "Contagem de participantes diverge das inscrições persistidas."
+        );
+      }
+
+      // ── Build and validate the COMPLETE refund plan before any write ──
+      const plan: RefundPlanItem[] = [];
+      const seenUids = new Set<string>();
+      for (const doc of registrationsSnap.docs) {
+        const reg = doc.data() ?? {};
+        const resolved = resolveRefundPlanItem({
+          docId: doc.id,
+          tournamentid,
+          tournamentEconomy: economy,
+          status: reg.status,
+          userRefPath: documentPath(reg.user_ref),
+          tournamentRefPath: documentPath(reg.tournament_ref),
+          registrationEconomy: reg.economy_type,
+          entryFeeSnapshot: reg.entry_fee_snapshot,
+          entryFee: reg.entry_fee,
+          transactionRefPath: documentPath(reg.transaction_ref),
+        });
+        if (!resolved.ok) {
+          throw new DomainError("failed-precondition", resolved.message);
+        }
+        if (seenUids.has(resolved.item.uid)) {
+          throw new DomainError(
+            "failed-precondition",
+            "Inscrições duplicadas para o mesmo usuário."
+          );
+        }
+        seenUids.add(resolved.item.uid);
+        plan.push(resolved.item);
+      }
+
+      // Cross-check every NEW-STYLE entry against its original ledger.
+      for (const item of plan) {
+        if (item.legacy) continue;
+        const entryTxSnap = await transaction.get(
+          db.doc(item.entryTransactionPath as string)
+        );
+        const entryTx = entryTxSnap.exists ? entryTxSnap.data() ?? {} : {};
+        const ledger = checkOriginalEntryLedger({
+          item,
+          tournamentid,
+          txExists: entryTxSnap.exists,
+          category: entryTx.category,
+          economyType: entryTx.economy_type,
+          userRefPath: documentPath(entryTx.user_ref),
+          tournamentRefPath: documentPath(entryTx.tournament_ref),
+          amountReais: entryTx.amount,
+          expectedAmountReais: centavosToReais(item.amountCentavos),
+        });
+        if (!ledger.ok) {
+          throw new DomainError("failed-precondition", ledger.message);
+        }
+      }
+
+      // Read every wallet and pre-compute every credit — the LAST reads, and
+      // still before the first write. Any invalid stored value, insufficient
+      // total_spent or overflow aborts here, leaving everything untouched.
+      const walletWrites: Array<{
+        ref: FirebaseFirestore.DocumentReference;
+        update: Record<string, unknown>;
+        previousCentavos: number;
+        afterCentavos: number;
+      }> = [];
+      for (const item of plan) {
+        const walletRef = db.collection("wallets").doc(item.uid);
+        const walletSnap = await transaction.get(walletRef);
+        if (!walletSnap.exists) {
+          throw new DomainError(
+            "not-found",
+            `Carteira do inscrito ${item.uid} não encontrada.`
+          );
+        }
+        const walletData = walletSnap.data() ?? {};
+
+        if (item.economy === ECONOMY_BETA_CREDIT) {
+          const previousBeta = storedReaisToCentavos(
+            walletData.beta_balance ?? 0,
+            "saldo beta"
+          );
+          const betaAfter = addCentavos(previousBeta, item.amountCentavos);
+          walletWrites.push({
+            ref: walletRef,
+            update: { beta_balance: centavosToReais(betaAfter) },
+            previousCentavos: previousBeta,
+            afterCentavos: betaAfter,
+          });
+        } else {
+          const previousBalance = storedReaisToCentavos(
+            walletData.balance ?? 0,
+            "saldo da carteira"
+          );
+          const totalSpent = storedReaisToCentavos(
+            walletData.total_spent ?? 0,
+            "total gasto"
+          );
+          const spentAfter = subtractCentavos(totalSpent, item.amountCentavos);
+          if (spentAfter < 0) {
+            throw new DomainError(
+              "failed-precondition",
+              "Total gasto insuficiente para o reembolso."
+            );
+          }
+          const balanceAfter = addCentavos(
+            previousBalance,
+            item.amountCentavos
+          );
+          walletWrites.push({
+            ref: walletRef,
+            update: {
+              balance: centavosToReais(balanceAfter),
+              total_spent: centavosToReais(spentAfter),
+            },
+            previousCentavos: previousBalance,
+            afterCentavos: balanceAfter,
+          });
+        }
+      }
+
+      const totalCentavos = sumRefundCentavos(plan);
+
+      // ── WRITES — everything is now validated ──
+      // ONE server-timestamp sentinel for every stamp in this commit.
+      const stampedAt = admin.firestore.FieldValue.serverTimestamp();
+
+      for (let i = 0; i < plan.length; i++) {
+        const item = plan[i];
+        const write = walletWrites[i];
+        const amountReais = centavosToReais(item.amountCentavos);
+        const registrationRef = db
+          .collection("registrations")
+          .doc(item.registrationDocId);
+        const refundTxRef = db
+          .collection("transactions")
+          .doc(refundTransactionId(item.registrationDocId));
+        const entryTxRef = item.entryTransactionPath
+          ? db.doc(item.entryTransactionPath)
+          : null;
+
+        // 1. Credit the ONE bucket that paid the entry.
+        transaction.update(write.ref, write.update);
+
+        // 2. Deterministic refund ledger — unmistakably cash OR beta.
+        const base = {
+          amount: amountReais,
+          user_ref: db.collection("users").doc(item.uid),
+          display_name: "Reembolso de inscrição",
+          tournament_ref: tournamentRef,
+          registration_ref: registrationRef,
+          entry_transaction_ref: entryTxRef,
+          timestamp: stampedAt,
+          created_at: stampedAt,
+          status: "completed",
+          external_id: refundTransactionId(item.registrationDocId),
+        };
+        if (item.economy === ECONOMY_BETA_CREDIT) {
+          transaction.set(refundTxRef, {
+            ...base,
+            category: BETA_REFUND_CATEGORY,
+            economy_type: ECONOMY_BETA_CREDIT,
+            beta_previous_balance: centavosToReais(write.previousCentavos),
+            beta_balance_after: centavosToReais(write.afterCentavos),
+          });
+        } else {
+          transaction.set(refundTxRef, {
+            ...base,
+            category: ENTRY_REFUND_CATEGORY,
+            economy_type: ECONOMY_CASH,
+            previous_balance: centavosToReais(write.previousCentavos),
+            balance_after: centavosToReais(write.afterCentavos),
+          });
+        }
+
+        // 3. The registration keeps every original field (including the
+        // original transaction_ref) and gains the refunded state.
+        transaction.update(registrationRef, {
+          status: "refunded",
+          refunded_at: stampedAt,
+          refunded_amount: amountReais,
+          refund_transaction_ref: refundTxRef,
+          refund_economy_type: item.economy,
+        });
+      }
+
+      // 4. The tournament becomes TERMINAL. Both participant pairs are zeroed
+      // together (the code's own invariant); economy, lock, price and history
+      // are preserved untouched.
+      transaction.update(tournamentRef, {
+        status: STATUS_CANCELLED,
+        cancelled_at: stampedAt,
+        cancelled_by: callerAuth.uid,
+        refunded_registration_count: plan.length,
+        refunded_total: centavosToReais(totalCentavos),
+        refund_economy_type: economy,
+        current_participants: 0,
+        current_players: 0,
+        updated_at: stampedAt,
+      });
+
+      return {
+        idempotent: false,
+        economy,
+        refundedCount: plan.length,
+        refundedTotalReais: centavosToReais(totalCentavos),
+      };
+    });
+
+    return {
+      success: true,
+      tournament_id: tournamentid,
+      economy_type: outcome.economy,
+      refunded_registrations: outcome.refundedCount,
+      refunded_amount: outcome.refundedTotalReais,
+      idempotent: outcome.idempotent,
+      message: "Torneio cancelado e inscrições reembolsadas.",
+    };
+  } catch (error) {
+    console.error("cancelTournament error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const cancelTournament = central.https.onCall(cancelTournamentHandler);
 
 /**
  * ADMIN-ONLY, IDEMPOTENT: grants non-withdrawable Beta Credits to a player's

@@ -42,7 +42,7 @@ describe("regiões explícitas por função", () => {
     assert.deepEqual(regionOf(fns.onUserCreated), [EAST]);
   });
 
-  it("as onze callables estão em us-central1", async () => {
+  it("as doze callables estão em us-central1", async () => {
     const fns = await loadFunctions();
     for (const name of [
       "testdeposit",
@@ -56,6 +56,7 @@ describe("regiões explícitas por função", () => {
       "startTournament",
       "declareTournamentResult",
       "grantBetaCredit",
+      "cancelTournament",
     ]) {
       assert.deepEqual(
         regionOf(fns[name]),
@@ -80,6 +81,7 @@ describe("regiões explícitas por função", () => {
       "startTournament",
       "declareTournamentResult",
       "grantBetaCredit",
+      "cancelTournament",
     ]) {
       const regions = regionOf(fns[name]);
       assert.ok(
@@ -89,18 +91,19 @@ describe("regiões explícitas por função", () => {
     }
   });
 
-  it("os doze exports implantáveis existem, com casing idêntico", async () => {
+  it("os treze exports implantáveis existem, com casing idêntico", async () => {
     const fns = await loadFunctions();
     // Só exports que SÃO gatilho implantável (têm `__trigger`) — ignora
     // `default`/`__esModule` do interop CommonJS↔ESM e quaisquer helpers
     // exportados que NÃO são funções deployáveis (ex.: createTournamentHandler,
     // setTournamentRoomHandler, getTournamentRoomHandler,
     // startTournamentHandler, declareTournamentResultHandler,
-    // grantBetaCreditHandler).
+    // grantBetaCreditHandler, cancelTournamentHandler).
     const exported = Object.keys(fns)
       .filter((k) => (fns[k] as ExportedFn).__trigger != null)
       .sort();
     assert.deepEqual(exported, [
+      "cancelTournament",
       "createTournament",
       "createtournament",
       "declareTournamentResult",
