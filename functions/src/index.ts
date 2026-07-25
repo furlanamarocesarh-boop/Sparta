@@ -52,6 +52,17 @@ import {
   normalizeReason,
   validateBetaGrantAmount,
 } from "./domain/betaCredit.js";
+import {
+  BETA_ENTRY_FEE_CATEGORY,
+  BETA_PRIZE_CATEGORY,
+  checkRegistrationEconomy,
+  decideBetaCompletedReplay,
+  economyLockMaterialization,
+  ECONOMY_BETA_CREDIT,
+  ECONOMY_CASH,
+  parseRequestedEconomyType,
+  resolveTournamentEconomy,
+} from "./domain/economy.js";
 
 admin.initializeApp();
 
@@ -420,16 +431,32 @@ export const jointournament = central.https.onCall(async (data, context) => {
         throw new DomainError("not-found", "Torneio não encontrado.");
       }
 
-      // Duplicate registration is checked before any money is touched.
+      const walletData = walletSnap.data() ?? {};
+      const tournamentData = tournamentSnap.data() ?? {};
+
+      // The bucket comes EXCLUSIVELY from the stored tournament (economy_type
+      // + its durable lock); the caller can never choose it. An invalid or
+      // diverged persisted economy fails closed BEFORE any money or state.
+      const economy = resolveTournamentEconomy(tournamentData);
+
+      // Duplicate registration is checked before any money is touched. A
+      // replay must additionally still be economically consistent: if the
+      // stored registration's provenance no longer matches the tournament's
+      // economy, that is a divergence — failed-precondition, no write.
       if (registrationSnap.exists) {
+        const registrationData = registrationSnap.data() ?? {};
+        const replayEconomy = checkRegistrationEconomy({
+          registrationEconomy: registrationData.economy_type,
+          tournamentEconomy: economy,
+        });
+        if (!replayEconomy.ok) {
+          throw new DomainError("failed-precondition", replayEconomy.message);
+        }
         throw new DomainError(
           "already-exists",
           "Você já está inscrito neste torneio."
         );
       }
-
-      const walletData = walletSnap.data() ?? {};
-      const tournamentData = tournamentSnap.data() ?? {};
 
       const status = String(tournamentData.status || "")
         .trim()
@@ -455,47 +482,97 @@ export const jointournament = central.https.onCall(async (data, context) => {
         );
       }
 
-      const previousBalance = storedReaisToCentavos(
-        walletData.balance ?? 0,
-        "saldo da carteira"
-      );
-      const totalSpent = storedReaisToCentavos(
-        walletData.total_spent ?? 0,
-        "total gasto"
-      );
+      // ── Debit the ONE bucket the tournament's economy names. There is no
+      // fallback, no split and no combination: a cash tournament sees only
+      // `balance` (even with plenty of beta), a beta tournament sees only
+      // `beta_balance` (even with plenty of cash). `debit()` is pure integer
+      // math and stays source-agnostic — the ROUTING happens here.
+      let transactionData: Record<string, unknown>;
+      if (economy === ECONOMY_BETA_CREDIT) {
+        const previousBeta = storedReaisToCentavos(
+          walletData.beta_balance ?? 0,
+          "saldo beta"
+        );
+        const betaAfter = debit(previousBeta, entryFeeCentavos);
 
-      // Enforces "you cannot spend what you do not have".
-      const balanceAfter = debit(previousBalance, entryFeeCentavos);
+        // ONLY beta_balance moves. The five cash fields are never touched.
+        transaction.update(walletRef, {
+          beta_balance: centavosToReais(betaAfter),
+        });
 
-      transaction.update(walletRef, {
-        balance: centavosToReais(balanceAfter),
-        total_spent: centavosToReais(addCentavos(totalSpent, entryFeeCentavos)),
-      });
+        transactionData = {
+          amount: centavosToReais(entryFeeCentavos),
+          category: BETA_ENTRY_FEE_CATEGORY,
+          economy_type: ECONOMY_BETA_CREDIT,
+          user_ref: userRef,
+          display_name: "Entrada em torneio",
+          tournament_ref: tournamentRef,
+          // Beta-pool stamps — deliberately NOT previous_balance/balance_after,
+          // which in every cash transaction refer to the real `balance`.
+          beta_previous_balance: centavosToReais(previousBeta),
+          beta_balance_after: centavosToReais(betaAfter),
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          status: "completed",
+          external_id: externalid,
+        };
+      } else {
+        const previousBalance = storedReaisToCentavos(
+          walletData.balance ?? 0,
+          "saldo da carteira"
+        );
+        const totalSpent = storedReaisToCentavos(
+          walletData.total_spent ?? 0,
+          "total gasto"
+        );
+
+        // Enforces "you cannot spend what you do not have".
+        const balanceAfter = debit(previousBalance, entryFeeCentavos);
+
+        transaction.update(walletRef, {
+          balance: centavosToReais(balanceAfter),
+          total_spent: centavosToReais(
+            addCentavos(totalSpent, entryFeeCentavos)
+          ),
+        });
+
+        transactionData = {
+          amount: centavosToReais(entryFeeCentavos),
+          category: "entry_fee",
+          economy_type: ECONOMY_CASH,
+          user_ref: userRef,
+          display_name: "Entrada em torneio",
+          tournament_ref: tournamentRef,
+          previous_balance: centavosToReais(previousBalance),
+          balance_after: centavosToReais(balanceAfter),
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          status: "completed",
+          external_id: externalid,
+        };
+      }
 
       // Advances BOTH the canonical and the legacy counter together, so the two
-      // representations can never drift apart.
-      transaction.update(tournamentRef, participantIncrementUpdate(counts));
+      // representations can never drift apart. On a LEGACY document this same
+      // legitimate update also materializes the resolved economy + lock (absent
+      // fields only — never a standalone normalization write).
+      transaction.update(tournamentRef, {
+        ...participantIncrementUpdate(counts),
+        ...economyLockMaterialization(tournamentData, economy),
+      });
 
       transaction.set(registrationRef, {
         user_ref: userRef,
         tournament_ref: tournamentRef,
         entry_fee: centavosToReais(entryFeeCentavos),
         status: "registered",
+        // Economic provenance + server-authoritative snapshot: which economy
+        // paid this entry and exactly how much, plus the ledger reference.
+        economy_type: economy,
+        entry_fee_snapshot: centavosToReais(entryFeeCentavos),
+        transaction_ref: transactionRef,
         created_at: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      transaction.set(transactionRef, {
-        amount: centavosToReais(entryFeeCentavos),
-        category: "entry_fee",
-        user_ref: userRef,
-        display_name: "Entrada em torneio",
-        tournament_ref: tournamentRef,
-        previous_balance: centavosToReais(previousBalance),
-        balance_after: centavosToReais(balanceAfter),
-        timestamp: admin.firestore.FieldValue.serverTimestamp(),
-        status: "completed",
-        external_id: externalid,
-      });
+      transaction.set(transactionRef, transactionData);
     });
 
     return {
@@ -549,6 +626,14 @@ export const startTournamentHandler = async (
       }
 
       const tournamentData = tournamentSnap.data() ?? {};
+
+      // No money moves here, but the transition still fails closed on an
+      // invalid or diverged persisted economy — a corrupt tournament is never
+      // advanced. The payload cannot carry economy_type (exact allowlist
+      // above), the type/lock are never rewritten, and the idempotent replay
+      // keeps writing nothing.
+      resolveTournamentEconomy(tournamentData);
+
       const status = String(tournamentData.status || "")
         .trim()
         .toLowerCase();
@@ -649,6 +734,13 @@ export const declareTournamentResultHandler = async (
       }
 
       const tournamentData = tournamentSnap.data() ?? {};
+
+      // The prize's economy comes EXCLUSIVELY from the stored tournament
+      // (economy_type + durable lock), resolved BEFORE anything can move.
+      // Invalid or diverged persisted state fails closed: no credit, no
+      // status change, no result.
+      const economy = resolveTournamentEconomy(tournamentData);
+
       const status = String(tournamentData.status || "")
         .trim()
         .toLowerCase();
@@ -666,6 +758,11 @@ export const declareTournamentResultHandler = async (
       }
 
       // ── Idempotent replay: status === completed ──
+      // The replay check is ECONOMY-AWARE: a cash tournament demands the
+      // canonical cash settlement shape (category "prize"), a beta tournament
+      // demands the beta shape (category "beta_prize" + economy stamps). A
+      // settlement persisted under the other economy is a divergence, never
+      // an equivalent replay. No timestamp is rewritten on an identical replay.
       if (gate.kind === "replay") {
         const persistedResult = resultExists
           ? (tournamentData.result as Record<string, unknown>)
@@ -674,34 +771,66 @@ export const declareTournamentResultHandler = async (
           ? prizeTxSnap.data() ?? {}
           : null;
 
-        const replay = decideCompletedReplay({
-          winneruid,
-          tournamentid,
-          resultExists,
-          txExists: prizeTxSnap.exists,
-          result: persistedResult
-            ? {
-                winner_uid: persistedResult.winner_uid,
-                winner_ref: documentPath(persistedResult.winner_ref),
-                registration_ref: documentPath(
-                  persistedResult.registration_ref
-                ),
-                transaction_ref: documentPath(
-                  persistedResult.transaction_ref
-                ),
-                prize: persistedResult.prize,
-              }
-            : null,
-          tx: persistedTx
-            ? {
-                category: persistedTx.category,
-                external_id: persistedTx.external_id,
-                user_ref: documentPath(persistedTx.user_ref),
-                tournament_ref: documentPath(persistedTx.tournament_ref),
-                amount: persistedTx.amount,
-              }
-            : null,
-        });
+        const replay =
+          economy === ECONOMY_BETA_CREDIT
+            ? decideBetaCompletedReplay({
+                winneruid,
+                tournamentid,
+                resultExists,
+                txExists: prizeTxSnap.exists,
+                result: persistedResult
+                  ? {
+                      winner_uid: persistedResult.winner_uid,
+                      winner_ref: documentPath(persistedResult.winner_ref),
+                      registration_ref: documentPath(
+                        persistedResult.registration_ref
+                      ),
+                      transaction_ref: documentPath(
+                        persistedResult.transaction_ref
+                      ),
+                      prize: persistedResult.prize,
+                      economy_type: persistedResult.economy_type,
+                    }
+                  : null,
+                tx: persistedTx
+                  ? {
+                      category: persistedTx.category,
+                      economy_type: persistedTx.economy_type,
+                      external_id: persistedTx.external_id,
+                      user_ref: documentPath(persistedTx.user_ref),
+                      tournament_ref: documentPath(persistedTx.tournament_ref),
+                      amount: persistedTx.amount,
+                    }
+                  : null,
+              })
+            : decideCompletedReplay({
+                winneruid,
+                tournamentid,
+                resultExists,
+                txExists: prizeTxSnap.exists,
+                result: persistedResult
+                  ? {
+                      winner_uid: persistedResult.winner_uid,
+                      winner_ref: documentPath(persistedResult.winner_ref),
+                      registration_ref: documentPath(
+                        persistedResult.registration_ref
+                      ),
+                      transaction_ref: documentPath(
+                        persistedResult.transaction_ref
+                      ),
+                      prize: persistedResult.prize,
+                    }
+                  : null,
+                tx: persistedTx
+                  ? {
+                      category: persistedTx.category,
+                      external_id: persistedTx.external_id,
+                      user_ref: documentPath(persistedTx.user_ref),
+                      tournament_ref: documentPath(persistedTx.tournament_ref),
+                      amount: persistedTx.amount,
+                    }
+                  : null,
+              });
 
         if (!replay.ok) {
           throw new DomainError("failed-precondition", replay.message);
@@ -729,6 +858,22 @@ export const declareTournamentResultHandler = async (
         throw new DomainError("failed-precondition", registration.message);
       }
 
+      // The winner's registration must have been paid under the SAME economy
+      // the tournament settles in. A legacy (provenance-less) registration is
+      // accepted only on the cash path; a beta tournament with a cash or
+      // provenance-less registration — e.g. after an economy flip — fails
+      // closed, atomically: no credit, no status change, no result.
+      const registrationEconomy = checkRegistrationEconomy({
+        registrationEconomy: registrationData.economy_type,
+        tournamentEconomy: economy,
+      });
+      if (!registrationEconomy.ok) {
+        throw new DomainError(
+          "failed-precondition",
+          registrationEconomy.message
+        );
+      }
+
       if (!walletSnap.exists) {
         throw new DomainError(
           "not-found",
@@ -744,6 +889,62 @@ export const declareTournamentResultHandler = async (
       const prizeCentavos = prize.centavos;
 
       const walletData = walletSnap.data() ?? {};
+
+      const externalId = prizeTransactionId(tournamentid);
+      const prizeReais = centavosToReais(prizeCentavos);
+      // ONE server-timestamp sentinel, reused so every stamp written in this
+      // commit resolves to the exact same time.
+      const stampedAt = admin.firestore.FieldValue.serverTimestamp();
+
+      if (economy === ECONOMY_BETA_CREDIT) {
+        // ── BETA settlement: the prize is Beta Credits, credited EXCLUSIVELY
+        // to beta_balance. None of the five cash fields (balance,
+        // total_deposited, total_won, total_spent, total_withdrawn) moves,
+        // and the ledger entry is unmistakably beta — it can never be read
+        // as a cash deposit or cash prize, and it stays non-withdrawable.
+        const previousBeta = storedReaisToCentavos(
+          walletData.beta_balance ?? 0,
+          "saldo beta"
+        );
+        const betaAfter = credit(previousBeta, prizeCentavos);
+
+        transaction.update(winnerWalletRef, {
+          beta_balance: centavosToReais(betaAfter),
+        });
+
+        transaction.set(prizeTxRef, {
+          amount: prizeReais,
+          category: BETA_PRIZE_CATEGORY,
+          economy_type: ECONOMY_BETA_CREDIT,
+          user_ref: winnerUserRef,
+          display_name: "",
+          tournament_ref: tournamentRef,
+          beta_previous_balance: centavosToReais(previousBeta),
+          beta_balance_after: centavosToReais(betaAfter),
+          timestamp: stampedAt,
+          status: "completed",
+          external_id: externalId,
+        });
+
+        transaction.update(tournamentRef, {
+          status: "completed",
+          result: {
+            placement: 1,
+            winner_uid: winneruid,
+            winner_ref: winnerUserRef,
+            registration_ref: registrationRef,
+            prize: prizeReais,
+            transaction_ref: prizeTxRef,
+            economy_type: ECONOMY_BETA_CREDIT,
+            declared_at: stampedAt,
+            paid_at: stampedAt,
+          },
+          updated_at: stampedAt,
+        });
+        return;
+      }
+
+      // ── CASH settlement: preserved integrally from the approved flow. ──
       const previousBalance = storedReaisToCentavos(
         walletData.balance ?? 0,
         "saldo da carteira"
@@ -755,12 +956,6 @@ export const declareTournamentResultHandler = async (
 
       const balanceAfter = credit(previousBalance, prizeCentavos);
       const totalWonAfter = addCentavos(previousTotalWon, prizeCentavos);
-
-      const externalId = prizeTransactionId(tournamentid);
-      const prizeReais = centavosToReais(prizeCentavos);
-      // ONE server-timestamp sentinel, reused so every stamp written in this
-      // commit resolves to the exact same time.
-      const stampedAt = admin.firestore.FieldValue.serverTimestamp();
 
       // 1 + 2. Credit the wallet and stamp its updated_at.
       transaction.update(winnerWalletRef, {
@@ -843,8 +1038,15 @@ export const createTournamentHandler = async (
       );
     }
 
+    // The economy is chosen EXACTLY once, at creation: "cash" (real BRL) or
+    // "beta_credit" (non-withdrawable Beta Credits). Required — no default,
+    // no alias, no coercion. It can never change afterwards.
+    const economyType = parseRequestedEconomyType(data.economy_type);
+
     // Entry fee and prize may legitimately be zero (a free tournament), but
-    // never negative, and never finer than centavos.
+    // never negative, and never finer than centavos. The SAME safe numeric
+    // representation serves both economies; for "cash" the unit is BRL, for
+    // "beta_credit" it is Beta Credit units (never BRL).
     const entryFeeCentavos = toCentavos(data.entry_fee, {
       field: "valor da inscrição",
       allowZero: true,
@@ -926,6 +1128,12 @@ export const createTournamentHandler = async (
       prize: centavosToReais(prizeCentavos),
 
       status: "open",
+
+      // The authorized economy and its DURABLE LOCK are born equal. Every
+      // financial operation re-checks both and fails closed on divergence,
+      // making the type immutable in practice even before the Rules land.
+      economy_type: economyType,
+      locked_economy_type: economyType,
 
       creator_ref: userRef,
       creator_uid: uid,

@@ -55,6 +55,9 @@ const VALID_PAYLOAD = {
   prize: 0,
   max_players: 8,
   game_mode: "solo",
+  // Required since feat/beta-economy-type: every new tournament names its
+  // economy explicitly.
+  economy_type: "cash",
 };
 
 describe("createTournamentHandler — unauthenticated", () => {
