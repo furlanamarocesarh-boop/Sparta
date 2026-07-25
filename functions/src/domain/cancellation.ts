@@ -88,7 +88,11 @@ export interface RefundPlanItem {
   readonly registrationDocId: string;
   readonly amountCentavos: number;
   readonly economy: EconomyType;
-  /** Path of the original entry ledger; null ONLY for the safe cash legacy. */
+  /**
+   * Path of the original entry ledger. Null ONLY for a legacy cash item,
+   * meaning "locate the single matching entry_fee ledger by query and
+   * validate it" — never "skip the ledger proof".
+   */
   readonly entryTransactionPath: string | null;
   /** True when this is a pre-economy legacy cash registration. */
   readonly legacy: boolean;
@@ -207,6 +211,62 @@ export function resolveRefundPlanItem(input: {
       legacy,
     },
   };
+}
+
+/**
+ * Cross-validates the ORIGINAL entry ledger of a LEGACY cash registration,
+ * located by query (category == "entry_fee", user_ref, tournament_ref) —
+ * the pre-economy `jointournament` wrote exactly one such ledger per
+ * (user, tournament) under a random id, unreferenced by the registration.
+ *
+ * A legacy refund is accepted ONLY when exactly ONE ledger matches and its
+ * category, user, tournament and amount prove the charge. Zero matches
+ * (absent), two or more (ambiguous), or any field divergence fail the WHOLE
+ * cancellation — `registration.entry_fee` alone is never sufficient, and the
+ * tournament's current price is never consulted.
+ */
+export function checkLegacyEntryLedger(input: {
+  readonly registrationDocId: string;
+  readonly tournamentid: string;
+  readonly uid: string;
+  readonly matches: number;
+  readonly category: unknown;
+  readonly economyType: unknown;
+  readonly userRefPath: string | null;
+  readonly tournamentRefPath: string | null;
+  readonly amountReais: unknown;
+  readonly expectedAmountReais: number;
+}): Check {
+  const id = input.registrationDocId;
+  if (input.matches === 0) {
+    return {
+      ok: false,
+      message: `Ledger original da inscrição ${id} não encontrado.`,
+    };
+  }
+  if (input.matches > 1) {
+    return {
+      ok: false,
+      message: `Ledger original da inscrição ${id} é ambíguo.`,
+    };
+  }
+  // A legacy ledger predates economy tagging (no economy_type); a cash-tagged
+  // one is also acceptable. Anything else is not a cash entry charge.
+  const economyOk =
+    input.economyType === undefined || input.economyType === ECONOMY_CASH;
+  const consistent =
+    economyOk &&
+    input.category === "entry_fee" &&
+    input.userRefPath === `users/${input.uid}` &&
+    input.tournamentRefPath === `tournaments/${input.tournamentid}` &&
+    input.amountReais === input.expectedAmountReais;
+  if (!consistent) {
+    return {
+      ok: false,
+      message: `Ledger original da inscrição ${id} diverge do esperado.`,
+    };
+  }
+  return { ok: true };
 }
 
 /**

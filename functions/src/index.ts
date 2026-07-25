@@ -19,6 +19,7 @@ import {
 import {
   BETA_REFUND_CATEGORY,
   canCancelAtomically,
+  checkLegacyEntryLedger,
   checkOriginalEntryLedger,
   checkRefundedRegistration,
   checkRefundLedger,
@@ -1588,9 +1589,43 @@ export const cancelTournamentHandler = async (
         plan.push(resolved.item);
       }
 
-      // Cross-check every NEW-STYLE entry against its original ledger.
+      // Cross-check EVERY entry against its original ledger. New-style items
+      // carry the reference; legacy items must have their single matching
+      // cash entry ledger LOCATED by query and proven — a legacy refund is
+      // never granted on `registration.entry_fee` alone.
+      const legacyEntryPaths = new Map<string, string>();
       for (const item of plan) {
-        if (item.legacy) continue;
+        if (item.legacy) {
+          const legacySnap = await transaction.get(
+            db
+              .collection("transactions")
+              .where("category", "==", "entry_fee")
+              .where("user_ref", "==", db.collection("users").doc(item.uid))
+              .where("tournament_ref", "==", tournamentRef)
+          );
+          const only = legacySnap.size === 1 ? legacySnap.docs[0] : null;
+          const data = only ? only.data() ?? {} : {};
+          const legacyLedger = checkLegacyEntryLedger({
+            registrationDocId: item.registrationDocId,
+            tournamentid,
+            uid: item.uid,
+            matches: legacySnap.size,
+            category: data.category,
+            economyType: data.economy_type,
+            userRefPath: documentPath(data.user_ref),
+            tournamentRefPath: documentPath(data.tournament_ref),
+            amountReais: data.amount,
+            expectedAmountReais: centavosToReais(item.amountCentavos),
+          });
+          if (!legacyLedger.ok) {
+            throw new DomainError("failed-precondition", legacyLedger.message);
+          }
+          legacyEntryPaths.set(
+            item.registrationDocId,
+            (only as FirebaseFirestore.QueryDocumentSnapshot).ref.path
+          );
+          continue;
+        }
         const entryTxSnap = await transaction.get(
           db.doc(item.entryTransactionPath as string)
         );
@@ -1691,9 +1726,13 @@ export const cancelTournamentHandler = async (
         const refundTxRef = db
           .collection("transactions")
           .doc(refundTransactionId(item.registrationDocId));
-        const entryTxRef = item.entryTransactionPath
-          ? db.doc(item.entryTransactionPath)
-          : null;
+        // The refund ALWAYS references the validated original entry ledger:
+        // the registration's own ref for new-style items, the query-located
+        // ledger for legacy items. Never null.
+        const entryTxRef = db.doc(
+          item.entryTransactionPath ??
+            (legacyEntryPaths.get(item.registrationDocId) as string)
+        );
 
         // 1. Credit the ONE bucket that paid the entry.
         transaction.update(write.ref, write.update);

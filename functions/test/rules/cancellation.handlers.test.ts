@@ -547,9 +547,8 @@ describe("cancelTournament — proveniência e legado", () => {
     assert.equal(await countTxWhere("beta_refund"), 0);
   });
 
-  it("(25) legado cash SEGURO reembolsa pelo entry_fee da inscrição", async () => {
-    // Torneio LEGADO (sem economia) + inscrição LEGADA (sem proveniência,
-    // sem snapshot, sem transaction_ref) com entry_fee server-written.
+  /** Seeds a LEGACY cash scenario: tournament + registration sem proveniência. */
+  async function seedLegacyCash(): Promise<void> {
     await seedTournament("t-legacy", {
       current_participants: 1,
       current_players: 1,
@@ -562,6 +561,35 @@ describe("cancelTournament — proveniência e legado", () => {
       entry_fee: ENTRY,
       status: "registered",
     });
+  }
+
+  /** Seeds a pre-economy entry_fee ledger with a random-style id. */
+  async function seedLegacyEntryLedger(
+    id: string,
+    overrides: Record<string, unknown> = {}
+  ): Promise<void> {
+    await db
+      .collection("transactions")
+      .doc(id)
+      .set({
+        amount: ENTRY,
+        category: "entry_fee",
+        user_ref: db.collection("users").doc(A),
+        display_name: "Entrada em torneio",
+        tournament_ref: db.collection("tournaments").doc("t-legacy"),
+        previous_balance: 50,
+        balance_after: 40,
+        timestamp: admin.firestore.Timestamp.fromMillis(2_000_000),
+        status: "completed",
+        external_id: id,
+        ...overrides,
+      });
+  }
+
+  it("(25) legado cash SEGURO: o ledger original é LOCALIZADO, validado e referenciado", async () => {
+    await seedLegacyCash();
+    await seedLegacyEntryLedger("entryfee_legacy_1");
+    const entryBefore = await readDoc("transactions/entryfee_legacy_1");
 
     const res = await cancelTournamentHandler(
       { tournamentid: "t-legacy" },
@@ -572,10 +600,84 @@ describe("cancelTournament — proveniência e legado", () => {
     assert.equal(wallet?.balance, 50);
     assert.equal(wallet?.total_spent, 3);
     assert.equal(wallet?.beta_balance, 70);
-    // Legado não tem ledger original: entry_transaction_ref é null.
+
+    // (F3-8) o reembolso referencia o ledger original validado — nunca null.
     const refundTx = await readDoc(`transactions/refund_${A}_t-legacy`);
-    assert.equal(refundTx?.entry_transaction_ref, null);
+    assert.deepEqual(refundTx?.entry_transaction_ref, {
+      __ref: "transactions/entryfee_legacy_1",
+    });
     assert.equal(refundTx?.category, "entry_refund");
+    // (17) o ledger original permanece byte-for-byte inalterado.
+    assert.deepEqual(
+      await readDoc("transactions/entryfee_legacy_1"),
+      entryBefore
+    );
+  });
+
+  it("(F3-2) legado sem ledger original falha fechado, estado intacto", async () => {
+    await seedLegacyCash(); // NENHUM ledger seeded
+    const wBefore = await readDoc(`wallets/${A}`);
+    assert.equal(
+      await expectFailure(() =>
+        cancelTournamentHandler({ tournamentid: "t-legacy" }, adminCtx)
+      ),
+      "failed-precondition"
+    );
+    assert.deepEqual(await readDoc(`wallets/${A}`), wBefore);
+    assert.equal((await readDoc("tournaments/t-legacy"))?.status, "open");
+    assert.equal(await countTxWhere("entry_refund"), 0);
+  });
+
+  it("(F3-3) ledger duplicado é AMBÍGUO: falha fechado", async () => {
+    await seedLegacyCash();
+    await seedLegacyEntryLedger("entryfee_legacy_1");
+    await seedLegacyEntryLedger("entryfee_legacy_2"); // duplicata
+    const wBefore = await readDoc(`wallets/${A}`);
+    assert.equal(
+      await expectFailure(() =>
+        cancelTournamentHandler({ tournamentid: "t-legacy" }, adminCtx)
+      ),
+      "failed-precondition"
+    );
+    assert.deepEqual(await readDoc(`wallets/${A}`), wBefore);
+    assert.equal(await countTxWhere("entry_refund"), 0);
+  });
+
+  it("(F3-4) valor divergente entre ledger e inscrição falha fechado", async () => {
+    await seedLegacyCash();
+    await seedLegacyEntryLedger("entryfee_legacy_1", { amount: 8 });
+    assert.equal(
+      await expectFailure(() =>
+        cancelTournamentHandler({ tournamentid: "t-legacy" }, adminCtx)
+      ),
+      "failed-precondition"
+    );
+    assert.equal(await countTxWhere("entry_refund"), 0);
+  });
+
+  it("(F3-5,6,7) ledger de outro usuário, outro torneio ou outra categoria não prova a cobrança", async () => {
+    await seedLegacyCash();
+    // Outro usuário.
+    await seedLegacyEntryLedger("entryfee_other_user", {
+      user_ref: db.collection("users").doc(B),
+    });
+    // Outro torneio.
+    await seedLegacyEntryLedger("entryfee_other_t", {
+      tournament_ref: db.collection("tournaments").doc("t-other"),
+    });
+    // Outra categoria.
+    await seedLegacyEntryLedger("deposit_x", { category: "deposit" });
+
+    const wBefore = await readDoc(`wallets/${A}`);
+    assert.equal(
+      await expectFailure(() =>
+        cancelTournamentHandler({ tournamentid: "t-legacy" }, adminCtx)
+      ),
+      "failed-precondition"
+    );
+    assert.deepEqual(await readDoc(`wallets/${A}`), wBefore);
+    assert.equal((await readDoc("tournaments/t-legacy"))?.status, "open");
+    assert.equal(await countTxWhere("entry_refund"), 0);
   });
 
   it("(26) legado AMBÍGUO falha fechado (entry_fee ausente/inválido)", async () => {

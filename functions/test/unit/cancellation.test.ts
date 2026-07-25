@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import {
   BETA_REFUND_CATEGORY,
   canCancelAtomically,
+  checkLegacyEntryLedger,
   checkOriginalEntryLedger,
   checkRefundedRegistration,
   checkRefundLedger,
@@ -225,6 +226,59 @@ describe("checkOriginalEntryLedger", () => {
     for (const diff of cases) {
       assert.equal(
         checkOriginalEntryLedger({ ...good, ...diff }).ok,
+        false,
+        JSON.stringify(diff)
+      );
+    }
+  });
+});
+
+describe("checkLegacyEntryLedger", () => {
+  const good = {
+    registrationDocId: "u1_t1",
+    tournamentid: "t1",
+    uid: "u1",
+    matches: 1,
+    category: "entry_fee",
+    economyType: undefined, // ledger pré-economia não tem o campo
+    userRefPath: "users/u1",
+    tournamentRefPath: "tournaments/t1",
+    amountReais: 10,
+    expectedAmountReais: 10,
+  };
+
+  it("um único ledger legado consistente prova a cobrança (sem economy_type)", () => {
+    assert.deepEqual(checkLegacyEntryLedger(good), { ok: true });
+  });
+
+  it("um ledger cash pós-economia também prova a cobrança", () => {
+    assert.deepEqual(
+      checkLegacyEntryLedger({ ...good, economyType: "cash" }),
+      { ok: true }
+    );
+  });
+
+  it("ausente (0 matches) e ambíguo (2+ matches) falham fechado", () => {
+    const absent = checkLegacyEntryLedger({ ...good, matches: 0 });
+    assert.equal(absent.ok, false);
+    assert.ok(!absent.ok && absent.message.includes("não encontrado"));
+    const dup = checkLegacyEntryLedger({ ...good, matches: 2 });
+    assert.equal(dup.ok, false);
+    assert.ok(!dup.ok && dup.message.includes("ambíguo"));
+  });
+
+  it("qualquer divergência falha: categoria, economia, usuário, torneio, valor", () => {
+    const cases = [
+      { category: "deposit" },
+      { economyType: "beta_credit" },
+      { userRefPath: "users/u2" },
+      { tournamentRefPath: "tournaments/t2" },
+      { amountReais: 8 },
+      { amountReais: undefined },
+    ];
+    for (const diff of cases) {
+      assert.equal(
+        checkLegacyEntryLedger({ ...good, ...diff }).ok,
         false,
         JSON.stringify(diff)
       );
