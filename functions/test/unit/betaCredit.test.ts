@@ -229,20 +229,33 @@ describe("isolamento estrutural do beta_balance", () => {
     assert.ok(!/beta/i.test(block), "requestwithdrawal must not mention beta");
   });
 
-  it("jointournament não conhece beta_balance (entrada ainda é 100% cash)", () => {
+  // NOTA (feat/beta-economy-type): os locks estruturais de estágio 1 que
+  // afirmavam "jointournament/settlement não mencionam beta" foram
+  // deliberadamente substituídos — o roteamento por economy_type agora
+  // EXISTE nesses handlers. O não-mistura passou a ser provado
+  // comportamentalmente (economyRouting.handlers.test.ts: inscrição/prêmio
+  // cash nunca tocam beta_balance; inscrição/prêmio beta nunca tocam os
+  // cinco campos cash). Os locks de saque/depósito/domínio-cash continuam.
+
+  it("jointournament nunca faz fallback: cada ramo enxerga UM único bucket", () => {
     const block = sliceBetween(
       "export const jointournament",
       "export const startTournamentHandler"
     );
-    assert.ok(!/beta/i.test(block), "jointournament must not mention beta");
-  });
+    // Fatia os dois ramos do roteamento e prova o isolamento de cada um.
+    const betaStart = block.indexOf("if (economy === ECONOMY_BETA_CREDIT) {");
+    const betaEnd = block.indexOf("} else {", betaStart);
+    const cashEnd = block.indexOf("// Advances BOTH", betaEnd);
+    assert.ok(betaStart > 0 && betaEnd > betaStart && cashEnd > betaEnd);
 
-  it("settlement (start/declare) não conhece beta_balance", () => {
-    const block = sliceBetween(
-      "export const startTournamentHandler",
-      "export const createTournamentHandler"
-    );
-    assert.ok(!/beta/i.test(block), "settlement must not mention beta");
+    const betaBranch = block.slice(betaStart, betaEnd);
+    const cashBranch = block.slice(betaEnd, cashEnd);
+
+    // O ramo beta nunca lê/escreve o pool cash nem os agregados cash.
+    assert.ok(!betaBranch.includes("walletData.balance"), "beta lê balance");
+    assert.ok(!/total_(deposited|won|spent|withdrawn)/.test(betaBranch));
+    // O ramo cash nunca lê/escreve o pool beta.
+    assert.ok(!/beta/i.test(cashBranch), "cash branch must not mention beta");
   });
 
   it("testdeposit não é o mecanismo beta (não menciona beta)", () => {
