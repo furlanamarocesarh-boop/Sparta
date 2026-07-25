@@ -96,6 +96,14 @@ export function renderReconciliation(
           .padStart(12)}`
       );
     }
+    // Beta Credits are NOT BRL — printed without the currency symbol.
+    lines.push(
+      `    ${"beta_balance".padEnd(20)}    ${centavosToReais(
+        result.derivedBetaCentavos
+      )
+        .toFixed(2)
+        .padStart(12)} (créditos beta)`
+    );
 
     if (result.conflicts.length > 0) {
       lines.push("");

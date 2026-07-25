@@ -1,3 +1,14 @@
+import {
+  BETA_REFUND_CATEGORY,
+  ENTRY_REFUND_CATEGORY,
+} from "../domain/cancellation.js";
+import { BETA_GRANT_CATEGORY } from "../domain/betaCredit.js";
+import {
+  BETA_ENTRY_FEE_CATEGORY,
+  BETA_PRIZE_CATEGORY,
+  ECONOMY_BETA_CREDIT,
+  ECONOMY_CASH,
+} from "../domain/economy.js";
 import { inspectReais, MAX_BALANCE_CENTAVOS } from "../domain/money.js";
 import { WalletField, WALLET_MONEY_FIELDS } from "./walletAudit.js";
 
@@ -56,11 +67,44 @@ export const CATEGORY_TO_FIELD: Readonly<Record<MoneyCategory, WalletField>> = {
 /** Categories that ADD to the balance. The other two subtract. */
 const CREDIT_CATEGORIES: ReadonlySet<string> = new Set(["deposit", "prize"]);
 
+/**
+ * The BETA ledger categories, each REQUIRED to carry
+ * `economy_type: "beta_credit"`. They feed the SEPARATE beta identity:
+ *
+ *   beta_balance == beta_grants + beta_prizes + beta_refunds - beta_entry_spend
+ *
+ * and are completely invisible to the five cash metrics. A beta category can
+ * never fall back to cash: without its economy tag it is INVALID, never cash.
+ */
+export const BETA_CATEGORIES = [
+  BETA_GRANT_CATEGORY,
+  BETA_ENTRY_FEE_CATEGORY,
+  BETA_PRIZE_CATEGORY,
+  BETA_REFUND_CATEGORY,
+] as const;
+
+/** Every category the classifier recognizes. Anything else → manual review. */
+export const KNOWN_CATEGORIES: ReadonlySet<string> = new Set([
+  ...MONEY_CATEGORIES,
+  ENTRY_REFUND_CATEGORY,
+  ...BETA_CATEGORIES,
+]);
+
 /** One transaction, reduced to only what reconciliation needs. */
 export interface TransactionRecord {
   readonly category: unknown;
   readonly status: unknown;
   readonly amount: unknown;
+  /** Firestore path of this doc — lets a refund be matched to its original. */
+  readonly path?: string;
+  readonly economyType?: unknown;
+  readonly tournamentRefPath?: string | null;
+  readonly registrationRefPath?: string | null;
+  readonly entryTransactionRefPath?: string | null;
+  /** Are the CASH stamps (previous_balance / balance_after) present? */
+  readonly hasCashStamps?: boolean;
+  /** Are the BETA stamps (beta_previous_balance / beta_balance_after) present? */
+  readonly hasBetaStamps?: boolean;
 }
 
 export interface RelatedDocuments {
@@ -94,6 +138,14 @@ export interface WalletContext {
   readonly userRefValid: boolean;
   /** Why it is invalid, when it is. Never carries the offending path. */
   readonly userRefStatus: UserRefStatus;
+  /**
+   * The stored `beta_balance`, when the field is PRESENT: its centavos, or
+   * null when unusable. Absent (undefined) is LEGAL — a pre-beta wallet reads
+   * as zero, and only a non-zero derived beta then counts as a conflict.
+   */
+  readonly betaBalanceCentavos?: number | null;
+  /** Whether the wallet document carries the beta_balance field at all. */
+  readonly betaBalancePresent?: boolean;
   readonly related: RelatedDocuments;
 }
 
@@ -123,6 +175,12 @@ export interface ReconciliationResult {
 
   /** Derived totals, in centavos, from the transaction history. */
   readonly derivedCentavos: Readonly<Record<WalletField, number>>;
+  /**
+   * Derived beta balance, in integer units, from the beta ledger identity:
+   * grants + prizes + refunds - entry spend. Kept OUTSIDE derivedCentavos so
+   * the cash shape (and everything consuming it) is untouched.
+   */
+  readonly derivedBetaCentavos: number;
   /** Present values that CONTRADICT the derived ones. */
   readonly conflicts: readonly string[];
   /** Why the case was classified as it was. */
@@ -168,33 +226,163 @@ export function reconcileWallet(
   let unusableTransaction = false;
   let unknownCategory = false;
 
+  // Beta accumulators — a completely separate pool. NOTE for reason strings:
+  // the privacy contract forbids certain substrings in the serialized result,
+  // so messages below never name reference fields directly.
+  let betaGrants = 0;
+  let betaPrizes = 0;
+  let betaRefunds = 0;
+  let betaEntrySpend = 0;
+  let entryRefundSum = 0;
+
+  // Refund → original matching happens INSIDE this wallet's own history (an
+  // entry charge and its refund always belong to the same owner).
+  const byPath = new Map<string, TransactionRecord>();
+  for (const tx of related.transactions) {
+    if (typeof tx.path === "string") byPath.set(tx.path, tx);
+  }
+  const usedRefundOriginals = new Set<string>();
+
+  /**
+   * Validates a refund's link to its original charge. Returns the validated
+   * amount in centavos, or null after pushing the exact reason. NOTHING is
+   * ever repaired or estimated — any gap is a finding.
+   */
+  const validateRefund = (
+    tx: TransactionRecord,
+    kind: "cash" | "beta"
+  ): number | null => {
+    const label = kind === "cash" ? "reembolso cash" : "reembolso beta";
+    const amount = inspectReais(tx.amount, {
+      allowZero: false,
+      maxCentavos: MAX_BALANCE_CENTAVOS,
+    });
+    if (!amount.ok) {
+      reasons.push(`${label} com valor inválido — não somável`);
+      return null;
+    }
+    if (
+      !tx.tournamentRefPath ||
+      !tx.registrationRefPath ||
+      !tx.entryTransactionRefPath
+    ) {
+      reasons.push(`${label} sem as referências obrigatórias`);
+      return null;
+    }
+    if (kind === "cash" && tx.hasBetaStamps === true) {
+      reasons.push("reembolso cash com campos beta — inválido");
+      return null;
+    }
+    if (kind === "beta" && tx.hasCashStamps === true) {
+      reasons.push("reembolso beta com campos cash — inválido");
+      return null;
+    }
+    const original = byPath.get(tx.entryTransactionRefPath);
+    if (!original) {
+      reasons.push(`${label} sem ledger original no histórico`);
+      return null;
+    }
+    if (usedRefundOriginals.has(tx.entryTransactionRefPath)) {
+      reasons.push(`${label} reutiliza um ledger original — duplicado`);
+      return null;
+    }
+    const expectedOriginalCategory =
+      kind === "cash" ? "entry_fee" : BETA_ENTRY_FEE_CATEGORY;
+    const originalAmount = inspectReais(original.amount, {
+      allowZero: false,
+      maxCentavos: MAX_BALANCE_CENTAVOS,
+    });
+    const originalOk =
+      original.category === expectedOriginalCategory &&
+      originalAmount.ok &&
+      originalAmount.centavos === amount.centavos &&
+      original.tournamentRefPath === tx.tournamentRefPath;
+    if (!originalOk) {
+      reasons.push(`${label} diverge do ledger original`);
+      return null;
+    }
+    usedRefundOriginals.add(tx.entryTransactionRefPath);
+    return amount.centavos;
+  };
+
   for (const tx of related.transactions) {
     const category = typeof tx.category === "string" ? tx.category : "";
 
-    if (!MONEY_CATEGORIES.includes(category as MoneyCategory)) {
+    if (!KNOWN_CATEGORIES.has(category)) {
       // An unrecognized category could move money in a way we cannot model.
       unknownCategory = true;
       continue;
     }
 
-    const amount = inspectReais(tx.amount, {
-      allowZero: true,
-      maxCentavos: MAX_BALANCE_CENTAVOS,
-    });
-
-    if (!amount.ok) {
-      unusableTransaction = true;
+    // ── The four historical CASH categories — behavior preserved, plus the
+    // guard that a cash category can never DECLARE the beta economy.
+    if (MONEY_CATEGORIES.includes(category as MoneyCategory)) {
+      if (tx.economyType === ECONOMY_BETA_CREDIT) {
+        reasons.push(
+          "transaction cash declara economia beta — inválida, não somada"
+        );
+        continue;
+      }
+      const amount = inspectReais(tx.amount, {
+        allowZero: true,
+        maxCentavos: MAX_BALANCE_CENTAVOS,
+      });
+      if (!amount.ok) {
+        unusableTransaction = true;
+        continue;
+      }
+      derived[CATEGORY_TO_FIELD[category as MoneyCategory]] += amount.centavos;
+      // A withdrawal is charged at request time, pending or not (see header).
+      if (CREDIT_CATEGORIES.has(category)) {
+        derived.balance += amount.centavos;
+      } else {
+        derived.balance -= amount.centavos;
+      }
       continue;
     }
 
-    derived[CATEGORY_TO_FIELD[category as MoneyCategory]] += amount.centavos;
-
-    // A withdrawal is charged at request time, pending or not (see the header).
-    if (CREDIT_CATEGORIES.has(category)) {
-      derived.balance += amount.centavos;
-    } else {
-      derived.balance -= amount.centavos;
+    // ── entry_refund: cash comes BACK — net spend and balance both adjust.
+    if (category === ENTRY_REFUND_CATEGORY) {
+      if (tx.economyType !== ECONOMY_CASH) {
+        reasons.push("reembolso cash sem economia cash — inválido");
+        continue;
+      }
+      const centavos = validateRefund(tx, "cash");
+      if (centavos === null) continue;
+      entryRefundSum += centavos;
+      derived.balance += centavos;
+      continue;
     }
+
+    // ── The four BETA categories: economy_type beta_credit is MANDATORY.
+    // Without it the transaction is INVALID — never silently cash.
+    if (tx.economyType !== ECONOMY_BETA_CREDIT) {
+      reasons.push(
+        "transaction beta sem economia beta_credit — inválida, nunca cash"
+      );
+      continue;
+    }
+    if (tx.hasCashStamps === true) {
+      reasons.push("transaction beta com campos cash — inválida");
+      continue;
+    }
+    if (category === BETA_REFUND_CATEGORY) {
+      const centavos = validateRefund(tx, "beta");
+      if (centavos === null) continue;
+      betaRefunds += centavos;
+      continue;
+    }
+    const amount = inspectReais(tx.amount, {
+      allowZero: false,
+      maxCentavos: MAX_BALANCE_CENTAVOS,
+    });
+    if (!amount.ok) {
+      reasons.push("transaction beta com valor inválido — não somável");
+      continue;
+    }
+    if (category === BETA_GRANT_CATEGORY) betaGrants += amount.centavos;
+    else if (category === BETA_PRIZE_CATEGORY) betaPrizes += amount.centavos;
+    else betaEntrySpend += amount.centavos;
   }
 
   if (unknownCategory) {
@@ -208,12 +396,33 @@ export function reconcileWallet(
     );
   }
 
+  // Net cash spend: gross entry fees minus validated refunds — never negative.
+  if (entryRefundSum > derived.total_spent) {
+    reasons.push("reembolsos cash excedem o gasto de inscrições — impossível");
+  } else {
+    derived.total_spent -= entryRefundSum;
+  }
+
+  // The separate beta identity: grants + prizes + refunds - entry spend.
+  const derivedBeta = betaGrants + betaPrizes + betaRefunds - betaEntrySpend;
+  if (
+    !Number.isSafeInteger(derivedBeta) ||
+    betaGrants + betaPrizes + betaRefunds > Number.MAX_SAFE_INTEGER
+  ) {
+    reasons.push("saldo beta derivado não é um inteiro seguro");
+  } else if (derivedBeta < 0) {
+    reasons.push("histórico beta implica saldo negativo — impossível");
+  } else if (derivedBeta > MAX_BALANCE_CENTAVOS) {
+    reasons.push("saldo beta derivado acima do limite permitido");
+  }
+
   // --- Cross-checks against the documents that must accompany a charge. ------
   const withdrawalTxCount = related.transactions.filter(
     (tx) => tx.category === "withdrawal"
   ).length;
-  const entryFeeTxCount = related.transactions.filter(
-    (tx) => tx.category === "entry_fee"
+  const entryChargeTxCount = related.transactions.filter(
+    (tx) =>
+      tx.category === "entry_fee" || tx.category === BETA_ENTRY_FEE_CATEGORY
   ).length;
 
   if (related.withdrawalStatuses.length !== withdrawalTxCount) {
@@ -221,11 +430,29 @@ export function reconcileWallet(
       "nº de withdrawals não bate com o nº de transactions category=withdrawal"
     );
   }
-  if (related.registrationCount !== entryFeeTxCount) {
-    // jointournament writes both atomically; a mismatch means the history is
-    // incomplete, so entry fees cannot be trusted to be fully represented.
+  if (related.registrationCount !== entryChargeTxCount) {
+    // jointournament writes both atomically (cash OR beta entry); a mismatch
+    // means the history is incomplete, so entry charges cannot be trusted to
+    // be fully represented.
     reasons.push(
-      "nº de registrations não bate com o nº de transactions category=entry_fee"
+      "nº de registrations não bate com o nº de transactions de inscrição"
+    );
+  }
+
+  // --- Does the stored beta balance agree with the beta ledger? --------------
+  if (context.betaBalancePresent === true) {
+    const presentBeta = context.betaBalanceCentavos;
+    if (presentBeta === null || presentBeta === undefined) {
+      conflicts.push("beta_balance: valor presente é inválido");
+    } else if (presentBeta !== derivedBeta) {
+      conflicts.push(
+        `beta_balance: presente ${fmt(presentBeta)} ≠ derivado ${fmt(derivedBeta)}`
+      );
+    }
+  } else if (derivedBeta !== 0) {
+    // Absent means zero at runtime — a non-zero beta history contradicts it.
+    conflicts.push(
+      `beta_balance: ausente (= 0), mas o histórico deriva ${fmt(derivedBeta)}`
     );
   }
 
@@ -294,6 +521,7 @@ export function reconcileWallet(
     registrationCount: related.registrationCount,
     hasFinancialActivity,
     derivedCentavos: derived,
+    derivedBetaCentavos: derivedBeta,
     conflicts,
     reasons,
     classification,
