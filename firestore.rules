@@ -108,6 +108,24 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // PLAYER ACTIVITY — one document per player per business day, recording
+    // that the player OPENED the app that day.
+    //
+    // NÃO é financeiro: não guarda valor, saldo, economia nem referência a
+    // torneio. Mesmo assim segue exatamente a mesma postura das coleções
+    // financeiras: leitura só do dono (ou admin) e NENHUMA escrita direta de
+    // cliente. O documento nasce apenas pela callable recordDailyAppOpen
+    // (Admin SDK, que ignora as Rules), então um jogador não consegue forjar
+    // dias de acesso que nunca aconteceram, nem apagar os que aconteceram.
+    //
+    // O isolamento entre jogadores vem de isOwnerByUserRef(): tanto o `get`
+    // direto quanto o `list` filtrado por user_ref só retornam documentos do
+    // próprio usuário — um jogador nunca lê o histórico de outro.
+    match /player_activity/{activityId} {
+      allow read: if isOwnerByUserRef() || isAdmin();
+      allow create, update, delete: if false;
+    }
+
     // Bloqueia qualquer collection não prevista.
     match /{document=**} {
       allow read, write: if false;
