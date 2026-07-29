@@ -88,6 +88,16 @@ import {
   validateClientDay,
   validateClientOffsetMinutes,
 } from "./domain/playerActivity.js";
+import {
+  activityDaysInMonth,
+  aggregateLedger,
+  dailyNetArray,
+  normalizeMonth,
+  normalizeStatsUid,
+  STATS_TIMEZONE,
+  type EconomyTotals,
+  type LedgerRow,
+} from "./domain/engagementStats.js";
 
 admin.initializeApp();
 
@@ -2111,3 +2121,148 @@ export const recordDailyAppOpenHandler = async (
 export const recordDailyAppOpen = central.https.onCall(
   recordDailyAppOpenHandler
 );
+
+/**
+ * AUTHENTICATED, READ-ONLY: the caller's own activity days for a calendar month
+ * plus their competitive tournament net result.
+ *
+ * READ-ONLY BY CONSTRUCTION: it opens no Firestore transaction and issues no
+ * write. It changes no balance, no payment execution, no settlement decision
+ * and no existing transaction semantics. It creates NO persisted aggregate —
+ * every figure is derived on the fly from the canonical ledger, so there is
+ * nothing for a client to tamper with and nothing that can drift from truth.
+ *
+ * IDENTITY: the uid comes EXCLUSIVELY from the verified token. `month` is the
+ * only accepted payload key, so a client cannot ask about another player — the
+ * exact-payload allowlist rejects the attempt with `invalid-argument` before
+ * anything is read.
+ *
+ * THE TWO ECONOMIES ARE NEVER SUMMED. `cash` (reais) and `betaCredit`
+ * (non-monetary Beta Credits) are returned side by side. The top-level
+ * `dailyNet`/`currentWeekNet`/`currentMonthNet`/`lifetimeNet` mirror the CASH
+ * economy so the documented response shape holds; beta lives under
+ * `betaCredit`. No field carries a combined figure.
+ *
+ * MONEY UNIT: every amount is an INTEGER of centavos (cash) or centavos-like
+ * units (beta). Never a float, never reais.
+ *
+ * SCOPE OF EACH FIGURE: `activityDays` and `dailyNet` cover the REQUESTED
+ * month. `currentWeekNet` (Monday-based) and `currentMonthNet` are anchored to
+ * the SERVER's today in America/Sao_Paulo, independent of the requested month.
+ * `lifetimeNet` spans the whole ledger.
+ *
+ * Exported for behavioral tests; a plain function with no trigger metadata is
+ * NOT a deployable endpoint.
+ */
+export const getPlayerEngagementStatsHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertSignedIn(
+      context,
+      "Você precisa estar logado para ver suas estatísticas."
+    );
+
+    // Exactly one key. `uid` is deliberately NOT accepted.
+    assertExactPayload(data ?? {}, ["month"]);
+
+    const uid = normalizeStatsUid(callerAuth.uid);
+    const month = normalizeMonth((data ?? {}).month);
+
+    // The server decides "today"; the client never influences the window.
+    const today = businessDayKey(new Date(), STATS_TIMEZONE);
+
+    const userRef = db.collection("users").doc(uid);
+
+    // Both queries filter ON `user_ref`, so the query itself is the
+    // authorization scope the Rules require — never a broad read narrowed on
+    // the client. A single equality filter needs only the automatic
+    // single-field index, so NO composite index is required.
+    const [txSnap, activitySnap] = await Promise.all([
+      db.collection("transactions").where("user_ref", "==", userRef).get(),
+      db
+        .collection(ACTIVITY_COLLECTION)
+        .where("user_ref", "==", userRef)
+        .get(),
+    ]);
+
+    const rows: LedgerRow[] = txSnap.docs.map((doc) => {
+      const d = doc.data() ?? {};
+      return {
+        id: doc.id,
+        category: d.category,
+        status: d.status,
+        amount: d.amount,
+        at: toDateOrNull(d.timestamp ?? d.created_at),
+      };
+    });
+
+    const totals = aggregateLedger({ rows, requestedMonth: month, today });
+
+    const activityDays = activityDaysInMonth(
+      activitySnap.docs.map((doc) => (doc.data() ?? {}).activity_day),
+      month
+    );
+
+    const shape = (t: EconomyTotals) => ({
+      dailyNet: dailyNetArray(t),
+      currentWeekNet: t.currentWeekNet,
+      currentMonthNet: t.currentMonthNet,
+      lifetimeNet: t.lifetimeNet,
+    });
+
+    const cash = shape(totals.cash);
+    const betaCredit = shape(totals.beta);
+
+    return {
+      success: true,
+      timezone: STATS_TIMEZONE,
+      month: month.key,
+      amountUnit: "centavos",
+      activityDays,
+      // Documented top-level shape — the CASH economy.
+      dailyNet: cash.dailyNet,
+      currentWeekNet: cash.currentWeekNet,
+      currentMonthNet: cash.currentMonthNet,
+      lifetimeNet: cash.lifetimeNet,
+      // Both economies, explicitly separated. Never summed.
+      cash,
+      betaCredit,
+      // Honest disclosure of what did not reach a total.
+      excluded: {
+        unknownCategory: totals.excludedUnknownCategory,
+        malformedAmount: totals.excludedMalformedAmount,
+        undated: totals.excludedUndated,
+        notCompleted: totals.excludedNotCompleted,
+      },
+    };
+  } catch (error) {
+    console.error("getPlayerEngagementStats error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const getPlayerEngagementStats = central.https.onCall(
+  getPlayerEngagementStatsHandler
+);
+
+/**
+ * A Firestore Timestamp (production), a Date (tests), or null for anything
+ * else. A row we cannot date is counted as undated rather than guessed at.
+ */
+function toDateOrNull(value: unknown): Date | null {
+  if (value instanceof Date) return value;
+  if (
+    value &&
+    typeof (value as { toDate?: unknown }).toDate === "function"
+  ) {
+    try {
+      const d = (value as { toDate: () => Date }).toDate();
+      return d instanceof Date && !Number.isNaN(d.getTime()) ? d : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}

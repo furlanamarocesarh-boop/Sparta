@@ -42,7 +42,7 @@ describe("regiões explícitas por função", () => {
     assert.deepEqual(regionOf(fns.onUserCreated), [EAST]);
   });
 
-  it("as treze callables estão em us-central1", async () => {
+  it("as quatorze callables estão em us-central1", async () => {
     const fns = await loadFunctions();
     for (const name of [
       "testdeposit",
@@ -58,6 +58,7 @@ describe("regiões explícitas por função", () => {
       "grantBetaCredit",
       "cancelTournament",
       "recordDailyAppOpen",
+      "getPlayerEngagementStats",
     ]) {
       assert.deepEqual(
         regionOf(fns[name]),
@@ -84,6 +85,7 @@ describe("regiões explícitas por função", () => {
       "grantBetaCredit",
       "cancelTournament",
       "recordDailyAppOpen",
+      "getPlayerEngagementStats",
     ]) {
       const regions = regionOf(fns[name]);
       assert.ok(
@@ -93,7 +95,7 @@ describe("regiões explícitas por função", () => {
     }
   });
 
-  it("os quatorze exports implantáveis existem, com casing idêntico", async () => {
+  it("os quinze exports implantáveis existem, com casing idêntico", async () => {
     const fns = await loadFunctions();
     // Só exports que SÃO gatilho implantável (têm `__trigger`) — ignora
     // `default`/`__esModule` do interop CommonJS↔ESM e quaisquer helpers
@@ -101,7 +103,7 @@ describe("regiões explícitas por função", () => {
     // setTournamentRoomHandler, getTournamentRoomHandler,
     // startTournamentHandler, declareTournamentResultHandler,
     // grantBetaCreditHandler, cancelTournamentHandler,
-    // recordDailyAppOpenHandler).
+    // recordDailyAppOpenHandler, getPlayerEngagementStatsHandler).
     const exported = Object.keys(fns)
       .filter((k) => (fns[k] as ExportedFn).__trigger != null)
       .sort();
@@ -110,6 +112,7 @@ describe("regiões explícitas por função", () => {
       "createTournament",
       "createtournament",
       "declareTournamentResult",
+      "getPlayerEngagementStats",
       "getTournamentRoom",
       "grantBetaCredit",
       "jointournament",
