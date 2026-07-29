@@ -37,6 +37,27 @@ service cloud.firestore {
       return signedIn() && resource.data.user_ref == userRef();
     }
 
+    // The DETERMINISTIC registration id that `jointournament` writes:
+    // `{uid}_{tournamentId}`. This asks one narrow question — "is this document
+    // path the caller's own?" — and is used ONLY to authorize the existence
+    // check of a document that does NOT exist.
+    //
+    // It NEVER decides ownership of stored data. Whenever a registration
+    // actually exists, authorization goes through the canonical stored
+    // `user_ref` instead, so a malformed document whose id merely starts with
+    // the caller's uid stays private.
+    //
+    // The prefix compared is `uid + '_'`, not `uid`, so prefix-similar uids
+    // cannot reach each other: with uids "abc" and "abcdef", the id
+    // "abcdef_t1" does not start with "abc_". Requiring the id to be strictly
+    // LONGER than the prefix also rejects a bare "{uid}_" with no tournament.
+    function isOwnDeterministicRegistrationId(registrationId) {
+      let prefix = request.auth.uid + '_';
+      return signedIn()
+          && registrationId.size() > prefix.size()
+          && registrationId[0:prefix.size()] == prefix;
+    }
+
     // USERS
     match /users/{userId} {
       allow read: if isOwnerByUid(userId) || isAdmin();
@@ -74,9 +95,39 @@ service cloud.firestore {
     }
 
     // REGISTRATIONS
+    //
+    // `get` and `list` are authorized SEPARATELY, because they answer different
+    // questions and only one of them needed to change.
+    //
+    // WHY: before rendering the join CTA, the app reads the deterministic
+    // document `registrations/{uid}_{tournamentId}` to learn whether the player
+    // is already registered. On a document that does NOT exist, `resource` is
+    // null, so the old `resource.data.user_ref` check errored and denied the
+    // read — the join button was never rendered and `jointournament` was never
+    // invoked. A player who had never registered could never register at all.
+    //
+    // THE INVARIANT:
+    //  - document EXISTS  -> ownership is decided ONLY by the canonical stored
+    //    `user_ref`, exactly as before. The id is never trusted, so a malformed
+    //    document whose id starts with the caller's uid is still private;
+    //  - document MISSING -> the caller may probe ONLY their own deterministic
+    //    path. This cannot leak anything: there is no document to read. It
+    //    reveals exactly one bit, about the caller themselves — "am I
+    //    registered for this tournament?" — which they are entitled to know.
+    //
+    // Each disjunct guards its own `resource` state, so `resource.data` is
+    // never dereferenced on a missing document.
     match /registrations/{registrationId} {
-      // Usuário pode ler apenas inscrições próprias.
-      allow read: if isOwnerByUserRef() || isAdmin();
+      allow get: if isAdmin()
+                 || (resource != null && isOwnerByUserRef())
+                 || (resource == null
+                     && isOwnDeterministicRegistrationId(registrationId));
+
+      // Deliberately UNCHANGED and deliberately NOT sharing the `get` rule: a
+      // query is always evaluated against existing documents, so the
+      // missing-document exception must never apply to it. Listing stays
+      // owner-filtered, and an unfiltered scan stays denied.
+      allow list: if isAdmin() || isOwnerByUserRef();
 
       // Inscrição só via jointournament.
       allow create, update, delete: if false;
