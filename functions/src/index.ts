@@ -78,6 +78,26 @@ import {
   parseRequestedEconomyType,
   resolveTournamentEconomy,
 } from "./domain/economy.js";
+import {
+  ACTIVITY_COLLECTION,
+  ACTIVITY_TIMEZONE,
+  activityDocumentId,
+  businessDayKey,
+  checkActivityReplay,
+  normalizeActivityUid,
+  validateClientDay,
+  validateClientOffsetMinutes,
+} from "./domain/playerActivity.js";
+import {
+  activityDaysInMonth,
+  aggregateLedger,
+  dailyNetArray,
+  normalizeMonth,
+  normalizeStatsUid,
+  STATS_TIMEZONE,
+  type EconomyTotals,
+  type LedgerRow,
+} from "./domain/engagementStats.js";
 
 admin.initializeApp();
 
@@ -1978,3 +1998,271 @@ export const grantBetaCreditHandler = async (
 };
 
 export const grantBetaCredit = central.https.onCall(grantBetaCreditHandler);
+
+/**
+ * AUTHENTICATED, IDEMPOTENT: records that the caller OPENED the app today.
+ *
+ * NON-FINANCIAL BY CONSTRUCTION: this is the only flow that writes
+ * `player_activity`, and it touches NOTHING else — no wallet, no balance, no
+ * transaction, no registration, no tournament, no user document. It carries no
+ * amount and has no economy. A failure here can therefore never corrupt money;
+ * the client is expected to call it non-blockingly and ignore errors.
+ *
+ * IDENTITY: the uid comes EXCLUSIVELY from the verified token
+ * (`context.auth.uid`). There is no `uid` payload key, so one player can never
+ * record activity for another — the exact-payload allowlist rejects the attempt
+ * with `invalid-argument` before anything else runs.
+ *
+ * THE DAY IS THE SERVER'S: the document id uses the business day derived from
+ * the SERVER clock in `America/Sao_Paulo`. A client MAY send `client_day` and
+ * `client_timezone_offset_minutes`; those are validated against server time and
+ * stored as diagnostics, but they never choose the document. A device whose
+ * clock is more than a day off is rejected loudly rather than silently writing
+ * a day the player never opened the app.
+ *
+ * IDEMPOTENCY: the id is the deterministic `{uid}_{YYYY-MM-DD}`, read INSIDE the
+ * Firestore transaction. The first call of the day creates exactly one document;
+ * every later call the same day returns success with NO write; the next day
+ * creates exactly one new document.
+ *
+ * OLD-CLIENT COMPATIBILITY: beta `0.1.0+1` does not call this function and is
+ * completely unaffected. Nothing about the existing callables changes.
+ *
+ * Exported for behavioral tests; a plain function with no trigger metadata is
+ * NOT a deployable endpoint.
+ */
+export const recordDailyAppOpenHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertSignedIn(
+      context,
+      "Você precisa estar logado para registrar o acesso."
+    );
+
+    // Exactly these two OPTIONAL keys. `uid` is deliberately NOT accepted —
+    // sending one is an invalid payload, not a silently ignored field.
+    assertExactPayload(data ?? {}, [
+      "client_day",
+      "client_timezone_offset_minutes",
+    ]);
+
+    const uid = normalizeActivityUid(callerAuth.uid);
+
+    // The server clock decides the day. Read once so the id, the stored day and
+    // the validation all agree even if the call straddles midnight.
+    const serverNow = new Date();
+    const dayKey = businessDayKey(serverNow, ACTIVITY_TIMEZONE);
+
+    const payload = (data ?? {}) as Record<string, unknown>;
+    const clientDay = validateClientDay(payload.client_day, dayKey);
+    const clientOffsetMinutes = validateClientOffsetMinutes(
+      payload.client_timezone_offset_minutes
+    );
+
+    const userRef = db.collection("users").doc(uid);
+    const activityRef = db
+      .collection(ACTIVITY_COLLECTION)
+      .doc(activityDocumentId(uid, dayKey));
+
+    const outcome = await db.runTransaction(async (transaction) => {
+      // Read first — every read before any write.
+      const activitySnap = await transaction.get(activityRef);
+
+      if (activitySnap.exists) {
+        const stored = activitySnap.data() ?? {};
+        const replay = checkActivityReplay({
+          uid,
+          dayKey,
+          stored: {
+            uid: stored.uid,
+            activityDay: stored.activity_day,
+            userRefPath: documentPath(stored.user_ref),
+          },
+        });
+        if (!replay.ok) {
+          throw new DomainError("failed-precondition", replay.message);
+        }
+        // Already recorded today: success with NO write. The stored
+        // `first_opened_at` keeps pointing at the FIRST open of the day.
+        return { alreadyRecorded: true };
+      }
+
+      const stampedAt = admin.firestore.FieldValue.serverTimestamp();
+
+      transaction.set(activityRef, {
+        uid: uid,
+        user_ref: userRef,
+        activity_day: dayKey,
+        timezone: ACTIVITY_TIMEZONE,
+        first_opened_at: stampedAt,
+        created_at: stampedAt,
+        // Diagnostics only — never used to choose the day.
+        client_day: clientDay,
+        client_timezone_offset_minutes: clientOffsetMinutes,
+      });
+
+      return { alreadyRecorded: false };
+    });
+
+    return {
+      success: true,
+      already_recorded: outcome.alreadyRecorded,
+      activity_day: dayKey,
+      timezone: ACTIVITY_TIMEZONE,
+    };
+  } catch (error) {
+    console.error("recordDailyAppOpen error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const recordDailyAppOpen = central.https.onCall(
+  recordDailyAppOpenHandler
+);
+
+/**
+ * AUTHENTICATED, READ-ONLY: the caller's own activity days for a calendar month
+ * plus their competitive tournament net result.
+ *
+ * READ-ONLY BY CONSTRUCTION: it opens no Firestore transaction and issues no
+ * write. It changes no balance, no payment execution, no settlement decision
+ * and no existing transaction semantics. It creates NO persisted aggregate —
+ * every figure is derived on the fly from the canonical ledger, so there is
+ * nothing for a client to tamper with and nothing that can drift from truth.
+ *
+ * IDENTITY: the uid comes EXCLUSIVELY from the verified token. `month` is the
+ * only accepted payload key, so a client cannot ask about another player — the
+ * exact-payload allowlist rejects the attempt with `invalid-argument` before
+ * anything is read.
+ *
+ * THE TWO ECONOMIES ARE NEVER SUMMED. `cash` (reais) and `betaCredit`
+ * (non-monetary Beta Credits) are returned side by side. The top-level
+ * `dailyNet`/`currentWeekNet`/`currentMonthNet`/`lifetimeNet` mirror the CASH
+ * economy so the documented response shape holds; beta lives under
+ * `betaCredit`. No field carries a combined figure.
+ *
+ * MONEY UNIT: every amount is an INTEGER of centavos (cash) or centavos-like
+ * units (beta). Never a float, never reais.
+ *
+ * SCOPE OF EACH FIGURE: `activityDays` and `dailyNet` cover the REQUESTED
+ * month. `currentWeekNet` (Monday-based) and `currentMonthNet` are anchored to
+ * the SERVER's today in America/Sao_Paulo, independent of the requested month.
+ * `lifetimeNet` spans the whole ledger.
+ *
+ * Exported for behavioral tests; a plain function with no trigger metadata is
+ * NOT a deployable endpoint.
+ */
+export const getPlayerEngagementStatsHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertSignedIn(
+      context,
+      "Você precisa estar logado para ver suas estatísticas."
+    );
+
+    // Exactly one key. `uid` is deliberately NOT accepted.
+    assertExactPayload(data ?? {}, ["month"]);
+
+    const uid = normalizeStatsUid(callerAuth.uid);
+    const month = normalizeMonth((data ?? {}).month);
+
+    // The server decides "today"; the client never influences the window.
+    const today = businessDayKey(new Date(), STATS_TIMEZONE);
+
+    const userRef = db.collection("users").doc(uid);
+
+    // Both queries filter ON `user_ref`, so the query itself is the
+    // authorization scope the Rules require — never a broad read narrowed on
+    // the client. A single equality filter needs only the automatic
+    // single-field index, so NO composite index is required.
+    const [txSnap, activitySnap] = await Promise.all([
+      db.collection("transactions").where("user_ref", "==", userRef).get(),
+      db
+        .collection(ACTIVITY_COLLECTION)
+        .where("user_ref", "==", userRef)
+        .get(),
+    ]);
+
+    const rows: LedgerRow[] = txSnap.docs.map((doc) => {
+      const d = doc.data() ?? {};
+      return {
+        id: doc.id,
+        category: d.category,
+        status: d.status,
+        amount: d.amount,
+        at: toDateOrNull(d.timestamp ?? d.created_at),
+      };
+    });
+
+    const totals = aggregateLedger({ rows, requestedMonth: month, today });
+
+    const activityDays = activityDaysInMonth(
+      activitySnap.docs.map((doc) => (doc.data() ?? {}).activity_day),
+      month
+    );
+
+    const shape = (t: EconomyTotals) => ({
+      dailyNet: dailyNetArray(t),
+      currentWeekNet: t.currentWeekNet,
+      currentMonthNet: t.currentMonthNet,
+      lifetimeNet: t.lifetimeNet,
+    });
+
+    const cash = shape(totals.cash);
+    const betaCredit = shape(totals.beta);
+
+    return {
+      success: true,
+      timezone: STATS_TIMEZONE,
+      month: month.key,
+      amountUnit: "centavos",
+      activityDays,
+      // Documented top-level shape — the CASH economy.
+      dailyNet: cash.dailyNet,
+      currentWeekNet: cash.currentWeekNet,
+      currentMonthNet: cash.currentMonthNet,
+      lifetimeNet: cash.lifetimeNet,
+      // Both economies, explicitly separated. Never summed.
+      cash,
+      betaCredit,
+      // Honest disclosure of what did not reach a total.
+      excluded: {
+        unknownCategory: totals.excludedUnknownCategory,
+        malformedAmount: totals.excludedMalformedAmount,
+        undated: totals.excludedUndated,
+        notCompleted: totals.excludedNotCompleted,
+      },
+    };
+  } catch (error) {
+    console.error("getPlayerEngagementStats error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const getPlayerEngagementStats = central.https.onCall(
+  getPlayerEngagementStatsHandler
+);
+
+/**
+ * A Firestore Timestamp (production), a Date (tests), or null for anything
+ * else. A row we cannot date is counted as undated rather than guessed at.
+ */
+function toDateOrNull(value: unknown): Date | null {
+  if (value instanceof Date) return value;
+  if (
+    value &&
+    typeof (value as { toDate?: unknown }).toDate === "function"
+  ) {
+    try {
+      const d = (value as { toDate: () => Date }).toDate();
+      return d instanceof Date && !Number.isNaN(d.getTime()) ? d : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
