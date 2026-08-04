@@ -1,3 +1,5 @@
+import { randomBytes } from "node:crypto";
+
 import * as admin from "firebase-admin";
 import { https, region } from "firebase-functions/v1";
 
@@ -98,6 +100,17 @@ import {
   type EconomyTotals,
   type LedgerRow,
 } from "./domain/engagementStats.js";
+import {
+  assertPublicPlayerId,
+  decidePublicPlayerIdReservation,
+  encodePublicPlayerId,
+  isPublicPlayerId,
+  normalizeIdentityUid,
+  PUBLIC_PLAYER_ID_COLLECTION,
+  PUBLIC_PLAYER_ID_ENTROPY_BYTES,
+  PUBLIC_PLAYER_ID_INDEX_COLLECTION,
+  PUBLIC_PLAYER_ID_MAX_RESERVATION_ATTEMPTS,
+} from "./domain/publicPlayerId.js";
 
 admin.initializeApp();
 
@@ -2246,6 +2259,143 @@ export const getPlayerEngagementStatsHandler = async (
 export const getPlayerEngagementStats = central.https.onCall(
   getPlayerEngagementStatsHandler
 );
+
+/**
+ * Assigns — or returns — the caller's pseudonymous `publicPlayerId`.
+ *
+ * NOT AN ENDPOINT AND NOT A TRIGGER. It carries no `onCall`, `onRequest`,
+ * `onDocument*` or `.region()` metadata, so it adds nothing to the deployment
+ * surface; `functionRegions.test.ts` discovers deployable exports by their
+ * `__trigger` and this has none. It is exported so the ranking trigger and
+ * `getMySeasonRanking` can call it internally later, and so its real Firestore
+ * behaviour can be tested. THIS COMMIT ADDS NO CALL SITE — deciding WHEN an
+ * identity is first created belongs to step 5 of section 21.
+ *
+ * THE RESERVATION IS A CREATE-ONLY PAIR, in one transaction:
+ *   public_player_ids/{uid}                  -> { publicPlayerId, createdAt }
+ *   public_player_id_index/{publicPlayerId}  -> { uid, createdAt }
+ * The index document id IS the lock — Firestore guarantees at most one — so
+ * uniqueness is structural rather than probabilistic, and `transaction.create`
+ * is the only write used. No `set`, no `set(..., {merge:true})`, no `update`,
+ * no `delete`: an identity can therefore never be overwritten, reassigned or
+ * released, which is exactly what sections 5.2 and 6.5 freeze.
+ *
+ * WHY THE CANDIDATE IS GENERATED OUTSIDE `runTransaction`. Firestore may re-run
+ * the transaction callback on contention. Generating inside would mint a new id
+ * on every internal retry, so a losing attempt could leave a different id than
+ * the one it read against. The candidate is therefore stable for the whole
+ * transaction, and ONLY an explicit `collision` decision — the candidate
+ * legitimately belongs to another account — makes the OUTER loop draw fresh
+ * entropy. A collided candidate is never retried and never reused.
+ *
+ * ERRORS PROPAGATE AS `DomainError`, deliberately unlike the callables above:
+ * this is an internal primitive with no client on the other side, so there is
+ * no `https.HttpsError` boundary to convert at. The eventual callers are a
+ * trigger and a callable that will convert at their own edge.
+ */
+export interface EnsurePublicPlayerIdOptions {
+  /**
+   * Entropy source, injected only by tests so a collision can be provoked
+   * deterministically. Production never passes it and always gets
+   * `randomBytes`, following the options-with-defaults convention already used
+   * by `scanCollection`.
+   */
+  readonly generateEntropy?: () => Uint8Array;
+}
+
+export const ensurePublicPlayerIdHandler = async (
+  uid: unknown,
+  options: EnsurePublicPlayerIdOptions = {}
+): Promise<{ publicPlayerId: string; created: boolean }> => {
+  const normalizedUid = normalizeIdentityUid(uid);
+  const generateEntropy =
+    options.generateEntropy ??
+    (() => randomBytes(PUBLIC_PLAYER_ID_ENTROPY_BYTES));
+
+  const mapRef = db.collection(PUBLIC_PLAYER_ID_COLLECTION).doc(normalizedUid);
+
+  for (
+    let attempt = 1;
+    attempt <= PUBLIC_PLAYER_ID_MAX_RESERVATION_ATTEMPTS;
+    attempt += 1
+  ) {
+    // Outside the transaction on purpose — see the note above. Validated before
+    // it can ever be used as a document id.
+    const candidate = assertPublicPlayerId(
+      encodePublicPlayerId(generateEntropy())
+    );
+
+    const outcome = await db.runTransaction(async (transaction) => {
+      // Every read before any write.
+      const mapSnap = await transaction.get(mapRef);
+      const mapData = mapSnap.exists ? mapSnap.data() ?? {} : null;
+
+      // WHICH index document is authoritative depends on the map: an existing
+      // map must be corroborated by the index of ITS id, not of a fresh
+      // candidate. A malformed mapped id falls back to the candidate and is
+      // then rejected by the decision as a malformed map.
+      const mappedId = mapData === null ? null : mapData.publicPlayerId;
+      const indexId = isPublicPlayerId(mappedId) ? mappedId : candidate;
+      const indexRef = db
+        .collection(PUBLIC_PLAYER_ID_INDEX_COLLECTION)
+        .doc(indexId);
+      const indexSnap = await transaction.get(indexRef);
+
+      const decision = decidePublicPlayerIdReservation({
+        uid: normalizedUid,
+        candidate,
+        map: mapData === null ? null : { publicPlayerId: mapData.publicPlayerId },
+        indexId,
+        index: indexSnap.exists
+          ? { uid: (indexSnap.data() ?? {}).uid }
+          : null,
+      });
+
+      if (decision.kind === "fail") {
+        throw new DomainError("failed-precondition", decision.message);
+      }
+      if (decision.kind === "reuse") {
+        // Already reserved and consistent: return it with NO write at all.
+        return { kind: "reuse" as const, publicPlayerId: decision.publicPlayerId };
+      }
+      if (decision.kind === "collision") {
+        return { kind: "collision" as const };
+      }
+
+      const stampedAt = admin.firestore.FieldValue.serverTimestamp();
+
+      // create() and nothing else: it fails if the document already exists, so
+      // neither half of the pair can ever be silently replaced.
+      transaction.create(mapRef, {
+        publicPlayerId: decision.publicPlayerId,
+        createdAt: stampedAt,
+      });
+      transaction.create(indexRef, {
+        uid: normalizedUid,
+        createdAt: stampedAt,
+      });
+
+      return { kind: "reserve" as const, publicPlayerId: decision.publicPlayerId };
+    });
+
+    if (outcome.kind === "reuse") {
+      return { publicPlayerId: outcome.publicPlayerId, created: false };
+    }
+    if (outcome.kind === "reserve") {
+      return { publicPlayerId: outcome.publicPlayerId, created: true };
+    }
+    // Collision: discard this candidate for good and draw fresh entropy.
+  }
+
+  // Budget exhausted. Observable and fail-closed: nothing was reserved, nothing
+  // was reused, and no partially written pair can exist, because every attempt
+  // either committed both documents or committed none.
+  throw new DomainError(
+    "internal",
+    "Não foi possível reservar um identificador público após " +
+      `${PUBLIC_PLAYER_ID_MAX_RESERVATION_ATTEMPTS} tentativas.`
+  );
+};
 
 /**
  * A Firestore Timestamp (production), a Date (tests), or null for anything

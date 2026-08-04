@@ -177,6 +177,27 @@ service cloud.firestore {
       allow create, update, delete: if false;
     }
 
+    // PUBLIC IDENTITY MAP — the UID -> publicPlayerId association, and its reverse
+    // uniqueness guard. Server-only in BOTH directions: no client may read either,
+    // so the pseudonym can never be resolved back to an account and the id space
+    // cannot be enumerated; no client may write either, so an identity can never be
+    // forged, reassigned or reused.
+    //
+    // `read: if false` applies to the ADMIN claim too. These documents are the one
+    // bridge between a real account and its public pseudonym, so exposing them to
+    // an admin client would defeat the pseudonymity for everyone at once. The
+    // Admin SDK (Cloud Functions) bypasses Rules and remains the only writer.
+    //
+    // The catch-all below already denied both collections; stating the posture
+    // explicitly is what makes it a decision instead of an inheritance.
+    match /public_player_ids/{uid} {
+      allow read, write: if false;
+    }
+
+    match /public_player_id_index/{publicPlayerId} {
+      allow read, write: if false;
+    }
+
     // Bloqueia qualquer collection não prevista.
     match /{document=**} {
       allow read, write: if false;

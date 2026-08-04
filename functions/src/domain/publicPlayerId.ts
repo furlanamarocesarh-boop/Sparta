@@ -23,9 +23,9 @@ import { invalidArgument } from "./errors.js";
  * WHAT THIS MODULE DELIBERATELY DOES NOT DO. Generating an id needs a source of
  * randomness, and reserving one needs a transaction over
  * `public_player_ids/{uid}` and `public_player_id_index/{publicPlayerId}`;
- * both belong to the handler layer. This module owns only the frozen FORMAT,
- * its VALIDATION and the LABEL derivation — the parts that are deterministic
- * and therefore provable in a unit test.
+ * both belong to the handler layer. This module owns the frozen FORMAT, its
+ * VALIDATION, the LABEL derivation and the pure RESERVATION DECISION — every
+ * part that is deterministic and therefore provable in a unit test.
  */
 
 /**
@@ -143,4 +143,167 @@ export function publicPlayerLabel(publicPlayerId: string): string {
     PUBLIC_PLAYER_LABEL_PREFIX +
     validated.slice(0, PUBLIC_PLAYER_LABEL_VISIBLE_CHARS)
   );
+}
+
+/**
+ * How many independent candidates one reservation may try before giving up.
+ *
+ * With 16 random bytes a real collision is vanishingly improbable, so this is
+ * not a capacity plan — it is a defensive budget that bounds the work an
+ * unexpected state (a corrupted index, a hostile clock on the entropy source)
+ * can cause, and turns "retry forever" into an observable failure. The exact
+ * value is an internal detail, not part of the frozen contract.
+ */
+export const PUBLIC_PLAYER_ID_MAX_RESERVATION_ATTEMPTS = 5;
+
+/**
+ * Normalizes the uid with the secure pattern already used by `jointournament`,
+ * `grantBetaCredit`, the settlement module and `recordDailyAppOpen`: trimmed,
+ * non-empty, no "/", and no longer than 200 chars — so it can never escape its
+ * document path.
+ */
+export function normalizeIdentityUid(value: unknown): string {
+  const uid = String(value || "").trim();
+  if (!uid) {
+    throw invalidArgument("UID do jogador é obrigatório.");
+  }
+  if (uid.includes("/") || uid.length > 200) {
+    throw invalidArgument("UID do jogador inválido.");
+  }
+  return uid;
+}
+
+/** The same rule as [normalizeIdentityUid], as a predicate over stored data. */
+function isUsableUid(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.trim() === value &&
+    !value.includes("/") &&
+    value.length <= 200
+  );
+}
+
+/** The persisted fields of `public_player_ids/{uid}`. */
+export interface StoredPublicIdentityMap {
+  readonly publicPlayerId?: unknown;
+}
+
+/** The persisted fields of `public_player_id_index/{publicPlayerId}`. */
+export interface StoredPublicIdentityIndex {
+  readonly uid?: unknown;
+}
+
+/**
+ * Everything one reservation attempt read, before it decides anything.
+ *
+ * [indexId] records WHICH index document [index] came from. It is not
+ * redundant: the authoritative index depends on what the map says — an existing
+ * map must be corroborated by the index of ITS id, never of a fresh candidate —
+ * so a caller that read the wrong document is caught here instead of silently
+ * validating the wrong pair.
+ */
+export interface PublicPlayerIdReservationState {
+  readonly uid: string;
+  readonly candidate: string;
+  readonly map: StoredPublicIdentityMap | null;
+  readonly indexId: string;
+  readonly index: StoredPublicIdentityIndex | null;
+}
+
+/**
+ * What an attempt should do. `collision` is the ONLY outcome that may be
+ * retried with fresh entropy; `fail` is terminal by design.
+ */
+export type PublicPlayerIdReservation =
+  | { readonly kind: "reuse"; readonly publicPlayerId: string }
+  | { readonly kind: "reserve"; readonly publicPlayerId: string }
+  | { readonly kind: "collision"; readonly candidate: string }
+  | { readonly kind: "fail"; readonly message: string };
+
+function reservationFailure(message: string): PublicPlayerIdReservation {
+  return { kind: "fail", message };
+}
+
+/**
+ * Decides one reservation attempt from what it read — pure, total, and with no
+ * Firestore, Admin SDK or `node:crypto` anywhere near it.
+ *
+ * FAIL-CLOSED IS THE WHOLE POINT. Every structural inconsistency returns
+ * `fail`: a map without its index, an index without its map, an index owned by
+ * a different account, a malformed field. None of them is repaired,
+ * overwritten or ignored, because each one is a symptom of something this
+ * module cannot see, and because "repairing" an identity would either break the
+ * immutability of section 5.2 or hand a released id to a second account.
+ *
+ * `collision` is reserved for the ONE benign case: a candidate that legitimately
+ * belongs to somebody else. That is the only state where trying again with new
+ * entropy is correct rather than destructive.
+ */
+export function decidePublicPlayerIdReservation(
+  state: PublicPlayerIdReservationState
+): PublicPlayerIdReservation {
+  const { uid, candidate, map, indexId, index } = state;
+
+  if (!isUsableUid(uid)) {
+    return reservationFailure("UID do jogador inválido.");
+  }
+  if (!isPublicPlayerId(candidate)) {
+    return reservationFailure("Candidato a identificador público inválido.");
+  }
+
+  // No map: this uid has no identity yet, so the candidate's OWN index decides.
+  if (map === null) {
+    if (indexId !== candidate) {
+      return reservationFailure(
+        "Índice reverso lido não corresponde ao candidato."
+      );
+    }
+    if (index === null) {
+      return { kind: "reserve", publicPlayerId: candidate };
+    }
+
+    const ownerUid = index.uid;
+    if (!isUsableUid(ownerUid)) {
+      return reservationFailure("Índice reverso malformado.");
+    }
+    if (ownerUid === uid) {
+      // The index claims this uid already holds the candidate, yet no map
+      // exists. Creating the map now would adopt a reservation whose other half
+      // is missing — the exact state a create-only pair is designed to prevent.
+      return reservationFailure(
+        "Índice reverso órfão: identificador reservado para este UID sem mapa correspondente."
+      );
+    }
+    // Legitimately somebody else's. The only retryable outcome.
+    return { kind: "collision", candidate };
+  }
+
+  // A map exists: it is authoritative, and it must be corroborated.
+  const mappedId = map.publicPlayerId;
+  if (!isPublicPlayerId(mappedId)) {
+    return reservationFailure("Mapa de identidade pública malformado.");
+  }
+  if (indexId !== mappedId) {
+    return reservationFailure(
+      "Índice reverso lido não corresponde ao identificador mapeado."
+    );
+  }
+  if (index === null) {
+    return reservationFailure(
+      "Índice reverso ausente para o identificador mapeado."
+    );
+  }
+
+  const ownerUid = index.uid;
+  if (!isUsableUid(ownerUid)) {
+    return reservationFailure("Índice reverso malformado.");
+  }
+  if (ownerUid !== uid) {
+    return reservationFailure("Índice reverso pertence a outro UID.");
+  }
+
+  // Both halves agree: the identity already exists. No write, ever — this is
+  // what makes it immutable and stable across seasons.
+  return { kind: "reuse", publicPlayerId: mappedId };
 }

@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import {
@@ -6,12 +8,16 @@ import {
   PUBLIC_PLAYER_ID_ENTROPY_BYTES,
   PUBLIC_PLAYER_ID_INDEX_COLLECTION,
   PUBLIC_PLAYER_ID_LENGTH,
+  PUBLIC_PLAYER_ID_MAX_RESERVATION_ATTEMPTS,
   PUBLIC_PLAYER_LABEL_PREFIX,
   PUBLIC_PLAYER_LABEL_VISIBLE_CHARS,
   assertPublicPlayerId,
+  decidePublicPlayerIdReservation,
   encodePublicPlayerId,
   isPublicPlayerId,
+  normalizeIdentityUid,
   publicPlayerLabel,
+  type PublicPlayerIdReservationState,
 } from "../../src/domain/publicPlayerId.js";
 
 /** The sample identity of design section 5.5. */
@@ -234,6 +240,355 @@ describe("rótulo visual do MVP", () => {
     assertDomainCode(
       () => publicPlayerLabel(undefined as unknown as string),
       "invalid-argument"
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reserva — decisão pura
+// ---------------------------------------------------------------------------
+
+const UID = "7N4hobJBzhOaWmWTidTduhlf7Wj1";
+const OTHER_UID = "K3pQrS9tUvWxYz01AbCdEfGh2Ij3";
+
+/** Another well-formed identity, distinct from SAMPLE_ID. */
+const OTHER_ID = "Zq8Wv2_tR4mYbN7xJc-K1L";
+
+/** Builds a reservation state, overriding only what a case cares about. */
+function state(
+  overrides: Partial<PublicPlayerIdReservationState> = {}
+): PublicPlayerIdReservationState {
+  return {
+    uid: UID,
+    candidate: SAMPLE_ID,
+    map: null,
+    indexId: SAMPLE_ID,
+    index: null,
+    ...overrides,
+  };
+}
+
+describe("normalizeIdentityUid", () => {
+  it("aceita e devolve o uid do token, sem espaços em volta", () => {
+    assert.equal(normalizeIdentityUid(`  ${UID}  `), UID);
+  });
+
+  it("rejeita vazio, barra e comprimento capaz de escapar do caminho", () => {
+    assertDomainCode(() => normalizeIdentityUid(""), "invalid-argument");
+    assertDomainCode(() => normalizeIdentityUid(null), "invalid-argument");
+    assertDomainCode(
+      () => normalizeIdentityUid("uid/../wallets/victim"),
+      "invalid-argument"
+    );
+    assertDomainCode(
+      () => normalizeIdentityUid("x".repeat(201)),
+      "invalid-argument"
+    );
+  });
+});
+
+describe("orçamento de tentativas", () => {
+  it("é um inteiro finito, pequeno e maior que uma tentativa", () => {
+    // Detalhe interno, não do contrato — mas precisa permitir ao menos uma
+    // segunda tentativa, senão uma colisão legítima viraria falha imediata.
+    assert.ok(Number.isInteger(PUBLIC_PLAYER_ID_MAX_RESERVATION_ATTEMPTS));
+    assert.ok(PUBLIC_PLAYER_ID_MAX_RESERVATION_ATTEMPTS > 1);
+    assert.ok(PUBLIC_PLAYER_ID_MAX_RESERVATION_ATTEMPTS <= 10);
+  });
+});
+
+describe("decisão de reserva — caminhos benignos", () => {
+  it("sem mapa e sem índice, reserva o candidato", () => {
+    const decision = decidePublicPlayerIdReservation(state());
+
+    assert.deepEqual(decision, { kind: "reserve", publicPlayerId: SAMPLE_ID });
+  });
+
+  it("mapa e índice coerentes reutilizam a identidade, sem escrita", () => {
+    const decision = decidePublicPlayerIdReservation(
+      state({
+        // Um candidato novo foi sorteado, mas é irrelevante: a identidade já
+        // existe e é imutável.
+        candidate: OTHER_ID,
+        map: { publicPlayerId: SAMPLE_ID },
+        indexId: SAMPLE_ID,
+        index: { uid: UID },
+      })
+    );
+
+    assert.deepEqual(decision, { kind: "reuse", publicPlayerId: SAMPLE_ID });
+  });
+
+  it("candidato que pertence legitimamente a outro UID é colisão", () => {
+    const decision = decidePublicPlayerIdReservation(
+      state({ index: { uid: OTHER_UID } })
+    );
+
+    assert.deepEqual(decision, { kind: "collision", candidate: SAMPLE_ID });
+  });
+});
+
+describe("decisão de reserva — imutabilidade e não-reuso", () => {
+  it("com mapa válido, NENHUM candidato consegue produzir uma nova reserva", () => {
+    // Imutabilidade: a identidade existente vence sempre. Percorre candidatos
+    // distintos para provar que a decisão não depende do sorteio.
+    for (let i = 0; i < 16; i += 1) {
+      const candidate = encodePublicPlayerId(bytes(16, i * 7));
+      const decision = decidePublicPlayerIdReservation(
+        state({
+          candidate,
+          map: { publicPlayerId: SAMPLE_ID },
+          indexId: SAMPLE_ID,
+          index: { uid: UID },
+        })
+      );
+
+      assert.equal(decision.kind, "reuse");
+      assert.equal(
+        (decision as { publicPlayerId: string }).publicPlayerId,
+        SAMPLE_ID
+      );
+    }
+  });
+
+  it("um identificador já indexado por outra conta nunca vira reserva", () => {
+    // Não-reuso: o índice reverso é permanente, então nenhum sorteio consegue
+    // entregar a mesma identidade a uma segunda conta.
+    for (const owner of [OTHER_UID, "outro-uid", "z"]) {
+      const decision = decidePublicPlayerIdReservation(
+        state({ index: { uid: owner } })
+      );
+
+      assert.equal(decision.kind, "collision");
+    }
+  });
+
+  it("colisão devolve o candidato colidido, para que o laço o descarte", () => {
+    const decision = decidePublicPlayerIdReservation(
+      state({ candidate: OTHER_ID, indexId: OTHER_ID, index: { uid: OTHER_UID } })
+    );
+
+    assert.deepEqual(decision, { kind: "collision", candidate: OTHER_ID });
+  });
+});
+
+describe("decisão de reserva — inconsistências falham fechadas", () => {
+  /** Extrai a mensagem de uma decisão que precisa ser `fail`. */
+  function failureOf(input: PublicPlayerIdReservationState): string {
+    const decision = decidePublicPlayerIdReservation(input);
+    assert.equal(decision.kind, "fail", `esperava fail, veio ${decision.kind}`);
+    return (decision as { message: string }).message;
+  }
+
+  it("mapa malformado não é reparado nem sobrescrito", () => {
+    for (const stored of [
+      { publicPlayerId: "PLR-123456" },
+      { publicPlayerId: "" },
+      { publicPlayerId: 42 },
+      { publicPlayerId: null },
+      {},
+    ]) {
+      const message = failureOf(
+        state({ map: stored, indexId: SAMPLE_ID, index: { uid: UID } })
+      );
+      assert.match(message, /[Mm]apa/);
+    }
+  });
+
+  it("mapa existente sem índice reverso falha", () => {
+    const message = failureOf(
+      state({ map: { publicPlayerId: SAMPLE_ID }, indexId: SAMPLE_ID, index: null })
+    );
+
+    assert.match(message, /ausente/);
+  });
+
+  it("índice reverso malformado falha, com ou sem mapa", () => {
+    for (const stored of [{ uid: "" }, { uid: 7 }, { uid: null }, {}, { uid: "a/b" }]) {
+      failureOf(state({ index: stored }));
+      failureOf(
+        state({ map: { publicPlayerId: SAMPLE_ID }, indexId: SAMPLE_ID, index: stored })
+      );
+    }
+  });
+
+  it("índice do identificador mapeado pertencente a outro UID falha", () => {
+    const message = failureOf(
+      state({
+        map: { publicPlayerId: SAMPLE_ID },
+        indexId: SAMPLE_ID,
+        index: { uid: OTHER_UID },
+      })
+    );
+
+    assert.match(message, /outro UID/);
+  });
+
+  it("índice órfão apontando para o PRÓPRIO UID falha, em vez de adotar a metade solta", () => {
+    // Metade de um par create-only. Criar o mapa agora adotaria uma reserva
+    // cuja outra metade nunca foi confirmada.
+    const message = failureOf(state({ index: { uid: UID } }));
+
+    assert.match(message, /órfão/);
+  });
+
+  it("ler o índice ERRADO é detectado em vez de validar o par trocado", () => {
+    // Sem mapa, o índice autoritativo é o do candidato.
+    failureOf(state({ indexId: OTHER_ID }));
+
+    // Com mapa, é o do identificador mapeado — nunca o do candidato novo.
+    failureOf(
+      state({
+        candidate: OTHER_ID,
+        map: { publicPlayerId: SAMPLE_ID },
+        indexId: OTHER_ID,
+        index: { uid: UID },
+      })
+    );
+  });
+
+  it("uid ou candidato inválidos falham antes de qualquer decisão de escrita", () => {
+    failureOf(state({ uid: "" }));
+    failureOf(state({ uid: "uid/escapado" }));
+    failureOf(state({ candidate: "PLR-123456", indexId: "PLR-123456" }));
+  });
+
+  it("nenhuma inconsistência jamais produz reserve ou reuse", () => {
+    const corrupt: PublicPlayerIdReservationState[] = [
+      state({ map: { publicPlayerId: "quebrado" } }),
+      state({ map: { publicPlayerId: SAMPLE_ID }, indexId: SAMPLE_ID, index: null }),
+      state({ index: { uid: UID } }),
+      state({
+        map: { publicPlayerId: SAMPLE_ID },
+        indexId: SAMPLE_ID,
+        index: { uid: OTHER_UID },
+      }),
+      state({ indexId: OTHER_ID }),
+    ];
+
+    for (const input of corrupt) {
+      const kind = decidePublicPlayerIdReservation(input).kind;
+      assert.ok(
+        kind !== "reserve" && kind !== "reuse",
+        `estado corrompido produziu ${kind}`
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Guarda estrutural do handler
+// ---------------------------------------------------------------------------
+
+/**
+ * O emulador prova o COMPORTAMENTO da reserva, mas não consegue distinguir
+ * `transaction.create` de `transaction.set`: dentro de uma transação, a decisão
+ * pura já impede escrever sobre um documento existente, e o Firestore aborta e
+ * repete quando alguém escreve entre a leitura e o commit. `create` é, portanto,
+ * defesa em profundidade — e defesa em profundidade que nenhum teste observa é
+ * defesa que alguém remove sem perceber.
+ *
+ * Esta guarda fecha exatamente essa lacuna, no mesmo estilo estrutural que
+ * `payprizeAliasSecure.test.ts` já usa sobre `src/index.ts`.
+ */
+function srcDir(): string {
+  const cwd = process.cwd();
+  if (existsSync(join(cwd, "src", "index.ts"))) return join(cwd, "src");
+  if (existsSync(join(cwd, "functions", "src", "index.ts"))) {
+    return join(cwd, "functions", "src");
+  }
+  throw new Error(`cannot locate src from cwd: ${cwd}`);
+}
+
+// CRLF normalizado: o checkout no Windows grava \r\n e os delimitadores abaixo
+// são todos em \n.
+const SOURCE = readFileSync(join(srcDir(), "index.ts"), "utf8").replace(
+  /\r\n/g,
+  "\n"
+);
+
+/** Occurrences of a literal needle. */
+function occurrences(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+
+/** The source text of the reservation handler, and nothing else. */
+function reservationSource(): string {
+  const start = SOURCE.indexOf("export const ensurePublicPlayerIdHandler");
+  assert.ok(start >= 0, "o handler de reserva precisa existir em index.ts");
+  const end = SOURCE.indexOf("\n};\n", start);
+  assert.ok(end > start, "não foi possível delimitar o corpo do handler");
+  return SOURCE.slice(start, end);
+}
+
+describe("guarda estrutural — a reserva é create-only", () => {
+  it("escreve exatamente dois documentos, ambos com transaction.create", () => {
+    const body = reservationSource();
+
+    assert.equal(
+      occurrences(body, "transaction.create("),
+      2,
+      "o par mapa + índice precisa nascer de duas criações create-only"
+    );
+  });
+
+  it("não usa nenhuma primitiva capaz de sobrescrever, mesclar ou apagar", () => {
+    const body = reservationSource();
+
+    for (const forbidden of [".set(", ".update(", ".delete(", "merge:", "merge :"]) {
+      assert.equal(
+        occurrences(body, forbidden),
+        0,
+        `a reserva não pode conter "${forbidden}"`
+      );
+    }
+  });
+
+  it("sorteia a entropia FORA da transação, com os bytes do contrato", () => {
+    const body = reservationSource();
+
+    assert.ok(
+      body.includes("randomBytes(PUBLIC_PLAYER_ID_ENTROPY_BYTES)"),
+      "a entropia precisa vir de randomBytes com os bytes congelados"
+    );
+    assert.ok(
+      body.indexOf("generateEntropy()") < body.indexOf("db.runTransaction"),
+      "gerar dentro da transação trocaria o candidato a cada retry interno"
+    );
+    assert.ok(
+      body.includes("encodePublicPlayerId("),
+      "a codificação precisa passar pelo encoder ratificado"
+    );
+    assert.ok(
+      body.includes("assertPublicPlayerId("),
+      "o candidato precisa ser validado antes de virar id de documento"
+    );
+  });
+
+  it("não é um endpoint: nenhum metadado de trigger o acompanha", () => {
+    for (const line of SOURCE.split("\n")) {
+      if (!line.includes("ensurePublicPlayerId")) continue;
+      for (const trigger of [
+        "onCall",
+        "onRequest",
+        "onDocument",
+        ".region(",
+        "central.",
+        "east.",
+      ]) {
+        assert.ok(
+          !line.includes(trigger),
+          `a reserva não pode virar função implantável: "${line.trim()}"`
+        );
+      }
+    }
+  });
+
+  it("não tem call site: esta fase entrega a primitiva, não seu consumidor", () => {
+    assert.equal(
+      occurrences(SOURCE, "ensurePublicPlayerIdHandler"),
+      1,
+      "a única ocorrência deve ser a própria declaração"
     );
   });
 });
