@@ -7,8 +7,26 @@ configuration are changed by this document.
 `origin/master`). The earlier settlement baseline `04b4623b0cdc5e97d7ed8b27e6534ef48284804a`
 remains an ancestor of this base.
 
-**Phase:** contract freeze 1. Session 3 (partners) and any implementation session must treat
-sections 1–9 as frozen unless central coordination amends them.
+**Phase:** contract freeze — **finalized**. Central coordination has closed all twelve previously
+open decisions; section 19 maps each one to its resolution. **This document contains no open
+decisions.** What remains before code can be written is listed as prerequisites in section 20, with
+the fail-closed behaviour that applies while each is missing.
+
+Every section is frozen. Session 3 (partners) and any implementation session must treat this contract
+as binding unless central coordination amends it in writing.
+
+**Superseded by this finalization** — recorded so no reader relies on a withdrawn rule:
+
+| Withdrawn | Replaced by |
+|---|---|
+| Annual seasons (`cash_year_2026`, `season_kind`, `yearOfDayKey`, `Σ months == year`) | Calendar-month seasons only, `seasonId` = `YYYY-MM` (§3.1) |
+| `player_id` as the public handle | Server-generated `publicPlayerId` (§5) |
+| `last_prize_at` and `uid` as comparator levels | Three-level order ending in `publicPlayerId` (§4.3) |
+| Stored/materialized `rank` | Position derived at read time (§8.3) |
+| Rolling `24h/7d/30d/365d/all` windows and `windowMode` | Bounded `fromDay`/`toDay` range, ≤ 31 days (§10.2) |
+| Rebuild/backfill machinery and `rebuild_generation` | No backfill; append-only from activation (§3.4, §7.3) |
+| `impliedGrossMargin` revenue proxy | Explicit unavailability with enum reasons (§10.6) |
+| `MAX_AGGREGATE_CENTAVOS = 1_000_000_000_000` | `Number.MAX_SAFE_INTEGER` (§15.4) |
 
 ---
 
@@ -191,12 +209,13 @@ covering exactly `amount`, `balance_after`, `category`, `display_name`, `externa
 onto the prize row would break that test and the settlement replay contract. All ranking state lives
 in the new collections of section 6.
 
-**Single-winner assumption.** `prize_{tournamentid}` contains no winner uid and `placement` is
-hardcoded to `1` ([functions/src/index.ts:1023](../../functions/src/index.ts#L1023)), so exactly one
-paid winner per tournament is structurally enforced today. The ranking design does not depend on this
-— the guard document is keyed by transaction id, which stays unique — but the duplicate-prize
-detector in 10.9 does. If multi-placement payouts are ever introduced, the id derivation changes and
-section 10.9 must be amended. Listed in section 19.
+**Single-winner assumption — FROZEN. Resolves open decision 11 (see section 19).**
+`prize_{tournamentid}` contains no winner uid and `placement` is hardcoded to `1`
+([functions/src/index.ts:1023](../../functions/src/index.ts#L1023)), so exactly one paid winner per
+tournament is structurally enforced today, and **this document does not change settlement**. The
+ranking does not depend on the assumption — its guard is keyed by transaction id, which stays unique
+either way — but the duplicate-prize detector in 10.9 does. **If multi-placement payouts are ever
+introduced, the prize-id derivation changes and this contract must be amended before that ships.**
 
 ---
 
@@ -270,125 +289,271 @@ row whose `status` is not exactly `"completed"` never moves a ranking total.
 
 ---
 
-## 3. Season identifiers and São Paulo boundary handling
+## 3. Season identifiers, São Paulo boundaries and first activation
 
-A prize is assigned to a season by the business day of its **settlement instant**, resolved once:
+**FROZEN.** Season boundaries were already canonical and were never one of the twelve open
+decisions; first activation and the no-backfill policy are newly frozen here. The economy-scoped
+season document id contributes to the resolution of decision 2 (see section 19).
+
+### 3.1 A season is a complete calendar month
+
+* A season is a **complete calendar month**. There is no other season kind.
+* Canonical timezone: **`America/Sao_Paulo`**.
+* Canonical `seasonId`: **`YYYY-MM`** — e.g. `2026-08`.
+* Start: the first day of the month at `00:00:00` in the canonical timezone, **inclusive**.
+* End: the first day of the **following** month at `00:00:00` in the canonical timezone,
+  **exclusive**.
+* The device or player timezone is **never** used, for any purpose, anywhere in this contract.
+
+The half-open `[start, nextStart)` interval is deliberate: it has no `23:59:59.999` rounding edge and
+no gap or overlap between consecutive seasons, so every instant belongs to exactly one season.
+
+**Supersession — annual seasons are removed.** An earlier revision of this document specified both a
+monthly and an annual season (`cash_year_2026` and a `yearOfDayKey` helper). Central coordination has
+since frozen seasons as complete calendar months with the single canonical id `YYYY-MM`, with
+retention expressed in monthly seasons (section 8.4) and a leaderboard API keyed by `seasonId` alone.
+**Annual seasons, the `season_kind` discriminator, the `yearOfDayKey` helper and the
+`Σ months == year` invariant are therefore withdrawn from this contract.** This is a material change
+from the original brief, which had required monthly *and* annual seasons; it is recorded here rather
+than applied silently. Nothing in the backend depended on the annual aggregate — it was never
+implemented — so the withdrawal has no migration cost.
+
+### 3.2 Deriving a prize's season
+
+The season of a prize is derived **exclusively** from the canonical timestamp of its completed prize
+transaction:
 
 ```ts
-const dayKey    = businessDayKey(prizeTx.timestamp.toDate(), ACTIVITY_TIMEZONE); // YYYY-MM-DD
-const monthlyId = dayKey.slice(0, 7);                                            // YYYY-MM
-const annualId  = dayKey.slice(0, 4);                                            // YYYY
+const dayKey   = businessDayKey(prizeTx.timestamp.toDate(), ACTIVITY_TIMEZONE); // YYYY-MM-DD
+const seasonId = monthOfDayKey(dayKey);                                         // YYYY-MM
 ```
 
-* **Monthly season id:** `YYYY-MM` — e.g. `2026-08`.
-* **Annual season id:** `YYYY` — e.g. `2026`.
+Reuse the canonical helpers — `ACTIVITY_TIMEZONE`, `businessDayKey`, `normalizeMonth` and
+`monthOfDayKey` — and **create no competing interpretation** of a day, month or timezone.
 
-Boundaries are calendar boundaries in `America/Sao_Paulo`: a month begins at `00:00:00.000` local on
-day 01 and ends at `23:59:59.999` local on the last day. The same rule applies to the year. A prize
-settled at `2026-08-01T00:30:00-03:00` belongs to `2026-08`; the same instant expressed as
+A prize settled at `2026-08-01T00:30:00-03:00` belongs to `2026-08`; the same instant expressed as
 `2026-08-01T03:30:00Z` must not be bucketed to July by a naive UTC slice.
 
-**The timestamp used is `transactions/prize_{tid}.timestamp`**, which is the resolved server
-timestamp written inside the settlement transaction. `declared_at` and `paid_at` on the tournament
-result are the same sentinel resolved to the same instant
+**The timestamp used is `transactions/prize_{tid}.timestamp`**, the resolved server timestamp written
+inside the settlement transaction. `declared_at` and `paid_at` on the tournament result are the same
+sentinel resolved to the same instant
 ([functions/src/index.ts:930-932](../../functions/src/index.ts#L930-L932)), so they agree by
 construction; the transaction field is authoritative because it lives on the authoritative record.
 
-`monthOfDayKey` already exists for the `YYYY-MM` slice
-([functions/src/domain/engagementStats.ts:152-154](../../functions/src/domain/engagementStats.ts#L152-L154))
-and must be reused rather than reimplemented. A `yearOfDayKey` helper is new.
+**Forbidden season sources.** The season is never derived from the tournament date, the registration
+date, the account creation date, the trigger execution time, or any client-supplied value. Trigger
+delay never changes an event's season (section 8.4).
 
-Season id validation reuses the existing strictness of `normalizeMonth`
+`seasonId` validation reuses the existing strictness of `normalizeMonth`
 ([functions/src/domain/engagementStats.ts:132-149](../../functions/src/domain/engagementStats.ts#L132-L149)):
-`^\d{4}-\d{2}$`, month 01–12, year within `MIN_YEAR = 2020` … `MAX_YEAR = 2100`. The annual validator
-applies the same year band.
+`^\d{4}-\d{2}$`, month 01–12, year within `MIN_YEAR = 2020` … `MAX_YEAR = 2100`.
+
+### 3.3 First activation — `firstActiveSeasonId`
+
+* The first season is the **first complete calendar month that begins after the future
+  implementation has been approved and deployed**.
+* A partial season is **never** started mid-month.
+* Deployment may happen earlier, but **processing stays inert until the configured start**.
+* `firstActiveSeasonId` must be an **explicit backend configuration value**, validated before
+  activation. It is not derived, not inferred from deploy time, and not defaulted.
+* **No concrete month is invented here.** The selection *algorithm* above is frozen; only the
+  resulting value is deferred.
+
+**Fail-closed while unset.** Until `firstActiveSeasonId` is configured and validated, the ranking
+trigger performs **no** aggregate write. An absent or malformed value is a configuration error that
+disables processing — it is never treated as "start immediately" and never as `2020-01`. An event
+whose `seasonId` sorts before `firstActiveSeasonId` is ignored and recorded as out-of-scope, not as a
+failure.
+
+That the concrete month is chosen later does **not** reopen this rule. The algorithm and the
+no-backfill policy below are frozen now.
+
+### 3.4 No backfill — frozen
+
+* There will be **no backfill of prizes settled before the first season begins**.
+* Transactions before the activation boundary stay permanently outside the rankings.
+* **Historical seasons are never reconstructed.**
+* Reconciliation must never be used to pull pre-activation events into a ranking (section 14.2).
+
+This document therefore makes **no claim that historical rankings will ever be rebuilt.**
 
 ---
 
-## 4. Deterministic ordering and tie-breaking
+## 4. Score, ordering, tie-breaking and position
 
-Leaderboard order is fully determined by the following comparator, applied in sequence. Every level
-is a stored field so the order is reproducible by any reader and stable across rebuilds.
+**FROZEN.** Resolves open decision 2 — cash and beta rank independently (see section 19).
 
-1. `total_prize_centavos` — **descending**. Integer centavos, never reais, never a float.
-2. `wins` — descending. Number of qualifying prize rows in the season.
-3. `last_prize_at` — **ascending** (earlier wins the tie). The player who reached the total first
-   ranks higher.
-4. `uid` — ascending lexicographic. A total, deterministic terminal tie-break.
+### 4.1 What the score is
 
-Level 4 guarantees a strict total order: no two entries can compare equal, because `uid` is unique.
+`scoreCentavos` is the **gross total effectively credited in completed prizes of that economy during
+the season**, in integer centavos.
 
-Ranks are **dense within the emitted page** and computed by the server from the sorted array; `rank`
-is stored on the aggregate entry so all readers agree. Players with `total_prize_centavos === 0` are
-**not** materialized into the leaderboard at all — a season entry exists only once a player has been
-credited at least one qualifying prize.
+Explicitly **not** part of the score:
+
+* entry fees paid;
+* net spend or net result;
+* wallet balance;
+* the tournament's *advertised* prize (only the amount actually credited counts);
+* any client-supplied value.
+
+`wallets.total_won` stays lifetime-only and private and is **never** a source for a monthly ranking.
+`getPlayerEngagementStats` stays independent and is **never** a ranking source (section R.2).
+
+### 4.2 Entry contract
+
+Every season entry distinguishes at least:
+
+| Field | Meaning |
+|---|---|
+| `scoreCentavos` | Gross completed prize total for the economy and season, integer centavos |
+| `winsCount` | Number of qualifying completed prize events in the season |
+| `publicPlayerId` | Server-generated pseudonymous identity (section 5) |
+| `economy` | `"cash"` or `"beta_credit"` |
+| `seasonId` | `YYYY-MM` |
+| server-side timestamps | `firstPrizeAt`, `lastPrizeAt`, `updatedAt` — for audit only, never for ordering |
+
+### 4.3 Canonical order
+
+Exactly three levels, applied in sequence:
+
+1. **`scoreCentavos` descending**
+2. **`winsCount` descending**
+3. **`publicPlayerId` ascending**, binary/canonical comparison
+
+Frozen properties:
+
+* the order is **totally deterministic**;
+* **no tie-break by UID** — the UID is not present in the entry at all;
+* **no tie-break by trigger processing time** — `lastPrizeAt` is stored for audit but is **not** a
+  comparator level, so a delayed trigger can never change anyone's position;
+* **no per-read randomness**;
+* cash and beta are ordered **independently**.
+
+Level 3 yields a strict total order because `publicPlayerId` is unique and immutable (section 5).
+
+**The final tie-break is technical and neutral.** Ordering by `publicPlayerId` is a deterministic
+disambiguation, not an additional reward: the identifier is random, unguessable and unrelated to
+merit, tenure or activity, so no player can seek or be disadvantaged by it in any meaningful way.
 
 Amounts are compared in centavos because reais are IEEE-754 doubles; comparing reais would make the
 order depend on representation noise. `inspectReais` supplies the exact centavos at ingest.
 
+### 4.4 Position
+
+* Positions are **exact ordinals**: 1, 2, 3, 4 …
+* **There are no shared positions.** Two entries with the same `scoreCentavos` and the same
+  `winsCount` are still ordered — and therefore numbered — by `publicPlayerId`.
+* There is no dense-rank, no competition-rank and no gap semantics, because ties cannot survive
+  level 3.
+* Positions are computed from the canonical order of section 4.3 and nothing else.
+* Cash and beta compute positions independently.
+
+Players with no qualifying prize are **not materialized at all** — a season entry exists only once a
+player has been credited at least one qualifying completed prize. There is never a synthesized
+zero-score row (section 6.2).
+
 ---
 
-## 5. Public leaderboard fields and privacy exclusions
+## 5. Public pseudonymous identity and privacy exclusions
 
-### 5.1 Emitted fields
+**FROZEN.** Resolves open decision 1 (see section 19).
+
+### 5.1 Why a new identity was required
+
+Every identifier already present in the backend was rejected:
+
+| Candidate | Why rejected |
+|---|---|
+| `uid` | Raw Auth uid is an enumeration surface and is internal. |
+| `users.player_id` | `PLR-` + `Math.floor(100000 + Math.random() * 900000)` ([functions/src/index.ts:170-173](../../functions/src/index.ts#L170-L173)) — a 900 000-value space with no reservation, so collisions arrive in the low thousands of users. It is also predictable in shape. |
+| `users.username` | Permanently `""` ([functions/src/index.ts:193-199](../../functions/src/index.ts#L193-L199)); [docs/username.md](../username.md) records the gap. |
+| Auth `displayName` | Not in Firestore, user-controlled, unvalidated — impersonation risk on a public surface. |
+| e-mail, phone | PII. Never public. |
+| any internal predictable id | Enumerable. |
+
+`firestore.rules` also allows reading `users/{uid}` only to the owner or an admin
+([firestore.rules:62-68](../../firestore.rules#L62-L68)), so a public leaderboard could never join
+against `users` at read time regardless.
+
+### 5.2 The frozen MVP identity — `publicPlayerId`
+
+A pseudonymous identity created **exclusively by the server**:
+
+* **16 cryptographically random bytes**;
+* encoded **base64url without padding**;
+* **exactly 22 characters**, matching `[A-Za-z0-9_-]{22}`;
+* collision-checked, **create-only**;
+* **immutable** once assigned;
+* **not derived** from the UID;
+* **not derived** from `player_id`, e-mail, phone or any name;
+* **never reused** by another account;
+* **stable across seasons**.
+
+Randomness — not derivation — is what makes it safe: a derived identifier (even hashed) would let
+anyone holding a UID confirm a player's presence on the leaderboard.
+
+### 5.3 Visual label for the MVP
+
+* The label is the literal `Jogador ` followed by the **first eight characters** of the
+  `publicPlayerId` — e.g. `Jogador A7fQ2_kB`.
+* The **full `publicPlayerId` remains the technical identity of the row** and the ordering key; the
+  eight-character label is presentation only and is never used for identity, ordering or lookup.
+* **No player-customisable public name is implemented in this phase.** The `setUsername` proposal in
+  [docs/username.md](../username.md) remains a separate, later workstream and is not a prerequisite
+  for this contract.
+
+The truncated label may collide visually between two players. That is accepted for the MVP because
+the label carries no authority: ordering, paging cursors and `getMySeasonRanking` all use the full
+22-character value.
+
+### 5.4 Storage and projection
+
+* The **UID ↔ `publicPlayerId` association is private and server-only**.
+* **No Firestore Rule grants any client read access to the association**, in either direction.
+* Endpoints project **only** allowlisted public fields.
+* **The UID never appears** in a leaderboard response, in a cursor, in public logs, or in any
+  response metadata.
+* `getMySeasonRanking` identifies the caller from the **authenticated context** and does **not**
+  return the UID.
+
+### 5.5 Emitted public fields
 
 ```jsonc
 {
-  "rank": 1,
-  "uid": "…",                    // see 5.3 — pending central decision
-  "player_id": "PLR-123456",     // pseudonymous handle
-  "display_name": "",            // denormalized snapshot, see 5.3
-  "total_prize_centavos": 125000,
-  "wins": 3,
-  "last_prize_at": "2026-08-03T18:22:11.000Z"
+  "position": 1,
+  "publicPlayerId": "A7fQ2_kB9xLm3NpQr5TzUw",
+  "label": "Jogador A7fQ2_kB",
+  "scoreCentavos": 125000,
+  "winsCount": 3,
+  "economy": "cash",
+  "seasonId": "2026-08"
 }
 ```
 
-### 5.2 Hard exclusions
+### 5.6 Hard exclusions
 
-Never present on any public leaderboard document or callable response:
+Never present on any leaderboard document or callable response:
 
-* `email`, `pix_key`, `whatsapp` (all PII on `users/{uid}`);
+* **the UID**, in any field, cursor, log or metadata;
+* `email`, `pix_key`, `whatsapp` (PII on `users/{uid}`);
 * `pix_key_snapshot` (on `withdrawals`);
+* `player_id` and `username` (superseded by `publicPlayerId`);
 * every wallet field: `balance`, `total_deposited`, `total_won`, `total_spent`,
   `total_withdrawn`, `beta_balance`;
 * deposits, withdrawals and their states;
 * entry fees paid, net position, or any figure from which a balance could be derived;
-* any transaction id, `external_id`, or ledger row.
+* any transaction id, `external_id`, or ledger row;
+* room credentials, in any form.
 
-`total_prize_centavos` is a gross sum of prizes won. It is not a balance and cannot be inverted into
-one, because entry fees, deposits and withdrawals are all excluded from it.
+`scoreCentavos` is a gross sum of prizes won. It is not a balance and cannot be inverted into one,
+because entry fees, deposits and withdrawals are all excluded from it.
 
-### 5.3 The display-name problem — **blocking decision required**
+### 5.7 Implementation gate
 
-`users/{uid}.username` is written as `""` by `onUserCreated` and **is never populated**
-([functions/src/index.ts:193-199](../../functions/src/index.ts#L193-L199)). This is a known, recorded
-gap; [docs/username.md](../username.md) names this exact use case:
-
-> any server-side feature that needs a name (leaderboards, tournament rosters, payout records) cannot
-> rely on `users/{uid}.username`.
-
-Compounding this, `firestore.rules` allows reading `users/{uid}` only to the owner or an admin
-([firestore.rules:62-68](../../firestore.rules#L62-L68)), so a public leaderboard **cannot** join
-against `users` at read time. Any public name must be **denormalized into the aggregate at write
-time** by the backend (Admin SDK, which bypasses Rules).
-
-Available identifiers, and why each is insufficient on its own:
-
-| Candidate | Problem |
-|---|---|
-| `users.username` | Always `""`. Nothing to show. |
-| Auth `displayName` | Lives in Firebase Auth, not Firestore. Not readable inside a Firestore trigger without an extra `auth().getUser()` call, and it is user-controlled and unvalidated (impersonation risk on a public surface). |
-| `users.player_id` | Present and pseudonymous, but **not guaranteed unique**: `generatePlayerId()` is `PLR-` plus `Math.floor(100000 + Math.random() * 900000)` ([functions/src/index.ts:170-173](../../functions/src/index.ts#L170-L173)) — a 900 000-value space with no reservation, so collisions become likely in the low thousands of users. |
-| `uid` | Exposing raw Auth uids publicly is an enumeration surface and is not human-readable. |
-
-**Recommendation:** ship the leaderboard with `player_id` as the visible handle and `display_name`
-as an empty-string-tolerant denormalized field, and treat the real fix as the `setUsername` callable
-already proposed in [docs/username.md](../username.md) (Option A). Do **not** publish Auth
-`displayName` on a public surface until server-side validation, profanity and impersonation checks
-exist.
-
-This is listed again in section 19 as requiring central approval.
+**Implementation of the ranking may not begin until this identity contract is in scope and covered
+by Firestore Rules and tests.** The leaderboard cannot ship against `player_id` as an interim
+measure — doing so would publish a colliding, predictable identifier and would then require a
+migration of every historical entry. Recorded in section 20.
 
 ---
 
@@ -401,59 +566,62 @@ construction — the same discipline the repository already applies to
 ### 6.1 Season leaderboard entries
 
 ```text
-season_rankings/{seasonDocId}/entries/{uid}
+season_rankings/{economy}_{seasonId}/entries/{publicPlayerId}
 ```
 
-where `seasonDocId` is:
+Season document ids — monthly only:
 
 ```text
-cash_month_2026-08     cash_year_2026
-beta_month_2026-08     beta_year_2026
+cash_2026-08      beta_credit_2026-08
 ```
 
-The economy is part of the season document id. This makes it **structurally impossible** to write a
-combined cash+beta total: the two live in different documents and no code path reads both into one
-field.
+Two structural guarantees follow from the id:
+
+* **The economy is part of the season document id**, so writing a combined cash+beta total is
+  impossible: the two live in different documents and no code path reads both into one field.
+* **The entry is keyed by `publicPlayerId`, not by UID.** The UID therefore cannot leak through a
+  document path, a cursor, or a Rules-level path match.
 
 Entry document:
 
 ```jsonc
 {
-  "uid": "…",
-  "user_ref": "<DocumentReference users/{uid}>",
-  "player_id": "PLR-123456",
-  "display_name": "",
+  "publicPlayerId": "A7fQ2_kB9xLm3NpQr5TzUw",
   "economy": "cash",              // "cash" | "beta_credit"
-  "season_kind": "month",         // "month" | "year"
-  "season_id": "2026-08",
-  "total_prize_centavos": 125000,
-  "wins": 3,
-  "first_prize_at": "<Timestamp>",
-  "last_prize_at": "<Timestamp>",
-  "rank": 1,                      // materialized by the ranking pass, see 8.3
-  "updated_at": "<Timestamp>"
+  "seasonId": "2026-08",
+  "scoreCentavos": 125000,
+  "winsCount": 3,
+  "firstPrizeAt": "<Timestamp>",  // audit only — never a comparator level
+  "lastPrizeAt": "<Timestamp>",   // audit only — never a comparator level
+  "updatedAt": "<Timestamp>"
 }
 ```
+
+There is deliberately **no `uid`, no `user_ref`, no `player_id`, no `display_name` and no stored
+`position`**. Position is derived from the canonical order at read time (section 8.3), so it can
+never go stale or contradict the totals.
 
 ### 6.2 Season parent document
 
 ```text
-season_rankings/{seasonDocId}
+season_rankings/{economy}_{seasonId}
 ```
 
 ```jsonc
 {
   "economy": "cash",
-  "season_kind": "month",
-  "season_id": "2026-08",
+  "seasonId": "2026-08",
   "timezone": "America/Sao_Paulo",
-  "player_count": 42,
-  "total_prize_centavos": 980000,
-  "ranked_through": "<Timestamp>",   // last time ranks were materialized
-  "rebuild_generation": 3,           // bumped by a full rebuild, see 7.3
-  "updated_at": "<Timestamp>"
+  "playerCount": 42,
+  "totalScoreCentavos": 980000,
+  "windowStart": "<Timestamp>",   // first day of the month, 00:00:00 canonical, inclusive
+  "windowEnd": "<Timestamp>",     // first day of next month, 00:00:00 canonical, exclusive
+  "updatedAt": "<Timestamp>"
 }
 ```
+
+`playerCount` counts materialized entries only; a player with no qualifying prize is not counted,
+because no entry exists (section 4.4).
 
 ### 6.3 Idempotency markers
 
@@ -466,21 +634,26 @@ deterministic and unique per tournament. Contents:
 
 ```jsonc
 {
-  "transaction_ref": "<DocumentReference transactions/prize_{tid}>",
-  "uid": "…",
+  "transactionRef": "<DocumentReference transactions/prize_{tid}>",
+  "publicPlayerId": "A7fQ2_kB9xLm3NpQr5TzUw",
   "economy": "cash",
-  "amount_centavos": 50000,
-  "month_season_id": "2026-08",
-  "year_season_id": "2026",
-  "day_key": "2026-08-03",
-  "applied_at": "<Timestamp>",
-  "rebuild_generation": 3
+  "amountCentavos": 50000,
+  "seasonId": "2026-08",
+  "dayKey": "2026-08-03",
+  "appliedAt": "<Timestamp>"
 }
 ```
 
-This document is created **in the same Firestore transaction** as the two season-entry increments.
-Its existence is the guard: if it exists, the event has already been applied and the handler returns
-without writing. See section 7.
+This document is created **in the same Firestore transaction** as the season-entry and
+season-parent updates. Its existence is the guard: if it exists, the event has already been applied
+and the handler returns without writing. See section 7.
+
+The guard stores `publicPlayerId` rather than the UID, so even this internal collection cannot
+become a UID-disclosure path if its Rules were ever relaxed by mistake.
+
+**One guard per economy is impossible to confuse:** the guard id is the transaction id, and a
+transaction belongs to exactly one economy by category (`prize` → cash, `beta_prize` → beta), so a
+cash event can never consume a beta guard or vice versa.
 
 ### 6.4 Admin metric daily buckets
 
@@ -489,81 +662,133 @@ admin_metrics_daily/{dayKey}
 ```
 
 `dayKey` is `YYYY-MM-DD` in `America/Sao_Paulo`, produced by `businessDayKey`. One document per
-business day, holding every additive counter needed to answer the rolling windows in section 10 by
+business day, holding every additive counter needed to answer a bounded date range (section 10.2) by
 summation. Shape is specified in section 10.4.
 
-### 6.5 Names deliberately avoided
+### 6.5 Public identity map
+
+```text
+public_player_ids/{uid}
+```
+
+```jsonc
+{
+  "publicPlayerId": "A7fQ2_kB9xLm3NpQr5TzUw",
+  "createdAt": "<Timestamp>"
+}
+```
+
+This is the **private, server-only** UID → `publicPlayerId` association required by section 5.4. It
+is keyed by UID and **created once, never updated and never deleted** — which is what makes
+`publicPlayerId` immutable and non-reusable.
+
+A **reverse uniqueness guard** is required so a generated id can never be assigned twice:
+
+```text
+public_player_id_index/{publicPlayerId}   ->   { uid, createdAt }
+```
+
+The document id *is* the lock — Firestore guarantees at most one — so the collision check of section
+5.2 is a create-only write inside the same transaction that writes `public_player_ids/{uid}`. This is
+the reservation pattern [docs/username.md](../username.md) already describes for usernames. A
+collision retries with fresh entropy; with 16 random bytes a collision is vanishingly improbable, but
+the guard makes create-only correctness structural rather than probabilistic.
+
+**Both collections are Rules-denied in both directions** (section 13.1), so the pseudonym can never
+be resolved back to an account by any client, and no client can forge or reassign an identity.
+
+Neither is read at leaderboard request time: the entry already stores `publicPlayerId`, so serving a
+page requires no identity lookup. The map is consulted only when the ranking trigger needs the prize
+winner's `publicPlayerId`, and by `getMySeasonRanking` to resolve the authenticated caller.
+
+### 6.6 Names deliberately avoided
 
 The new design must not reuse any existing name. Already taken: collections `users`, `wallets`,
 `transactions`, `withdrawals`, `registrations`, `tournaments`, `tournament_rooms`, `player_activity`;
 callables listed in 0.1; and the transaction categories in 0.3. The proposed names
-`season_rankings`, `ranking_events` and `admin_metrics_daily` collide with nothing at the design base.
+`season_rankings`, `ranking_events`, `admin_metrics_daily`, `public_player_ids` and
+`public_player_id_index` collide with nothing at the design base.
 
 ---
 
-## 7. Idempotent update, rebuild and backfill
+## 7. Processing and idempotency
+
+**FROZEN.** Resolves open decision 6 (see section 19).
 
 ### 7.1 The idempotency contract
 
-Firestore triggers are **at-least-once**. Every ranking mutation therefore runs inside a
-`db.runTransaction` that:
+Firestore triggers are **at-least-once**; this is expected, not exceptional. Every ranking mutation
+runs inside one `db.runTransaction` that:
 
 1. reads `ranking_events/{prizeTxId}`;
-2. if it exists → return without writing (idempotent replay, no increment);
-3. otherwise reads both season entry documents (monthly and annual);
-4. writes both entries with values **computed from the read values in centavos**, and creates
-   `ranking_events/{prizeTxId}`.
+2. if it exists → returns without writing (idempotent replay, **no** second increment);
+3. otherwise reads the season entry and the season parent;
+4. writes the entry and the parent with values **computed from the read values in centavos**, and
+   creates `ranking_events/{prizeTxId}`.
 
-`FieldValue.increment()` is **forbidden** for money. The repository already established this rule and
-its reason ([functions/src/index.ts:372-376](../../functions/src/index.ts#L372-L376)):
+**The guard and the aggregate update commit atomically in the same Firestore transaction.** There is
+no state in which an event is marked processed while its aggregate failed, and no partial write.
+
+`FieldValue.increment()` is **forbidden** for money. The repository established this rule and its
+reason ([functions/src/index.ts:372-376](../../functions/src/index.ts#L372-L376)):
 
 > Computed from the value read inside this transaction rather than `FieldValue.increment()`:
 > `increment()` adds floats, which drift.
 
-`total_prize_centavos` is an integer, so `increment()` would be numerically safe there — but the
-read-compute-write form is required anyway because the guard document and the totals must commit
-atomically, and because `wins`/`first_prize_at`/`last_prize_at` need the prior values regardless.
+`scoreCentavos` is an integer, so `increment()` would be numerically safe — but the read-compute-write
+form is required anyway because the guard and the totals must commit atomically, and because
+`winsCount`, `firstPrizeAt` and `lastPrizeAt` need the prior values regardless.
 
-`addCentavos` must be used for the sum. Note its ceiling: `MAX_BALANCE_CENTAVOS = 1_000_000_000`
-(R$ 10 000 000,00) ([functions/src/domain/money.ts:25](../../functions/src/domain/money.ts#L25)).
-A season-wide total could plausibly exceed that ceiling even though no individual wallet does — see
-section 15.4.
+Addition uses the **aggregate-domain** helper of section 15.4, not the wallet helper.
 
-### 7.2 Ordering and the monthly/annual pair
+### 7.2 Eligibility and fail-closed rules — frozen
 
-Both the monthly and the annual entry are updated in the **same** transaction as the guard document.
-They can never diverge: either all three writes commit or none does.
+* An **ineligible event creates no ranking entry** — no zero-score placeholder, no empty document.
+* An **unknown category is fail-closed**: only `prize` and `beta_prize` are ever counted
+  (section 2.5). Anything else is ignored and recorded.
+* An event whose `seasonId` precedes `firstActiveSeasonId` is ignored as out-of-scope (section 3.3).
+* **Cash and beta never share a guard or an aggregate.** The economy is fixed by the transaction
+  category and is part of the season document id (section 6.1).
+* A **processing error must be observable and retryable.** The guard is not written, so the retry
+  re-applies cleanly.
+* **An event is never marked processed if its aggregate write failed** — they are the same
+  transaction, so this is structural rather than a discipline.
+* **No concurrent trigger is created for the same source.** Exactly one trigger consumes
+  `transactions/{transactionId}`.
+* **A financial transaction is never modified by the ranking.** The ranking is strictly a reader of
+  the ledger.
 
-### 7.3 Rebuild and backfill
+### 7.3 No rebuild, no backfill
 
-A rebuild is required because prize history predates this feature. The procedure follows the existing
-audit CLI template ([functions/src/audit/cli.ts](../../functions/src/audit/cli.ts)) — an offline,
-admin-run, dry-run-by-default tool, **not** a callable:
+**There is no backfill and no historical rebuild** (section 3.4). Prizes settled before
+`firstActiveSeasonId` are permanently out of scope, so the `rebuild_generation` machinery an earlier
+revision of this document proposed is **withdrawn** — there is nothing to rebuild.
 
-1. Bump `rebuild_generation` on the target season parent documents.
-2. Page over `transactions` filtered by `category in ["prize","beta_prize"]` and
-   `timestamp` within the season window, ordered by `timestamp`, using cursor pagination
-   (`startAfter`) with a bounded page size. Requires the composite indexes in section 13.
-3. For each row, recompute the season ids from `businessDayKey(timestamp)` and apply the section-7.1
-   transaction. Rows whose `ranking_events/{txId}` already carries the **current**
-   `rebuild_generation` are skipped; rows carrying an older generation are re-applied into freshly
-   zeroed entries.
-4. Materialize `rank` for each season by reading entries ordered by the section-4 comparator and
-   writing `rank` in batches.
-5. Write a reconciliation report (section 14).
+Consequently:
 
-A full rebuild writes into freshly zeroed season entries rather than adjusting in place, so a rebuild
-is **convergent**: running it twice produces the same result as running it once.
+* no rebuild CLI is contracted;
+* no `rebuild_generation` field exists on any document;
+* reconciliation is **read-only** and never writes ranking state (section 14);
+* any future repair must be explicitly administrative, auditable and idempotent, and is **not**
+  authorized by this document.
 
-Backfill is safe to run against live data because it only ever writes to the three new collections.
-It never touches `transactions`, `wallets`, `tournaments` or `registrations`.
+Ranking state is therefore append-only from activation forward, driven exclusively by the trigger.
 
 ---
 
-## 8. Where updates happen — settlement, trigger, or pipeline
+## 8. Where updates happen, position derivation, closure and retention
 
 **Decision: a dedicated Firestore `onDocumentCreated` trigger on `transactions/{transactionId}`,
-plus an offline rebuild tool. Ranking is NOT written inside the settlement transaction.**
+fired after the prize transaction is created. Ranking is NOT written inside the settlement
+transaction.**
+
+**FROZEN.** Resolves open decision 6 (see section 19).
+
+Frozen properties, restated because they are load-bearing:
+
+* the trigger runs **after** the prize transaction has been created;
+* **ranking never participates in the financial settlement transaction**;
+* **a ranking failure never undoes, blocks or delays a prize.**
 
 ### 8.1 Why not inside the settlement transaction
 
@@ -587,18 +812,51 @@ remain the only thing settlement guarantees atomically.
 A scheduled pipeline would make the leaderboard lag by the schedule interval and would require
 scanning `transactions` on every run. The trigger reacts to exactly one new document, applies a
 bounded three-document transaction, and is idempotent by section 7.1. A scheduled job is still
-required, but only as a **reconciliation sweep** (section 14), not as the primary path.
+required, but only as a **read-only reconciliation sweep** (section 14), never as a writer.
 
-### 8.3 Rank materialization
+### 8.3 Position is derived, never stored
 
-`rank` cannot be maintained incrementally without contention across the whole season. It is
-materialized by a scheduled pass (default: every 15 minutes, and immediately after a rebuild) that
-reads entries ordered by the section-4 comparator and writes `rank` in bounded batches. Between
-passes, `rank` may be stale while the totals are current; the callable in section 9 therefore
-computes order from the totals it reads and treats stored `rank` as a hint, so a client never sees a
-contradictory ordering.
+**No `position`/`rank` field is persisted on any entry.** The earlier proposal of a scheduled
+rank-materialization pass is **withdrawn**: a stored rank is stale between passes and can contradict
+the totals it is supposed to describe, which section 4.4's exact-ordinal requirement forbids.
 
-### 8.4 Cost of the new pattern
+Position is derived at read time from the canonical order of section 4.3:
+
+* `getSeasonLeaderboard` numbers entries from the cursor's absolute offset as it walks the canonical
+  order, so page 2 continues the numbering of page 1 without recomputation;
+* `getMySeasonRanking` computes the exact ordinal by counting entries ahead (section 9.2).
+
+Because both paths use the same canonical order over the same stored fields, they cannot disagree.
+
+### 8.4 Season closure, history and retention
+
+**FROZEN.** Retention was not one of the twelve open decisions — it is newly frozen here.
+
+Closure:
+
+* a season closes when its canonical interval ends (section 3.1);
+* a new prize belongs to the month of **its own canonical timestamp**, always;
+* **trigger delay never changes an event's season** — a prize settled at `2026-08-31T23:59:00-03:00`
+  whose trigger runs in September still belongs to `2026-08`;
+* a closed season's view **never receives economic activity from another month**;
+* a legitimate correction may only reflect authoritative transactions that **already belonged to that
+  season**;
+* **no manual score correction**, **no position editing**, **no silent removal of a winner.**
+
+Retention for the MVP:
+
+* the **current season plus the 11 preceding monthly seasons** stay available — a rolling window of
+  **up to 12 seasons**;
+* older seasons fall outside the player-facing API;
+* a later physical-deletion or anonymisation policy must be decided **with privacy review** before
+  implementation;
+* **no automatic deletion is implemented now** — seasons beyond the window are simply not served.
+
+The document carried no prior retention rule, and no stricter legal retention requirement is recorded
+anywhere in the repository at this base, so the 12-season window is adopted as-is. Retention is
+**not** silently widened: if a stricter rule is later found, the stricter rule wins.
+
+### 8.5 Cost of the new pattern
 
 This introduces the repository's first Firestore document trigger. That is a deliberate,
 documented departure and should be called out in review: it adds a new deployment surface, a new
@@ -613,16 +871,17 @@ Two callables, both `central.https.onCall`, matching the existing handler/export
 (`export const xHandler = async (data, context) => {…}` then
 `export const x = central.https.onCall(xHandler)`).
 
+**FROZEN.** Resolves open decision 10 (see section 19).
+
 ### 9.1 `getSeasonLeaderboard`
 
 ```ts
 // request — exact payload, enforced by assertExactPayload
 {
   economy: "cash" | "beta_credit",
-  seasonKind: "month" | "year",
-  seasonId: string,        // "YYYY-MM" for month, "YYYY" for year
+  seasonId: string,        // "YYYY-MM", validated by normalizeMonth
   limit?: number,          // 1..100, default 50
-  cursor?: string | null   // opaque, from a previous response
+  cursor?: string | null   // opaque, server-produced
 }
 
 // response
@@ -631,50 +890,113 @@ Two callables, both `central.https.onCall`, matching the existing handler/export
   timezone: "America/Sao_Paulo",
   amountUnit: "centavos",
   economy: "cash",
-  seasonKind: "month",
   seasonId: "2026-08",
   playerCount: 42,
   entries: [
-    { rank, uid, player_id, display_name, total_prize_centavos, wins, last_prize_at }
+    {
+      position: 1,
+      publicPlayerId: "A7fQ2_kB9xLm3NpQr5TzUw",
+      label: "Jogador A7fQ2_kB",
+      scoreCentavos: 125000,
+      winsCount: 3,
+      economy: "cash",
+      seasonId: "2026-08"
+    }
   ],
-  nextCursor: string | null,
-  rankedThrough: string | null   // ISO instant; null before the first ranking pass
+  nextCursor: string | null
 }
 ```
 
-Authorization: `assertSignedIn`. The leaderboard is public **to authenticated users**, matching
-`tournaments`, the only currently readable collection
-([firestore.rules:137-139](../../firestore.rules#L137-L139)). It is not exposed to unauthenticated
-callers, which avoids an unauthenticated enumeration surface.
+Frozen rules:
 
-`limit` is hard-capped at **100** server-side regardless of what the client sends. There is no
-"return everything" mode.
+* **Authentication is mandatory** (`assertSignedIn`). The leaderboard is visible to authenticated
+  users only, matching `tournaments`, the only currently client-readable collection
+  ([firestore.rules:137-139](../../firestore.rules#L137-L139)). This avoids an unauthenticated
+  enumeration surface.
+* **Strict payload** via `assertExactPayload` — any unexpected key is `invalid-argument`.
+* `economy` and `seasonId` are **validated**; an unknown economy or malformed `seasonId` is
+  `invalid-argument`, never a silent empty page.
+* Default page **50**, maximum **100**, clamped server-side regardless of what the client sends.
+  There is no "return everything" mode.
+* **Cursor pagination only. Offset is never used** — offset paging renumbers rows when a concurrent
+  write lands mid-page.
+* The cursor is **opaque and server-produced**, and is **bound to the season, the economy and the
+  ordering tuple** it was issued for.
+* A cursor that is **invalid, tampered with, or replayed against a different ranking** (different
+  season or economy) **is rejected** with `invalid-argument`. It is never silently reinterpreted.
+* **No response contains a UID** — not in an entry, not in the cursor, not in metadata.
+
+Each entry carries **only** the allowlisted public projection above: position, `publicPlayerId`,
+pseudonymous label, `scoreCentavos`, `winsCount`, economy, season.
+
+The cursor encodes the ordering tuple `(scoreCentavos, winsCount, publicPlayerId)` plus the absolute
+offset of the next row, so page 2 continues page 1's numbering without recomputation. Since
+`publicPlayerId` is already the entry's document id and carries no UID, the cursor cannot leak
+identity.
 
 ### 9.2 `getMySeasonRanking`
 
 ```ts
-// request
-{ economy: "cash" | "beta_credit", seasonKind: "month" | "year", seasonId: string }
+// request — exact payload
+{ economy: "cash" | "beta_credit", seasonId: string }
 
-// response
+// response — ranked
+{
+  success: true, timezone: "America/Sao_Paulo", amountUnit: "centavos",
+  economy: "cash", seasonId: "2026-08",
+  isRanked: true,
+  rank: 7,
+  entry: {
+    publicPlayerId: "A7fQ2_kB9xLm3NpQr5TzUw",
+    label: "Jogador A7fQ2_kB",
+    scoreCentavos: 42000,
+    winsCount: 1
+  },
+  playerCount: 42
+}
+
+// response — not ranked
 {
   success: true, timezone, amountUnit: "centavos",
-  economy, seasonKind, seasonId,
-  entry: { rank, total_prize_centavos, wins, last_prize_at } | null,
+  economy, seasonId,
+  isRanked: false,
+  rank: null,
+  entry: null,
   playerCount: 42
 }
 ```
 
-Authorization: `assertSignedIn`. The uid comes **exclusively from the verified token** and is never
-accepted in the payload — the same rule `getPlayerEngagementStats` already enforces
-([functions/src/index.ts:2167-2170](../../functions/src/index.ts#L2167-L2170)). This lets a player
-see their own placement without paging the whole leaderboard.
+Frozen rules:
+
+* **Authentication is mandatory.** The caller is identified **from the authenticated context**; the
+  payload has no uid field, mirroring `getPlayerEngagementStats`
+  ([functions/src/index.ts:2167-2170](../../functions/src/index.ts#L2167-L2170)).
+* With no eligible prize, the response is **`isRanked: false` and `rank: null`**.
+* **No fictitious zero-score entry is created or returned** — not in the response and not in
+  Firestore.
+* **The UID is never returned.**
+* The position uses the **same canonical order** as the leaderboard (section 4.3).
+
+**Exact-position strategy (approved).** Given the caller's entry `(s, w, p)`:
+
+```text
+ahead = count(entries where scoreCentavos > s)
+      + count(entries where scoreCentavos = s and winsCount > w)
+      + count(entries where scoreCentavos = s and winsCount = w and publicPlayerId < p)
+
+rank  = ahead + 1
+```
+
+The three counts are disjoint and together cover exactly the entries that precede the caller under
+section 4.3, so `rank` is the exact ordinal — never an estimate and never a shared position. Each
+count is an aggregation query over the season's `entries` subcollection; the conceptual indexes are
+recorded in section 13.2. **`firestore.indexes.json` is not modified in this phase.**
 
 ### 9.3 Shared conventions
 
-Both reuse `assertExactPayload` so any unexpected key is `invalid-argument`, both disclose
-`timezone` and `amountUnit` exactly as `getPlayerEngagementStats` does, and both return pt-BR error
-messages via `toHttpsError`.
+Both reuse `assertExactPayload`, both disclose `timezone` and `amountUnit` exactly as
+`getPlayerEngagementStats` does, and both return pt-BR messages via `toHttpsError`. Neither accepts a
+raw query, filter, ordering, field list or collection name from the client.
 
 ---
 
@@ -690,57 +1012,63 @@ the prohibited design. This contract forecloses it: metrics come from pre-aggreg
 read by a single admin-only callable, and the client is never given a query surface over
 `transactions`.
 
-### 10.2 Rolling window definitions
+### 10.2 Date-range window — bounded and day-aligned
 
-Windows are **exact rolling windows anchored at the request instant `now`**, not calendar buckets:
+**FROZEN.** Resolves open decision 8 (see section 19).
 
-| Filter | Definition |
-|---|---|
-| `24h` | `(now - 24 hours, now]` |
-| `7d` | `(now - 7 × 24 hours, now]` |
-| `30d` | `(now - 30 × 24 hours, now]` |
-| `365d` | `(now - 365 × 24 hours, now]` |
-| `all` | `(beginning of time, now]` |
+`getAdminMetrics` takes an explicit **date range of whole business days**, not a rolling window
+anchored at the request instant:
 
-**Boundary rule:** windows are half-open — exclusive at the older edge, inclusive at `now`. A row
-whose `timestamp` equals exactly `now - 24h` is **outside** the 24h window.
+* `fromDay` and `toDay` are `YYYY-MM-DD` keys interpreted in **`America/Sao_Paulo`**;
+* the range is **inclusive on both ends** and covers whole business days;
+* the range covers **at most 31 days per call**; a longer range is `invalid-argument`;
+* the default range is the one already documented for the dashboard's landing view (last 7 whole
+  business days, ending on the current business day).
 
-**Granularity caveat, stated explicitly rather than hidden:** the daily buckets of section 6.4 have
-one-day granularity in `America/Sao_Paulo`. A rolling window whose edge falls mid-day cannot be
-answered exactly from day buckets alone. Two options, and the recommendation:
+**Supersession — rolling windows are withdrawn.** The earlier revision defined rolling
+`24h / 7d / 30d / 365d / all` windows anchored at `now`, with an `exact` vs `day_aligned`
+`windowMode` disclosure. Central coordination has since frozen a bounded date range in the canonical
+timezone, so:
 
-* **(A) Day-aligned approximation.** Sum whole buckets from `businessDayKey(now - N days)` through
-  `businessDayKey(now)`. Cheap and always O(N) document reads. The reported window is then
-  day-aligned, not instant-aligned.
-* **(B) Exact.** Sum whole buckets for the interior and run two bounded, indexed range queries over
-  `transactions` for the two partial edge days.
+* the **mid-day boundary problem disappears entirely** — every window edge is a business-day
+  boundary, which is exactly the granularity `admin_metrics_daily` stores, so **every figure is exact
+  with respect to its stated range**;
+* `windowMode` is **removed**: there is no longer an approximate window mode to disclose;
+* `365d` and `all-time` are **no longer answerable in a single call**. A caller needing a longer
+  horizon composes consecutive ≤31-day ranges client-side. The metric *definitions* are unchanged;
+  only the per-call span is bounded.
 
-**Recommendation: (B) for `24h`, `7d` and `30d`; (A) for `365d` and `all`.** The edge queries are
-bounded by one business day of transactions, which is small, while a 365-day exact window would need
-365 bucket reads plus edges and gains nothing material. Every response states which mode produced it
-via `windowMode: "exact" | "day_aligned"`, so a dashboard never implies precision it does not have.
+The 31-day cap is what makes the endpoint's cost predictable: at most 31 bucket documents are read
+per call, whatever the platform's volume.
+
+**Half-open internally.** A day bucket covers `[dayStart, nextDayStart)` in the canonical timezone,
+so summing consecutive buckets neither double-counts nor skips a boundary instant.
 
 ### 10.3 Metric definitions and data sources
 
 All amounts in **integer centavos**. Cash and beta are reported in separate blocks and never summed.
 
-| # | Metric | Exact definition | Source |
-|---|---|---|---|
-| 1 | Transaction count | Number of `transactions` rows with `status === "completed"` in window, per category | `admin_metrics_daily.count_by_category` |
-| 2 | Transaction volume | Σ `amount` in centavos over the same rows, per category | `admin_metrics_daily.sum_centavos_by_category` |
-| 3 | Average transaction size | `sum_centavos / count`, integer-divided, per category. Undefined (`null`) when `count === 0` | derived from 1 and 2 |
-| 4 | Median transaction size | 50th percentile of `amount`. **Not derivable from sums** — see 10.5 | `admin_metrics_daily.histogram_by_category` |
-| 5 | Entry fees | Σ `amount` where `category === "entry_fee"` (cash) / `beta_entry_fee` (beta), `status === "completed"` | bucket |
-| 6 | Prizes distributed | Σ `amount` where `category === "prize"` (cash) / `beta_prize` (beta), `status === "completed"` | bucket |
-| 7 | Gross Sparta fee | **NOT COMPUTABLE — see 10.6** | — |
-| 8 | Partner commission | **NOT COMPUTABLE — Session 3, see 10.6 and 18** | — |
-| 9 | Net Sparta revenue | **NOT COMPUTABLE — depends on 7 and 8** | — |
-| 10 | Withdrawal states | Count and Σ `amount` of `withdrawals` grouped by `status`. **Today `status` is only ever `"pending"` — see 10.7** | `admin_metrics_daily.withdrawals_by_status` |
-| 11 | New users | Count of `users` documents created in window. **NO timestamp field exists on `users` — see 10.8** | blocked |
-| 12 | Partner-attributed users | **NOT COMPUTABLE — Session 3** | — |
-| 13 | Conversion by partner | **NOT COMPUTABLE — Session 3** | — |
-| 14 | Highest-volume tournaments | Top N tournaments by Σ `entry_fee` amount in window, and separately by `prize` amount | `admin_metrics_daily.tournament_volume` (capped map, see 10.4) |
-| 15 | Suspicious or duplicate events | See 10.9 | derived + reconciliation sweep |
+| # | Metric | Exact definition | Source | Status |
+|---|---|---|---|---|
+| 1 | Transaction count | Number of `transactions` rows with `status === "completed"` in range, per category | `admin_metrics_daily.count_by_category` | available |
+| 2 | Transaction volume | Σ `amount` in centavos over the same rows, per category | `admin_metrics_daily.sum_centavos_by_category` | available |
+| 3 | Average transaction size | `sum_centavos / count`, integer-divided, per category. `null` when `count === 0` | derived from 1 and 2 | available |
+| 4 | Median transaction size | 50th percentile of `amount`, reported as a bounded interval — see 10.5 | `admin_metrics_daily.histogram_by_category` | available |
+| 5 | Entry fees | Σ `amount` where `category === "entry_fee"` (cash) / `beta_entry_fee` (beta), `status === "completed"` | bucket | available |
+| 6 | Prizes distributed | Σ `amount` where `category === "prize"` (cash) / `beta_prize` (beta), `status === "completed"` | bucket | available |
+| 7 | Gross Sparta fee | Fee recognised by the platform | none — see 10.6 | `LEDGER_NOT_IMPLEMENTED` |
+| 8 | Partner commission | Commission owed to a partner | none — see 10.6, 18 | `SOURCE_NOT_IMPLEMENTED` |
+| 9 | Net Sparta revenue | Recognised platform revenue net of commission | none — see 10.6 | `REVENUE_RECOGNITION_NOT_DEFINED` |
+| 10 | Organizer revenue | Revenue, wallet, release and withdrawal for organizers | out of scope — see 10.6 | `ORGANIZER_FINANCE_OUT_OF_SCOPE` |
+| 11 | Withdrawal states | Count and Σ `amount` of `withdrawals` grouped by observed `status` — see 10.7 | `admin_metrics_daily.withdrawals_by_status` | available |
+| 12 | New users | Count of accounts created in range | none — see 10.8 | `CANONICAL_CREATED_AT_UNAVAILABLE` |
+| 13 | Partner-attributed users | Users attributed to a partner | none — Session 3 | `SOURCE_NOT_IMPLEMENTED` |
+| 14 | Conversion by partner | Attributed users converting to paid entry | none — Session 3 | `SOURCE_NOT_IMPLEMENTED` |
+| 15 | Highest-volume tournaments | Top N tournaments by Σ `entry_fee`, and separately by `prize` | `admin_metrics_daily.tournament_volume` (capped, 10.4) | available |
+| 16 | Suspicious or duplicate events | See 10.9 | derived + read-only reconciliation | available |
+
+Metrics 7–10 and 12–14 return `value: null`, `available: false` and a stable
+`unavailableReason` enum (section 10.11). **Zero is never used to mean "we do not know".**
 
 ### 10.4 `admin_metrics_daily/{dayKey}` shape
 
@@ -756,7 +1084,6 @@ All amounts in **integer centavos**. Cash and beta are reported in separate bloc
                                           "registrations": 10 } },        // capped, see below
   "new_users":               null,                                        // see 10.8
   "registrations":           37,
-  "generation": 1,
   "updated_at": "<Timestamp>"
 }
 ```
@@ -766,58 +1093,112 @@ this map is bounded to the **top 200 tournaments by entry volume for that day**;
 `tournament_volume_truncated: true` and `tournament_volume_dropped: <n>` when the cap bites. Silent
 truncation is forbidden — a dashboard must be able to tell that it is seeing a capped list.
 
-### 10.5 Median — the honest approach
+Every counter above is **recomputable by the reconciler from the authoritative ledger** (section
+14.2). The bucket is a cache of the ledger, never a substitute for it.
 
-A median cannot be reconstructed from daily sums and counts. Options considered:
+### 10.5 Median — bounded interval, exactly disclosed
+
+**FROZEN.** Resolves open decision 7 (see section 19).
+
+A median cannot be reconstructed from sums and counts. Options considered:
 
 * store every amount → unbounded document growth, rejected;
-* exact median by scanning `transactions` in the window → the prohibited full-collection read;
+* exact median by scanning the whole `transactions` collection → the prohibited full-collection read;
 * **fixed-bucket histogram → chosen.**
 
 Each daily bucket stores a histogram of `amount` per category using **logarithmic centavo buckets**:
 bucket `i` covers `[2^i, 2^(i+1))` centavos, for `i` in `0..30` (1 centavo up to ~R$ 10 737 418).
 Bucket `0` additionally absorbs `amount === 0`.
 
-Histograms are additive, so a window median is computed by summing the per-day histograms and walking
-to the 50 % cumulative count. The result is reported as an **interval**, not a false point value:
+Histograms are **exactly additive**, so summing the per-day histograms across the range and walking
+to the 50 % cumulative count yields the bucket that provably contains the median. The result is
+reported as an **interval**, never as a fabricated point value:
 
 ```jsonc
-"median_centavos": { "lowerBound": 4096, "upperBound": 8191, "approximate": true }
+"medianCentavos": { "lowerBound": 4096, "upperBound": 8191, "exactBucket": true }
 ```
 
-Any consumer wanting a single number takes the lower bound and must display it as approximate. If
-central coordination requires an exact median, that is an offline reconciliation-report figure
-(section 14), not a live dashboard figure.
+**This does not violate the "no metric estimated from approximate fields" principle.** The histogram
+is built from **exact** amounts via `inspectReais`, and the reported interval is a **proven bound**,
+not an estimate: the true median is guaranteed to lie within `[lowerBound, upperBound]`. What is
+disclosed is *resolution*, not uncertainty about the data. A consumer must render it as an interval;
+collapsing it to a single number and presenting that as "the median" is forbidden.
 
-### 10.6 Fee and commission metrics — **not computable at this base**
+If an exact point median is ever required, it is an offline reconciliation-report figure computed
+from the ledger (section 14.2) — never a live dashboard figure.
 
-There is **no fee, commission, rake, or revenue-split concept anywhere in the backend.** An
-exhaustive search for `partner`, `affiliate`, `referr`, `commission`, `attribut`, `sponsor`,
-`coupon`, `promo`, `rake` and `revenue` across `functions/src`, `functions/test`, `firestore.rules`,
-`firestore.indexes.json` and `docs/` returns **no functional match** — the only hits are the word
-"decommissioned" in [docs/admin-transition.md](../admin-transition.md) and unrelated prose.
+### 10.6 Fee, commission, revenue and organizers — **unavailable, by decision**
+
+**FROZEN.** Resolves open decision 3 (see section 19).
+
+#### 10.6.1 Approved product rates (recorded, not computable)
+
+Central coordination and Session 3 have approved these **product** decisions. They are recorded here
+for compatibility only — **none of them is a licence to compute a metric at this base**:
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| `sparta_fee_bps` | `750` | 7,5 % of the **cash** entry fee |
+| — | — | The fee is **included in the entry fee**; the player is never charged extra |
+| — | — | **Beta and free tournaments generate no such fee** |
+| `partner_commission_bps` | `4000` | The future default share **of Sparta's fee** taken by a partner |
+| — | — | Equivalent to 3 % of an attributed entry, once the full ledger exists |
+
+Partners/influencers are one category; **organizers are a different category**, and organizer
+revenue, wallet, release and withdrawal are **outside this module** entirely.
+
+#### 10.6.2 Why the metrics are still unavailable
+
+There is **no fee, commission, rake, or revenue-split concept anywhere in the backend at
+`dcc0d4d`.** An exhaustive search for `partner`, `affiliate`, `referr`, `commission`, `attribut`,
+`sponsor`, `coupon`, `promo`, `rake` and `revenue` across `functions/src`, `functions/test`,
+`firestore.rules`, `firestore.indexes.json` and `docs/` returns **no functional match** — the only
+hits are the word "decommissioned" in [docs/admin-transition.md](../admin-transition.md) and
+unrelated prose.
 
 Concretely, settlement credits the winner the tournament's **full** `prize` and takes nothing:
 `prizeCentavos` comes straight from `tournaments/{tid}.prize` and the entire amount is credited
-([functions/src/index.ts:920-1017](../../functions/src/index.ts#L920-L1017)). Entry fees go to the
-platform implicitly — there is no house account, no fee ledger row, and no split.
+([functions/src/index.ts:920-1017](../../functions/src/index.ts#L920-L1017)). Entry fees reach the
+platform implicitly — there is **no house account, no fee ledger row, and no split**.
 
-Therefore **gross Sparta fee, partner commission and net Sparta revenue cannot be defined, let alone
-computed, at this design base.** This contract does not invent them. Any definition would be a
-product decision with financial consequences and must come from central coordination plus Session 3.
+#### 10.6.3 Explicitly forbidden inferences
 
-An arithmetic *proxy* is available and should be labelled as such if a dashboard needs a placeholder:
+* **Do not** infer revenue by multiplying entry fees by 7,5 %.
+* **Do not** infer commission by multiplying a theoretical fee by 40 %.
+* **Do not** treat a future snapshot as recognised revenue.
+* **Do not** use a wallet balance or a prize as a stand-in for a platform ledger.
+* **Do not** ship an "implied gross margin" (`Σ entry_fee − Σ prize`) as a named revenue metric. An
+  earlier revision of this document offered that arithmetic proxy as an optional labelled
+  placeholder; it is **withdrawn**, because a dashboard figure that looks like revenue will be read
+  as revenue.
 
-```text
-implied_gross_margin_centavos = Σ entry_fee − Σ prize      (cash only, per window)
-```
+A rate that is approved as **product policy** is not the same as a **recognised accounting figure**.
+Multiplying a rate by a volume produces a projection, not revenue: it ignores refunds, cancellations,
+payment-processor costs, attribution state and revenue-recognition timing — none of which exists in
+the backend yet.
 
-This is **not** "Sparta fee". It is the difference between what players paid in and what was paid
-out, it ignores payment-processor costs and any future partner split, and it must never be presented
-as revenue. Recommendation: do not ship it as a named revenue metric until section 19 item 3 is
-resolved.
+#### 10.6.4 Frozen outcome for this version
+
+| Metric | Value | `unavailableReason` |
+|---|---|---|
+| Gross Sparta fee | `null` | `LEDGER_NOT_IMPLEMENTED` |
+| Partner commission | `null` | `SOURCE_NOT_IMPLEMENTED` |
+| Platform (net Sparta) revenue | `null` | `REVENUE_RECOGNITION_NOT_DEFINED` |
+| Organizer revenue | `null` | `ORGANIZER_FINANCE_OUT_OF_SCOPE` |
+
+**Even after the base fee is integrated**, commission and revenue become available only once their
+own canonical sources **and** the refund/recognition policies are integrated. Shipping the fee ledger
+does not automatically unlock metrics 8, 9 and 10.
+
+#### 10.6.5 Not implemented by this module
+
+This document does not implement, and does not authorize: the base fee, attribution, a partner
+ledger, any new financial category, commission, a house wallet, organizers, or organizer wallet and
+withdrawal.
 
 ### 10.7 Withdrawal states
+
+**FROZEN.** Resolves open decision 9 (see section 19).
 
 `requestwithdrawal` writes `withdrawals/{externalId}` with `status: "pending"` and debits the wallet
 immediately ([functions/src/index.ts:370-408](../../functions/src/index.ts#L370-L408)). The
@@ -835,28 +1216,39 @@ aggregate must key by whatever `status` string it observes rather than a hardcod
 `paid` and `failed` appear automatically when the PIX integration lands. The dashboard must not
 display "pending" as "awaiting payment from the player's balance" — the balance is already debited.
 
-### 10.8 New users — **blocked, no timestamp exists**
+### 10.8 New users — **unavailable, by decision**
+
+**FROZEN.** Resolves open decision 4 (see section 19).
 
 `onUserCreated` writes exactly `{ email, username, player_id, pix_key, whatsapp }`
 ([functions/src/index.ts:193-199](../../functions/src/index.ts#L193-L199)). There is **no
 `created_at`** on `users/{uid}`, and Firestore cannot query by document creation time.
 
-Firebase Auth's `metadata.creationTime` exists but is not queryable from Firestore and would require
-paging the entire Auth user list — the Auth-side equivalent of the prohibited full-collection scan.
+Frozen findings:
 
-Options:
+* the current backend has **no complete, reliable server-side `created_at`** for all users;
+* the Auth creation date **must not be inferred by scanning** the Auth user list — that is the
+  Auth-side equivalent of the prohibited full-collection read;
+* **first activity, first registration and first transaction are not account creation** and must not
+  be substituted for it;
+* **document ids must never be interpreted as dates**;
+* therefore **`new_users` is `null` / unavailable**, with reason
+  **`CANONICAL_CREATED_AT_UNAVAILABLE`**.
 
-* **(A)** Add `created_at: FieldValue.serverTimestamp()` to `onUserCreated`. One-line change,
-  but it is a **source-code change to a financial-adjacent trigger** and is therefore out of scope
-  for this phase. New users are counted only from the deploy date forward; history is not
-  reconstructable from Firestore.
-* **(B)** Derive a proxy from the first `player_activity` document per uid. Only covers users who
-  opened the app after `player_activity` shipped, and conflates signup with first open.
-* **(C)** One-off Auth export to seed historical `created_at`, then (A) going forward.
+Future contract, when it is authorized (not by this document):
 
-**Recommendation: (A) for the forward path plus (C) for history**, both scheduled as implementation
-work in a later session. Until then the bucket stores `new_users: null` and the callable reports the
-metric as `unavailable` with a reason string — never `0`, which would read as "nobody signed up".
+* `users.created_at` written **exclusively by the server**;
+* the timestamp is **immutable**;
+* the **client can never set or modify it**;
+* an explicit **completeness date** is recorded;
+* **only days after that completeness date may report `new_users`**; earlier days stay unavailable,
+  because a partially populated field would silently understate signups;
+* **no backfill of legacy users is invented** — an absent value is reported as unavailable, never as
+  a reconstructed guess.
+
+`created_at` is **not implemented in this documentation workstream.** Until it exists and its
+completeness date passes, the bucket stores `new_users: null` and the callable reports the metric as
+unavailable — never `0`, which would read as "nobody signed up".
 
 ### 10.9 Suspicious or duplicate events
 
@@ -891,10 +1283,11 @@ metric surfaces its counts rather than reimplementing the checks.
 ### 10.10 `getAdminMetrics` callable contract
 
 ```ts
-// request
+// request — exact payload
 {
-  window: "24h" | "7d" | "30d" | "365d" | "all",
-  economy?: "cash" | "beta_credit" | "both",   // default "both"
+  fromDay: string,                              // "YYYY-MM-DD", canonical timezone
+  toDay: string,                                // "YYYY-MM-DD", inclusive, ≤ 31 days from fromDay
+  economy?: "cash" | "beta_credit" | "both",    // default "both"
   includeTournaments?: boolean,                 // default false — the expensive block
   tournamentLimit?: number                      // 1..50, default 10
 }
@@ -904,52 +1297,77 @@ metric surfaces its counts rather than reimplementing the checks.
   success: true,
   timezone: "America/Sao_Paulo",
   amountUnit: "centavos",
-  window: "7d",
-  windowMode: "exact",
-  windowStart: "<ISO>", windowEnd: "<ISO>",
+  fromDay: "2026-08-01",
+  toDay: "2026-08-07",
+  dayCount: 7,
   cash: {
     transactionCount: { entry_fee: 120, prize: 8, … },
     transactionVolumeCentavos: { … },
     averageCentavos: { … },
-    medianCentavos: { lowerBound, upperBound, approximate: true },
+    medianCentavos: { lowerBound: 4096, upperBound: 8191, exactBucket: true },
     entryFeesCentavos, prizesDistributedCentavos,
-    impliedGrossMarginCentavos,          // labelled, NOT revenue — see 10.6
-    grossSpartaFeeCentavos: null,        // unavailable
-    partnerCommissionCentavos: null,     // unavailable
-    netSpartaRevenueCentavos: null       // unavailable
+    grossSpartaFeeCentavos:    { value: null, available: false,
+                                 unavailableReason: "LEDGER_NOT_IMPLEMENTED" },
+    partnerCommissionCentavos: { value: null, available: false,
+                                 unavailableReason: "SOURCE_NOT_IMPLEMENTED" },
+    netSpartaRevenueCentavos:  { value: null, available: false,
+                                 unavailableReason: "REVENUE_RECOGNITION_NOT_DEFINED" },
+    organizerRevenueCentavos:  { value: null, available: false,
+                                 unavailableReason: "ORGANIZER_FINANCE_OUT_OF_SCOPE" }
   },
-  betaCredit: { … same shape … },
-  withdrawals: { pending: { count, sumCentavos } },
-  newUsers: null,
-  partnerAttributedUsers: null,
-  conversionByPartner: null,
+  betaCredit: { … same shape; fee/commission/revenue are structurally absent, not merely null … },
+  withdrawals: { pending: { count: 3, sumCentavos: 15000 } },
+  newUsers:               { value: null, available: false,
+                            unavailableReason: "CANONICAL_CREATED_AT_UNAVAILABLE" },
+  partnerAttributedUsers: { value: null, available: false,
+                            unavailableReason: "SOURCE_NOT_IMPLEMENTED" },
+  conversionByPartner:    { value: null, available: false,
+                            unavailableReason: "SOURCE_NOT_IMPLEMENTED" },
   topTournaments: [ { tournamentId, entryCentavos, prizeCentavos, registrations } ],
   topTournamentsTruncated: false,
   suspicious: { unknownCategory: 0, malformedAmount: 0, undated: 0,
-                duplicatePrize: 0, partialSettlement: 0, walletDrift: 0 },
-  unavailable: [
-    { metric: "grossSpartaFee",    reason: "no fee or revenue-split model exists at this base" },
-    { metric: "partnerCommission", reason: "no partner model; pending Session 3" },
-    { metric: "netSpartaRevenue",  reason: "depends on grossSpartaFee and partnerCommission" },
-    { metric: "newUsers",          reason: "users/{uid} has no created_at field" },
-    { metric: "partnerAttributedUsers", reason: "no attribution model; pending Session 3" },
-    { metric: "conversionByPartner",    reason: "no attribution model; pending Session 3" }
-  ]
+                duplicatePrize: 0, duplicateEntryFee: 0, prizeNamespaceCollision: 0,
+                partialSettlement: 0, walletDrift: 0 }
 }
 ```
 
-Every unavailable metric is `null` **and** carries an explicit reason. Nothing is reported as `0`
-when the truth is "we cannot know".
+Every unavailable metric carries `value: null`, `available: false` and a stable
+`unavailableReason`. **Nothing is reported as `0` when the truth is "we do not know".**
+
+Beta blocks never carry a fee, commission or revenue figure at all — not even a `null` one — because
+beta and free tournaments generate no fee by product decision (10.6.1). Structural absence is
+stronger than a null: there is no field a future change could accidentally populate.
+
+### 10.11 `unavailableReason` enum — stable and documented
+
+| Value | Meaning |
+|---|---|
+| `SOURCE_NOT_IMPLEMENTED` | The upstream data source (e.g. partner attribution) does not exist yet |
+| `LEDGER_NOT_IMPLEMENTED` | The event exists conceptually but no immutable ledger records it |
+| `REVENUE_RECOGNITION_NOT_DEFINED` | Sources may exist, but the recognition/refund policy that makes the figure meaningful is undefined |
+| `ORGANIZER_FINANCE_OUT_OF_SCOPE` | Deliberately outside this module |
+| `CANONICAL_CREATED_AT_UNAVAILABLE` | No complete, server-authoritative creation timestamp exists |
+
+The enum is **stable**: values are added, never renamed or repurposed, so a dashboard can branch on
+them safely.
 
 ---
 
 ## 11. Metric definitions and data sources — summary
 
-Consolidated in the table at 10.3, with per-metric detail in 10.4–10.9. Two rules govern all of them:
+Consolidated in the table at 10.3, with per-metric detail in 10.4–10.11. The governing rules:
 
 1. **Every figure traces to an immutable ledger row or an aggregate derived from one.** No metric is
    derived from an engagement aggregate, a wallet total, or a client-supplied value.
-2. **Cash and beta are never summed**, in any metric, at any window.
+2. **Cash and beta are never summed**, in any metric, over any range.
+3. **All monetary values are integer centavos.**
+4. **No metric is estimated from approximate fields.** Where resolution is bounded (the median), the
+   bound is disclosed explicitly and is provable, not estimated (10.5).
+5. **Absence of a canonical source means explicit unavailability, never zero.**
+6. **The aggregates never replace the ledger** — the reconciler must be able to recompute every
+   bucket from the authoritative sources (14.2).
+7. **No administrative aggregate participates in a financial transaction.**
+8. `admin_metrics_daily/{dayKey}` is keyed in **`America/Sao_Paulo`**.
 
 ---
 
@@ -969,10 +1387,11 @@ which reveals only whether the caller is authenticated — information the calle
 
 ### 12.2 Response limits
 
-* `getSeasonLeaderboard`: `limit` clamped to `[1, 100]`, default 50; cursor-based paging only.
+* `getSeasonLeaderboard`: `limit` clamped to `[1, 100]`, default 50; **cursor-based paging only, never
+  offset**; cursor bound to season + economy + ordering tuple and rejected otherwise (9.1).
 * `getMySeasonRanking`: single entry, no paging surface.
-* `getAdminMetrics`: `tournamentLimit` clamped to `[1, 50]`, default 10; the tournament block is
-  opt-in via `includeTournaments`.
+* `getAdminMetrics`: range clamped to **31 days**; `tournamentLimit` clamped to `[1, 50]`, default 10;
+  the tournament block is opt-in via `includeTournaments`.
 * Every callable uses `assertExactPayload`, so an unexpected key is `invalid-argument` rather than a
   silently ignored field
   ([functions/src/domain/settlement.ts:41-56](../../functions/src/domain/settlement.ts#L41-L56)).
@@ -980,16 +1399,21 @@ which reveals only whether the caller is authenticated — information the calle
 
 ### 12.3 Leak protection
 
-* `getAdminMetrics` returns **only aggregates**. It never returns a transaction id, a uid, a
-  `pix_key`, an `external_id`, or any row-level document. `topTournaments` returns tournament ids —
-  which every signed-in user can already read ([firestore.rules:137-139](../../firestore.rules#L137-L139)) —
-  and never uids.
-* The public leaderboard callables never read `users` at request time; they return only the
-  denormalized fields listed in 5.1.
+* `getAdminMetrics` returns **only allowlisted administrative aggregates**. It never returns raw
+  player data, a UID, a participant list, an individual wallet, a room credential, a transaction id,
+  a `pix_key`, or any row-level document. `topTournaments` returns tournament ids — which every
+  signed-in user can already read
+  ([firestore.rules:137-139](../../firestore.rules#L137-L139)) — and never UIDs.
+* **No leaderboard surface exposes a UID**, in any field, cursor, log or metadata (5.4, 5.6).
+* The public leaderboard callables never read `users` at request time; entries carry only the
+  allowlisted projection of 5.5.
 * Suspicious-event metrics are **counts only**. Investigating a specific flagged row is an offline
-  audit-CLI operation, not a callable response.
+  audit operation, not a callable response.
 * Because the aggregate collections are backend-written and Rules-denied to clients (section 13),
   an admin-claimed client cannot bypass these limits by reading the aggregates directly.
+* **No partner telemetry, no behavioural profiling, and no new analytics purpose is authorized.** The
+  existing LGPD basis for Crashlytics does **not** cover partner attribution or any new analytics;
+  that remains a separate workstream.
 
 ---
 
@@ -998,19 +1422,19 @@ which reveals only whether the caller is authenticated — information the calle
 ### 13.1 Rules
 
 `firestore.rules` ends with a catch-all deny
-([firestore.rules:181-183](../../firestore.rules#L181-L183)), so the three new collections are
+([firestore.rules:181-183](../../firestore.rules#L181-L183)), so the five new collections are
 **already denied** to every client without any change. The design deliberately keeps them that way:
-all three are read through callables (Admin SDK, which bypasses Rules).
+all five are backend-only, reached through callables (Admin SDK, which bypasses Rules).
 
 Explicit match blocks are still recommended so the posture is stated rather than inherited:
 
 ```javascript
-// SEASON RANKINGS — written only by the ranking trigger / rebuild tool.
+// SEASON RANKINGS — written only by the ranking trigger, via the Admin SDK.
 // Read through getSeasonLeaderboard / getMySeasonRanking, never directly, so the
 // server controls paging, field selection and the privacy exclusions.
-match /season_rankings/{seasonId} {
+match /season_rankings/{seasonDocId} {
   allow read, write: if false;
-  match /entries/{uid} {
+  match /entries/{publicPlayerId} {
     allow read, write: if false;
   }
 }
@@ -1025,11 +1449,35 @@ match /ranking_events/{transactionId} {
 match /admin_metrics_daily/{dayKey} {
   allow read, write: if false;
 }
+
+// PUBLIC IDENTITY MAP — the UID -> publicPlayerId association, and its reverse
+// uniqueness guard. Server-only in BOTH directions: no client may read either,
+// so the pseudonym can never be resolved back to an account and the id space
+// cannot be enumerated; no client may write either, so an identity can never be
+// forged, reassigned or reused.
+match /public_player_ids/{uid} {
+  allow read, write: if false;
+}
+
+match /public_player_id_index/{publicPlayerId} {
+  allow read, write: if false;
+}
 ```
 
-Note `read: if false` even for admins: the metrics callable is the only sanctioned surface, which
+Note `read: if false` **even for admins**: the callables are the only sanctioned surfaces, which
 prevents a Flutter admin screen from paging buckets directly and reconstructing a per-day ledger.
 This is what makes the section-10.1 prohibition structural rather than advisory.
+
+Frozen security posture:
+
+* clients **never write** ranking entries, ranking events or admin metrics;
+* clients **never choose** score, position, economy, `seasonId` or public identity — every one of
+  these is server-derived;
+* **the Admin SDK is the only writer**;
+* the leaderboard is served **only** as an allowlisted projection;
+* administrative metrics **require the `admin: true` claim**;
+* **room data never participates** in any ranking or metric;
+* **an individual wallet is never exposed**.
 
 ### 13.2 Indexes
 
@@ -1039,23 +1487,26 @@ That test uses `.find()` for the legacy-ledger composite and asserts no duplicat
 index for the exact field triple `["category","user_ref","tournament_ref"]`. **Adding new indexes for
 other field combinations does not break it.** The existing index must be preserved verbatim.
 
-Required additions (for the rebuild/backfill of section 7.3 and the exact edge queries of 10.2):
+**Conceptually required additions, recorded but NOT applied in this phase** (section 22 forbids
+touching `firestore.indexes.json` here):
 
 ```jsonc
-// prize rows for a season window, in settlement order
+// leaderboard ordering within a season — the canonical comparator of 4.3
+{ "collectionGroup": "entries", "queryScope": "COLLECTION",
+  "fields": [ { "fieldPath": "scoreCentavos",  "order": "DESCENDING" },
+              { "fieldPath": "winsCount",      "order": "DESCENDING" },
+              { "fieldPath": "publicPlayerId", "order": "ASCENDING" } ] }
+
+// exact-position counting for getMySeasonRanking (9.2) is served by the same
+// index: each of the three disjoint counts is a prefix range over this tuple.
+
+// ledger verification for the read-only reconciler (14.2)
 { "collectionGroup": "transactions", "queryScope": "COLLECTION",
   "fields": [ { "fieldPath": "category",  "order": "ASCENDING" },
               { "fieldPath": "status",    "order": "ASCENDING" },
               { "fieldPath": "timestamp", "order": "ASCENDING" } ] }
 
-// leaderboard ordering within a season
-{ "collectionGroup": "entries", "queryScope": "COLLECTION",
-  "fields": [ { "fieldPath": "total_prize_centavos", "order": "DESCENDING" },
-              { "fieldPath": "wins",                 "order": "DESCENDING" },
-              { "fieldPath": "last_prize_at",        "order": "ASCENDING" },
-              { "fieldPath": "uid",                  "order": "ASCENDING" } ] }
-
-// withdrawals by state within a window
+// withdrawals by state within a date range
 { "collectionGroup": "withdrawals", "queryScope": "COLLECTION",
   "fields": [ { "fieldPath": "status",       "order": "ASCENDING" },
               { "fieldPath": "requested_at", "order": "ASCENDING" } ] }
@@ -1063,6 +1514,9 @@ Required additions (for the rebuild/backfill of section 7.3 and the exact edge q
 
 The `entries` index is `COLLECTION` scope, matched under each season document. If cross-season
 queries are ever needed it must become `COLLECTION_GROUP`; that is not required by this contract.
+
+The leaderboard index matches the comparator exactly and in the same order, so a single indexed scan
+serves both paging and the position counts — no client-side sorting and no in-memory reordering.
 
 New index objects must follow the existing file conventions — `collectionGroup`, `queryScope`,
 `fields[].fieldPath`, `fields[].order` — and `fieldOverrides` must remain an array, which the guard
@@ -1081,33 +1535,50 @@ it is recorded so a future index cleanup is a deliberate decision rather than an
 
 ---
 
-## 14. Backfill, reconciliation and correction
+## 14. Reconciliation and correction
 
-### 14.1 Backfill
+**FROZEN.** No backfill, no repair, no correction callable is authorized by this document.
 
-Section 7.3. Offline CLI, dry-run by default, follows the
-[functions/src/audit/cli.ts](../../functions/src/audit/cli.ts) template, writes only to the three new
-collections.
+### 14.1 No backfill
 
-### 14.2 Reconciliation sweep
+There is none — see sections 3.4 and 7.3. Prizes settled before `firstActiveSeasonId` stay
+permanently outside the rankings, and **historical seasons are never reconstructed.**
 
-A scheduled job (daily, off-peak in `America/Sao_Paulo`) that:
+### 14.2 Read-only reconciliation
 
-1. recomputes each open season's totals from `transactions` by paged query;
-2. compares against the stored aggregates;
-3. writes a drift report and emits the section-10.9 suspicious-event counts;
-4. **reports drift; it does not silently repair it.**
+Extends the existing audit pattern
+([functions/src/audit/reconcile.ts](../../functions/src/audit/reconcile.ts),
+[functions/src/audit/cli.ts](../../functions/src/audit/cli.ts)), whose posture is already
+classify-and-report rather than mutate.
 
-This mirrors the existing reconciliation posture, which classifies and reports rather than mutating.
+* **Default mode is read-only / dry-run.**
+* It compares three things: the **authoritative ledger**, the **guards** (`ranking_events`) and the
+  **aggregates** (`season_rankings`, `admin_metrics_daily`).
+* It reports, at minimum:
+
+| Finding | Meaning |
+|---|---|
+| `missingEvent` | An eligible prize row with no guard and no aggregate contribution |
+| `duplicateEffect` | An aggregate that reflects the same event more than once |
+| `wrongEconomy` | An event applied to the other economy's aggregate |
+| `wrongSeason` | An event applied to a season other than its canonical timestamp's |
+| `amountMismatch` | The aggregate total disagrees with the ledger sum |
+
+* **Any future repair must be explicitly administrative, auditable and idempotent** — and is not
+  contracted here.
+* **Reconciliation must never be used to pull in events from before the first season** (3.4). A
+  pre-activation prize is not a `missingEvent`; it is out of scope and is reported as such, if at all.
+
+Closed seasons remain reconcilable against the canonical source indefinitely. A legitimate
+correction can **never invent an event** and can **never alter the financial ledger**.
 
 ### 14.3 Correction
 
-Correcting a ranking aggregate is a **rebuild of the affected season**, not an in-place edit:
-bump `rebuild_generation`, zero the entries, re-apply from the ledger. This keeps the aggregate a
-pure function of the immutable ledger, so no correction can introduce a value that the ledger does
-not support.
+There is no automatic correction path. If a drift is confirmed, the response is an explicitly
+administrative, audited, idempotent action authorized separately — not a silent rewrite, and not a
+rebuild, which section 7.3 withdrew.
 
-Correcting the **ledger** is out of scope for this contract and remains an audit-CLI concern. If a
+Correcting the **ledger** is out of scope for this contract and remains an audit concern. If a
 compensating financial category is ever introduced, section 2.5 must be amended first.
 
 ---
@@ -1134,53 +1605,66 @@ beta_balance == beta_grants + beta_prizes + beta_refunds − beta_entry_spend
 For every season document:
 
 ```text
-entries[*].total_prize_centavos  == Σ amounts of qualifying prize rows for that uid and season
-entries[*].wins                  == count of those rows
-season.total_prize_centavos      == Σ entries[*].total_prize_centavos
-season.player_count              == count of entries
+entries[*].scoreCentavos    == Σ amounts of qualifying prize rows for that player and season
+entries[*].winsCount        == count of those rows
+season.totalScoreCentavos   == Σ entries[*].scoreCentavos
+season.playerCount          == count of entries
 ```
 
-and globally:
+There is no cross-season invariant, because annual seasons were withdrawn (section 3.1).
 
-```text
-Σ monthly totals of a year == the annual total for the same economy and year
-```
+Read-only reconciliation asserts all of these (section 14.2).
 
-The reconciliation sweep asserts all of these.
+### 15.4 Two distinct monetary limits — wallet vs aggregate
 
-### 15.4 The aggregate overflow ceiling — **a real constraint**
+**FROZEN.** Resolves open decision 5 (see section 19).
 
-`addCentavos` throws `failed-precondition` when a sum exceeds `MAX_BALANCE_CENTAVOS = 1_000_000_000`
-centavos (R$ 10 000 000,00)
-([functions/src/domain/money.ts:212-223](../../functions/src/domain/money.ts#L212-L223)). That bound
-was chosen for a **single wallet**. A season-wide or annual platform total can plausibly exceed it
-while no individual wallet does.
+These are **different domains and must never share a helper**:
 
-A per-player season total is very unlikely to breach it. The **season parent**
-`total_prize_centavos` and the admin `sum_centavos_by_category` realistically can.
+| Domain | Limit | Applies to |
+|---|---|---|
+| **Individual wallet / single operation** | `MAX_CENTAVOS = 100_000_000` (R$ 1 000 000,00) per amount; `MAX_BALANCE_CENTAVOS = 1_000_000_000` (R$ 10 000 000,00) per balance ([functions/src/domain/money.ts:22-25](../../functions/src/domain/money.ts#L22-L25)) | One player's wallet, one transaction amount |
+| **Platform statistical aggregate** | **`MAX_AGGREGATE_CENTAVOS = Number.MAX_SAFE_INTEGER` = 9 007 199 254 740 991 centavos** | Season totals, admin bucket sums, any cross-player figure |
 
-Resolution — required before implementation:
+**The wallet cap must never be reused for a platform aggregate.** `addCentavos` throws
+`failed-precondition` above R$ 10 M
+([functions/src/domain/money.ts:212-223](../../functions/src/domain/money.ts#L212-L223)); that bound
+was sized for **one wallet**. Reusing it for platform-wide sums would make the metrics callable start
+throwing once cumulative volume crossed R$ 10 M — a latent production failure with no relation to any
+real limit.
 
-* per-player entry totals: use `addCentavos` unchanged;
-* season-parent and admin-bucket totals: use a distinct helper with a higher explicit ceiling
-  (proposed `MAX_AGGREGATE_CENTAVOS = 1_000_000_000_000`, R$ 10 000 000 000,00, still far inside
-  `Number.MAX_SAFE_INTEGER` at 9.007e15), defined alongside the existing constants and unit-tested
-  for the overflow boundary.
+Frozen rules for the aggregate domain:
 
-Reusing `addCentavos` for platform-wide sums would make the metrics callable start throwing once the
-platform crosses R$ 10 M cumulative — a latent production failure. Flagged in section 19.
+* only **safe, finite, non-negative integers**;
+* **addition, subtraction and conversion are always checked**;
+* **no operation may exceed `Number.MAX_SAFE_INTEGER`**;
+* **no floating point** is used to convert reais to centavos — conversion goes through the exact
+  integer path (`inspectReais`), never `value * 100` on a double;
+* **no silent rounding**;
+* **no saturation or clamping** at the limit;
+* **no wraparound**;
+* **overflow fails observably and prevents the incorrect write** — the aggregate is left untouched
+  and the failure is surfaced to reconciliation, never swallowed.
+
+Individual amounts remain subject to their own existing financial limits; the aggregate domain
+governs only the sums.
+
+**Helpers are not modified in this phase** — section 17 records where the new domain should live so
+`money.ts` stays untouched.
 
 ### 15.5 Failure modes
 
 | Failure | Handling |
 |---|---|
-| Trigger retried after partial write | Impossible — guard doc and both entries commit in one transaction |
-| Trigger never fires (missed event) | Reconciliation sweep detects drift; rebuild repairs |
+| Trigger retried after partial write | Impossible — guard and aggregates commit in one transaction |
+| Trigger never fires (missed event) | Read-only reconciliation reports `missingEvent`; repair is a separate authorized action |
 | Malformed `amount` on a prize row | Row excluded, counted in `malformedAmount`, never guessed |
 | Missing/unparseable `timestamp` | Row excluded, counted in `undated` — it cannot be assigned a season |
+| Event before `firstActiveSeasonId` | Ignored as out-of-scope; not a failure and not a `missingEvent` |
+| `firstActiveSeasonId` unset or malformed | Fail-closed: no aggregate write at all (3.3) |
 | Season document contention | Bounded: one prize row per tournament; retries are safe by 7.1 |
-| Aggregate overflow | `failed-precondition` surfaced to the sweep, never a silent wrap — see 15.4 |
-| Rank pass interrupted | `rank` stale, totals correct; callable orders by totals regardless |
+| Aggregate overflow | Observable failure, write prevented, no clamp and no wrap — see 15.4 |
+| Trigger delayed past month end | Event still lands in its own canonical season (8.4) |
 
 ---
 
@@ -1198,50 +1682,76 @@ id is `demo-sparta-battle`.
 | Season id from an instant just after local midnight | Bucketed to the new São Paulo day, not UTC |
 | Season id at `2026-08-01T02:00:00Z` | `2026-07` (still July 31 in São Paulo) |
 | Season id at `2026-08-01T04:00:00Z` | `2026-08` |
-| Annual boundary `2026-12-31T23:59:59-03:00` vs `+1s` | `2026` then `2027` |
+| Month boundary `2026-08-31T23:59:59-03:00` vs `+1s` | `2026-08` then `2026-09` |
+| Season interval | Half-open `[monthStart, nextMonthStart)` — no gap, no overlap |
 | Category `prize` | Eligible, cash economy |
 | Category `beta_prize` | Eligible, beta economy, never cash |
 | Categories `entry_fee`/`entry_refund`/`deposit`/`withdrawal`/`beta_grant`/`beta_refund`/`beta_entry_fee` | All ineligible |
-| Unknown category `admin_correction` | Ineligible (allowlist) |
+| Unknown category `admin_correction` | Ineligible (allowlist, fail-closed) |
 | `status !== "completed"` | Ineligible |
 | `amount` malformed / negative / >2 decimals / NaN | Excluded and counted |
-| Tie: equal totals, different wins | Higher wins first |
-| Tie: equal totals and wins, different `last_prize_at` | Earlier first |
-| Tie: all equal | Lower `uid` first — strict total order |
-| Comparator | Antisymmetric and transitive over a generated set |
-| `addCentavos` at the aggregate ceiling | Throws; aggregate helper does not — 15.4 |
+| Event before `firstActiveSeasonId` | Ignored as out-of-scope |
+| `firstActiveSeasonId` unset or malformed | Fail-closed: no write at all |
+| Tie: equal scores, different wins | Higher `winsCount` first |
+| Tie: equal scores and wins | Lower `publicPlayerId` first — strict total order |
+| Comparator | Antisymmetric and transitive over a generated set; no UID and no timestamp level |
+| Positions | Exact ordinals 1,2,3,4 — no shared positions, no gaps |
+| Wallet cap vs aggregate cap | `addCentavos` throws above R$ 10 M; aggregate helper does not — 15.4 |
+| Aggregate at `Number.MAX_SAFE_INTEGER` | Overflow fails observably; no clamp, no wrap, write prevented |
 
-### 16.2 Unit — `functions/test/unit/adminMetrics.test.ts`
+### 16.2 Unit — `functions/test/unit/publicPlayerId.test.ts`
 
 | Case | Expectation |
 |---|---|
-| Window edges half-open | `now − 24h` exactly is excluded; `now` included |
+| Generated id | Exactly 22 chars matching `[A-Za-z0-9_-]{22}` |
+| Entropy | 16 random bytes, base64url, no padding |
+| Derivation | Not a function of uid, `player_id`, e-mail, phone or name |
+| Collision on create | Retried; never overwrites an existing mapping |
+| Immutability | A second assignment for the same uid is rejected |
+| Reuse | A released id is never reassigned to another account |
+| Label | `Jogador ` + first 8 chars; full id still used for identity and ordering |
+
+### 16.3 Unit — `functions/test/unit/adminMetrics.test.ts`
+
+| Case | Expectation |
+|---|---|
+| Day bucket interval | Half-open `[dayStart, nextDayStart)` in São Paulo |
+| Range of 31 days | Accepted |
+| Range of 32 days | `invalid-argument` |
+| `toDay` before `fromDay` | `invalid-argument` |
 | Average with `count === 0` | `null`, never `0` and never a division by zero |
 | Histogram median, odd/even counts | Correct bucket interval |
 | Histogram additivity | Σ of day histograms == histogram of the union |
 | Median when all rows in one bucket | `lowerBound`/`upperBound` are that bucket |
 | Cash and beta blocks | Never summed; no combined field exists |
-| Unavailable metrics | `null` plus a reason string; never `0` |
+| Beta block | Carries no fee/commission/revenue field at all |
+| Unavailable metrics | `value: null`, `available: false`, enum reason; never `0` |
+| `unavailableReason` values | Exactly the enum of 10.11 |
 | `tournament_volume` beyond cap | `truncated: true` and a dropped count |
-| `windowMode` | `"exact"` for 24h/7d/30d, `"day_aligned"` for 365d/all |
 
-### 16.3 Handler — `functions/test/rules/seasonRanking.handlers.test.ts`
+### 16.4 Handler — `functions/test/rules/seasonRanking.handlers.test.ts`
 
 | Case | Expectation |
 |---|---|
-| Trigger applies a prize once | Both season entries and the guard doc created |
-| Trigger replayed with same tx id | No increment; totals unchanged |
-| Two distinct prizes, same uid, same season | Totals and `wins` accumulate exactly |
-| Prize spanning a month boundary | Correct monthly bucket; both land in the same annual bucket |
+| Trigger applies a prize once | Season entry, season parent and guard created in one transaction |
+| Trigger replayed with same tx id | No increment; totals byte-identical |
+| Two distinct prizes, same player, same season | `scoreCentavos` and `winsCount` accumulate exactly |
+| Prizes in different months | Land in their own monthly seasons |
+| Trigger running after month end | Event still lands in its own canonical season |
+| Cash and beta prizes for the same player | Separate season documents; never combined |
 | Non-prize transaction created | Trigger writes nothing |
 | Malformed prize row | Trigger writes nothing and records the exclusion |
-| Guard doc present but entries missing | Treated as applied — reported as drift, not silently re-applied |
+| Aggregate write fails | Guard is NOT written; the event stays retryable |
 | `getSeasonLeaderboard` `limit` 1000 | Clamped to 100 |
 | `getSeasonLeaderboard` unexpected key | `invalid-argument` |
-| `getMySeasonRanking` with `uid` in payload | `invalid-argument` — uid comes only from the token |
-| `getMySeasonRanking` for a player with no prizes | `entry: null`, not a synthesized zero row |
+| Cursor from another season or economy | Rejected with `invalid-argument` |
+| Tampered/opaque-cursor corruption | Rejected, never silently reinterpreted |
+| Any leaderboard response | Contains no UID, anywhere, including the cursor |
+| `getMySeasonRanking` with `uid` in payload | `invalid-argument` — caller comes only from context |
+| `getMySeasonRanking` for a player with no prizes | `isRanked: false`, `rank: null`, `entry: null`; no document created |
+| `getMySeasonRanking` rank | Matches the player's position in the paged leaderboard exactly |
 
-### 16.4 Negative authorization — `functions/test/rules/adminMetrics.auth.test.ts`
+### 16.5 Negative authorization — `functions/test/rules/adminMetrics.auth.test.ts`
 
 | Case | Expectation |
 |---|---|
@@ -1253,30 +1763,34 @@ id is `demo-sparta-battle`.
 | `admin: true` | Succeeds |
 | Auth check precedes payload parsing | A malformed payload from a non-admin still yields `permission-denied`, not `invalid-argument` |
 | `getSeasonLeaderboard` unauthenticated | `unauthenticated` |
+| `getMySeasonRanking` unauthenticated | `unauthenticated` |
 
-### 16.5 Rules — `functions/test/rules/seasonRanking.rules.test.ts`
+### 16.6 Rules — `functions/test/rules/seasonRanking.rules.test.ts`
 
 | Case | Expectation |
 |---|---|
-| Client reads `season_rankings/{id}` | Denied |
-| Client reads `season_rankings/{id}/entries/{uid}` — own uid | Denied |
+| Client reads `season_rankings/{seasonDocId}` | Denied |
+| Client reads `season_rankings/{id}/entries/{publicPlayerId}` | Denied |
 | Admin client reads any of the above | Denied — callable is the only surface |
 | Client reads `ranking_events/{txId}` | Denied |
 | Client or admin reads `admin_metrics_daily/{day}` | Denied |
-| Any client write to any of the three | Denied |
+| Client or admin reads `public_player_ids/{uid}` | Denied |
+| Client or admin reads `public_player_id_index/{publicPlayerId}` | Denied — the pseudonym can never be resolved back to a uid |
+| Any client write to any of the five | Denied |
 | Existing collections | Postures unchanged from the current suite |
 
-### 16.6 E2E — `functions/test/e2e/seasonRankingFlow.e2e.test.ts`
+### 16.7 E2E — `functions/test/e2e/seasonRankingFlow.e2e.test.ts`
 
 Full emulator flow: create tournament → join → start → `declareTournamentResult` → assert the prize
-transaction, then assert both season entries, the guard document, and the admin bucket; replay
-`declareTournamentResult` and assert no double count; run the rebuild tool and assert convergence to
-identical totals.
+transaction, then assert the season entry, the season parent, the guard document and the admin
+bucket; replay `declareTournamentResult` and assert no double count; page the leaderboard and assert
+positions are exact ordinals with no UID in any payload; assert `getMySeasonRanking` agrees with the
+paged position.
 
-### 16.7 Index guard
+### 16.8 Index guard
 
-`functions/test/unit/firestoreIndexes.test.ts` must continue to pass unchanged after the section-13.2
-additions. A new assertion should cover each added index.
+`functions/test/unit/firestoreIndexes.test.ts` must continue to pass unchanged. When the section-13.2
+indexes are eventually applied (a later phase), a new assertion should cover each added index.
 
 ---
 
@@ -1284,15 +1798,17 @@ additions. A new assertion should cover each added index.
 
 | File | Contents |
 |---|---|
-| `functions/src/domain/seasonRanking.ts` | Pure rules: season id derivation, eligibility allowlist, comparator, aggregate arithmetic. No Admin SDK, no `firebase-functions` — matches the existing domain-layer convention. |
-| `functions/src/domain/adminMetrics.ts` | Pure rules: window boundaries, histogram bucketing, median interval, average, unavailable-metric declarations. |
-| `functions/src/domain/aggregateMoney.ts` | `MAX_AGGREGATE_CENTAVOS` and the aggregate-safe add — section 15.4. Alternatively an addition to `money.ts`; keeping it separate avoids touching a frozen financial module. |
+| `functions/src/domain/seasonRanking.ts` | Pure rules: season id derivation, eligibility allowlist, comparator, position arithmetic. No Admin SDK, no `firebase-functions` — matches the existing domain-layer convention. |
+| `functions/src/domain/publicPlayerId.ts` | Pure rules: 22-char base64url format, validation, label derivation. Generation itself needs `crypto`, so it lives in the handler layer. |
+| `functions/src/domain/adminMetrics.ts` | Pure rules: date-range boundaries and the 31-day cap, histogram bucketing, median interval, average, `unavailableReason` enum. |
+| `functions/src/domain/aggregateMoney.ts` | `MAX_AGGREGATE_CENTAVOS` and the aggregate-safe checked add — section 15.4. **Deliberately a separate module**, so the frozen `money.ts` wallet contract is not touched. |
 | `functions/src/index.ts` | New exports only: `onPrizeTransactionCreated`, `getSeasonLeaderboard`, `getMySeasonRanking`, `getAdminMetrics`, each with its `…Handler` counterpart, pinned to `REGION_CALLABLES`. Existing exports untouched. |
-| `functions/src/ranking/rebuild.ts` + `functions/src/ranking/cli.ts` | Offline backfill/rebuild, dry-run by default. |
-| `firestore.rules` | The three match blocks of 13.1. |
-| `firestore.indexes.json` | The three index objects of 13.2. |
-| `firebase.json` | Add `lib/ranking` to the functions `ignore` list, matching `lib/audit` and `lib/adminclaim`, so the CLI is not deployed. |
-| Tests | The six files of section 16. |
+| `firestore.rules` | The five match blocks of 13.1. |
+| `firestore.indexes.json` | The index objects of 13.2 — **not in this phase**. |
+| Tests | The seven new files of section 16 (16.1–16.7). 16.8 adds assertions to the existing `firestoreIndexes.test.ts` rather than a new file. |
+
+**No rebuild or backfill CLI appears in this table.** Section 7.3 withdrew it; there is nothing to
+rebuild. Consequently no `lib/ranking` entry is needed in `firebase.json`'s deploy-ignore list.
 
 [functions/test/unit/functionRegions.test.ts](../../functions/test/unit/functionRegions.test.ts)
 pins regions by asserting `__trigger.regions` against an **explicit hardcoded list** of the fourteen
@@ -1312,6 +1828,13 @@ category, and no revenue split anywhere in the backend.
 Six admin metrics are blocked on Session 3: partner commission, net Sparta revenue,
 partner-attributed users, conversion by partner, and — indirectly — gross Sparta fee and any
 credible revenue figure.
+
+**Approved rates, recorded for compatibility (see 10.6.1).** `sparta_fee_bps = 750` (7,5 % of the
+cash entry, included in the entry, never charged on top; beta and free generate none) and
+`partner_commission_bps = 4000` (40 % of Sparta's fee, ≈ 3 % of an attributed entry). **These are
+product policy, not computable metrics** — section 10.6.3 forbids deriving any figure from them until
+the corresponding ledgers exist. Organizers are a separate category and are out of scope for this
+module entirely.
 
 ### 18.1 Entities Session 3 must define
 
@@ -1366,28 +1889,83 @@ current configuration would produce a figure that silently changes when configur
 * The season aggregate schema and the guard-document idempotency pattern (sections 6, 7).
 * The daily admin bucket, which has room for partner-keyed sub-maps under the same cap-and-disclose
   rule as `tournament_volume` (10.4).
-* `getAdminMetrics` already returns `partnerCommission`, `netSpartaRevenue`,
-  `partnerAttributedUsers` and `conversionByPartner` as `null` with reasons; Session 3 fills them in
-  without changing the response shape.
+* `getAdminMetrics` already returns `partnerCommissionCentavos`, `netSpartaRevenueCentavos`,
+  `partnerAttributedUsers` and `conversionByPartner` as `value: null, available: false` with enum
+  reasons; Session 3 fills them in **without changing the response shape**.
 
 ---
 
-## 19. Unresolved conflicts and decisions requiring central approval
+## 19. Resolution of the twelve previously open decisions
 
-| # | Decision | Why it cannot be settled here | Recommendation |
+**There are no open decisions in this document.** All twelve are closed below — each either decided
+outright or frozen as an approved fail-closed behaviour. Anything still needed before code can be
+written is a **prerequisite**, not an open decision, and is listed in section 20.
+
+| # | Original decision (as previously stated) | Resolution | Where frozen |
 |---|---|---|---|
-| 1 | **Public display name.** `users.username` is permanently `""`; `player_id` is not collision-free; Auth `displayName` is unvalidated and not in Firestore; `users` is not publicly readable. | Product + safety decision (impersonation, profanity, uniqueness), not a technical one. Recorded as open in [docs/username.md](../username.md). | Ship with `player_id`; prioritize the `setUsername` callable (username.md Option A) before any public launch. |
-| 2 | **Separate cash and beta leaderboards.** The frozen contract forbids summing the two economies, so a single combined ranking is impossible. | Changes what players see. Alternative — cash-only public ranking with beta hidden — is equally consistent with the constraint. | Two leaderboards, economy in the season document id. Confirm whether beta should be public at all during closed beta. |
-| 3 | **Fee / commission / revenue metrics are undefined at this base.** No fee, rake, house account or split exists; settlement pays the winner the full prize. | Defining them creates financial semantics with real consequences. | Report as `unavailable` with reasons. Do **not** ship `impliedGrossMargin` as a revenue metric. Resolve jointly with Session 3. |
-| 4 | **New-user counting is impossible today** — `users/{uid}` has no `created_at` and Firestore cannot query by creation time. | Fixing it edits `onUserCreated`, a financial-adjacent trigger, which is out of scope this phase. | Approve adding `created_at` in an implementation session, plus a one-off Auth export for history. Report `null` until then. |
-| 5 | **Aggregate overflow ceiling.** `addCentavos` caps at R$ 10 M, sized for one wallet; platform-wide season and metric totals can exceed it and would throw. | Introduces a new money constant, which touches the frozen money contract. | Approve `MAX_AGGREGATE_CENTAVOS` in a separate module (17), leaving `money.ts` untouched. |
-| 6 | **First Firestore document trigger in the repository.** | New deployment surface, new failure mode, new emulator requirement. | Approve — the alternative couples ranking to payout (8.1). |
-| 7 | **Median is approximate** (bucket interval, not a point value). | Exactness requires either unbounded storage or the prohibited full scan. | Approve the histogram interval; exact medians only in offline reconciliation reports. |
-| 8 | **Rolling windows are day-aligned for 365d and all-time.** | Exactness at those widths costs far more than it informs. | Approve, with `windowMode` disclosed in every response. |
-| 9 | **Withdrawal states are a single-valued enum today** (`pending` only); nothing transitions them. | Depends on the unbuilt PIX integration. | Key the aggregate dynamically by observed status so new states appear automatically. |
-| 10 | **Leaderboard visibility.** Proposed as authenticated-only, matching `tournaments`. | "Public" could mean unauthenticated. | Authenticated-only, to avoid an unauthenticated enumeration surface. |
-| 11 | **Single winner per tournament is structural** (`prize_{tid}` carries no uid; `placement: 1` hardcoded). If 2nd/3rd-place payouts are ever added, the prize-id derivation changes. | Product decision about prize structure. | Confirm single-winner is the permanent contract. If not, section 10.9's duplicate-prize detector and the `prize_*` id assumption must be amended before that ships. |
-| 12 | **Pre-existing test debt: `functions/test/unit/invariants.test.ts` encodes the retired prize-id scheme** `prize_{winneruid}_{tournamentid}` via a locally redeclared helper, so it passes while asserting a contract the code no longer implements. | Found during this audit; not caused by and not fixed by this design. | Fix in an implementation session — the ranking test matrix must import `prizeTransactionId` from source, never redeclare it. |
+| 1 | **Public display name** — `username` permanently `""`, `player_id` not collision-free, Auth `displayName` unvalidated, `users` not publicly readable | **DECIDED.** Server-generated pseudonymous `publicPlayerId`: 16 random bytes, base64url unpadded, exactly 22 chars, collision-checked, create-only, immutable, never reused, not derived from uid/`player_id`/e-mail/phone/name. Public label is `Jogador ` + first 8 chars. No customisable public name in this phase. The earlier "ship with `player_id`" recommendation is **withdrawn**. | §5 |
+| 2 | **Separate cash and beta leaderboards**, and whether beta should be public | **DECIDED.** Cash and beta are separate rankings, never summed, converted or compared; positions computed independently; economy is part of the season document id. Both are served to authenticated users via the same callable, selected by the required `economy` parameter. | §3.1, §4, §6.1, §9.1 |
+| 3 | **Fee / commission / revenue undefined at this base** | **DECIDED — unavailable by decision.** Rates are recorded as product policy (`sparta_fee_bps = 750`, `partner_commission_bps = 4000`), but gross fee, partner commission, net revenue and organizer revenue all return `value: null, available: false` with enum reasons. Inferring revenue from rate × volume is forbidden. The `impliedGrossMargin` proxy is **withdrawn**. | §10.6 |
+| 4 | **New-user counting impossible** — no `created_at` on `users` | **DECIDED — fail-closed.** `new_users` is `null` / unavailable with `CANONICAL_CREATED_AT_UNAVAILABLE`. Auth scanning, first-activity proxies and document-id-as-date are all forbidden. The future `created_at` contract (server-only, immutable, with a completeness date, no legacy backfill) is frozen but **not implemented here**. | §10.8 |
+| 5 | **Aggregate overflow ceiling** — wallet cap reused for platform sums | **DECIDED.** Two distinct domains. Wallet/operation limits unchanged; platform aggregates use `MAX_AGGREGATE_CENTAVOS = Number.MAX_SAFE_INTEGER` (9 007 199 254 740 991) in a **separate module**, with checked arithmetic, no float conversion, no silent rounding, no clamp, no wrap, and observable overflow that prevents the write. | §15.4 |
+| 6 | **First Firestore document trigger in the repository** | **APPROVED.** Trigger fires after the prize transaction is created; ranking never joins the settlement transaction; a ranking failure never undoes, blocks or delays a prize; at-least-once delivery is expected and handled by the `ranking_events/{txId}` guard committed atomically with the aggregates. | §7, §8 |
+| 7 | **Median is approximate** | **DECIDED.** Median is reported as a **provable bounded interval** `{lowerBound, upperBound, exactBucket: true}` from exactly-additive histograms of exact amounts — disclosed resolution, not an estimate from approximate fields. Collapsing it to a single number and calling it "the median" is forbidden. Exact point medians only in offline reconciliation. | §10.5 |
+| 8 | **Rolling windows day-aligned for 365d and all-time** | **DECIDED — superseded.** Rolling windows are withdrawn. `getAdminMetrics` takes an explicit `fromDay`/`toDay` range of whole business days in the canonical timezone, capped at **31 days per call**. Every figure is therefore exact for its stated range and `windowMode` is removed. 365d/all-time are composed from consecutive calls. | §10.2 |
+| 9 | **Withdrawal states single-valued** (`pending` only) | **DECIDED — fail-closed.** The aggregate keys **dynamically by observed `status`**, never a hardcoded enum, so `paid`/`failed` appear automatically when the PIX integration lands. No status bucket is fabricated, and `pending` must not be rendered as "awaiting debit" — the wallet is already debited. | §10.7 |
+| 10 | **Leaderboard visibility** | **DECIDED.** Authentication is mandatory on both leaderboard callables, matching `tournaments`, the only client-readable collection. No unauthenticated surface, so no unauthenticated enumeration. | §9.1, §9.2 |
+| 11 | **Single winner per tournament is structural** | **DECIDED — frozen as-is.** `prize_{tournamentid}` and `placement: 1` remain the contract; settlement is not changed by this document. The ranking depends only on the deterministic transaction id, so it is unaffected either way. **If multi-placement payouts are ever introduced, the prize-id derivation changes and this contract must be amended first** — specifically the duplicate-prize detector (§10.9) and the `prize_*` namespace assumption. | §1, §10.9, §14 |
+| 12 | **Pre-existing test debt in `invariants.test.ts`** | **CLOSED — not a product decision.** It is a recorded defect in an existing test that redeclares the retired `prize_{winneruid}_{tid}` helper locally instead of importing `prizeTransactionId`. Nothing about this contract depends on it. It is reclassified as an **implementation prerequisite** (§20), to be fixed when tests are authorized. It is not carried forward as an open decision. | §20 |
+
+No decision was deferred, renamed, or replaced by a new open item.
+
+---
+
+## 20. Implementation prerequisites
+
+These are **not open decisions** — every behaviour above is frozen. These are the concrete things
+that must exist before ranking code can be written, and the fail-closed behaviour that applies while
+each is missing.
+
+| # | Prerequisite | Fail-closed behaviour until it exists |
+|---|---|---|
+| 1 | **`firstActiveSeasonId` configured and validated** in the backend (§3.3) | Ranking processing is inert: no aggregate write at all. Absent/malformed is a configuration error, never "start now" and never a default month. |
+| 2 | **`publicPlayerId` implemented**, with generation, collision handling, immutability, Rules and tests (§5) | Ranking cannot ship. The leaderboard must not fall back to `player_id` or any existing identifier. |
+| 3 | **Base 7,5 % fee integrated separately** as an immutable ledger, outside this module (§10.6) | Fee/commission/revenue metrics stay `null` with their enum reasons. |
+| 4 | **`users.created_at`** server-written, immutable, with a completeness date (§10.8) | `new_users` stays `null` with `CANONICAL_CREATED_AT_UNAVAILABLE`; days before the completeness date stay unavailable permanently. |
+| 5 | **`MAX_AGGREGATE_CENTAVOS` module** created separately from `money.ts` (§15.4) | Aggregates must not be written using the wallet helper. |
+| 6 | **Firestore Rules** for the five new collections (§13.1) | The catch-all deny already blocks them, but the posture must be explicit before launch. |
+| 7 | **Indexes** of §13.2 applied and deployed | Leaderboard paging and exact-position counting are not servable. |
+| 8 | **Fix `functions/test/unit/invariants.test.ts`** to import `prizeTransactionId` instead of redeclaring it — **resolves open decision 12**, reclassified from decision to defect (§19) | Pre-existing defect, unrelated to this contract; new ranking tests must never redeclare a source helper. |
+| 9 | **Privacy review of the retention policy** before any physical deletion or anonymisation (§8.4) | Nothing is deleted; seasons beyond the 12-month window are simply not served. |
+
+---
+
+## 21. Recommended sequence
+
+1. Central review and sign-off of this frozen contract.
+2. Complete and integrate the **base 7,5 % fee** separately.
+3. Define the first `firstActiveSeasonId`.
+4. Implement the **pseudonymous public identity**.
+5. Implement the **ranking trigger, guard and entries**.
+6. Implement the **callables and indexes**.
+7. Implement **admin metrics for available sources only**.
+8. Implement **Rules**.
+9. Implement the **read-only (dry-run) reconciler**.
+10. Run tests for idempotency, concurrency, economy separation, pagination, position, overflow and
+    security.
+11. Only then evaluate **production activation**.
+12. **Attribution, commission and organizers remain later workstreams.**
+
+---
+
+## 22. Scope of this document
+
+This update **does not authorize**: a trigger, a callable, a collection, an index, a Rule, a test, a
+backfill, a repair, a migration, a fee, a commission, attribution, organizers, a settlement change, a
+ledger change, or a deploy.
+
+It **freezes the contract for central review** and nothing more. No source, Rules, indexes, tests,
+dependencies or Firebase configuration were modified.
 
 ---
 
@@ -1423,7 +2001,7 @@ it carries no amount and never touches wallets, transactions, registrations or t
 |---|---|---|---|---|---|---|---|---|
 | `getPlayerEngagementStats` (callable) | Definitive ledger rows in `transactions`, filtered `user_ref == caller` | Per-economy **net** result (prizes + refunds − entries) in centavos: `dailyNet`, `currentWeekNet`, `currentMonthNet`, `lifetimeNet`, plus exclusion counters | `assertSignedIn`; uid from token only, never payload | No Rules block needed (callable uses Admin SDK); single-field `user_ref` index only, no composite | Partial — same source ledger, but **net** per player vs **gross prizes** across players | **keep-separate** | It computes a *net* figure including entry fees and refunds, and is scoped to one player. A ranking needs *gross prize* totals across all players. Reusing it would either leak other players' net positions or redefine ranking value to something the approved rules forbid. | None — untouched. New callables are additive. |
 | `engagementStats.ts` `CATEGORY_TABLE` | — (pure classification) | Canonical category → economy/role/sign mapping | n/a | n/a | **Direct and valuable** | **reuse** | It is the single canonical enumeration of every category any handler writes, already unit-tested. The ranking allowlist must be derived from it so a new category can never be silently mis-bucketed. | Additive only. Any new category (Session 3) must be added here — see 18.4.3. |
-| `engagementStats.ts` `normalizeMonth`, `monthOfDayKey`, `daysInMonth` | — (pure) | `YYYY-MM` validation and slicing | n/a | n/a | Direct | **reuse** | Monthly season ids are exactly `YYYY-MM` with the same validity band (2020–2100). Reimplementing would risk divergent validation. | None. A new `yearOfDayKey` is additive. |
+| `engagementStats.ts` `normalizeMonth`, `monthOfDayKey`, `daysInMonth` | — (pure) | `YYYY-MM` validation and slicing | n/a | n/a | Direct | **reuse** | Season ids are exactly `YYYY-MM` with the same validity band (2020–2100). Reimplementing would risk divergent validation. | None — reused verbatim, no new date helper is introduced. |
 | `engagementStats.ts` `aggregateLedger` | Ledger rows | Net totals with skip counters | n/a | n/a | Conceptual only | **keep-separate** | Signature is per-player and month-scoped, and it nets entries against prizes. Ranking needs a different reduction. The *exclusion-counter discipline* is copied, not the function. | None. |
 | `playerActivity.ts` `ACTIVITY_TIMEZONE`, `businessDayKey` | Server clock | São Paulo business day resolution via `Intl` + IANA zone | n/a | n/a | Direct | **reuse** | The source designates it the repository convention for every future day-bucketed feature. Season and window bucketing must use it or boundaries will disagree. | None. Critical that it is reused, not copied. |
 | `player_activity/{uid}_{day}` (collection) | `recordDailyAppOpen` callable | One doc per player per business day; app was opened | Owner or admin read; no client write ([firestore.rules:175-178](../../firestore.rules#L175-L178)) | Explicit match block; no composite index | None — non-financial | **keep-separate** | Records app opens, carries no amount, and is explicitly not financial. It can never back a prize ranking. | None. |
@@ -1443,7 +2021,7 @@ it carries no amount and never touches wallets, transactions, registrations or t
 
 All of them. Specifically:
 
-* `season_rankings/*/entries/*.total_prize_centavos` and `.wins` — from
+* `season_rankings/*/entries/*.scoreCentavos` and `.winsCount` — from
   `transactions/prize_{tid}` only;
 * `admin_metrics_daily.sum_centavos_by_category`, `.count_by_category`, `.histogram_by_category` —
   from `transactions` rows only;
@@ -1462,9 +2040,9 @@ ranking pipeline has no code path that reads `getPlayerEngagementStats` or any e
 |---|---|
 | Existing engagement handler and new financial aggregator both count a prize | **Cannot occur.** The engagement path performs no aggregate write — it computes at read time and persists nothing. There is no second writer to collide with. |
 | Ranking trigger fires twice for one prize (at-least-once delivery) | `ranking_events/{prize_tid}` guard document, created in the same transaction as the increments (7.1). |
-| Backfill re-applies an already-counted prize | Same guard document, plus `rebuild_generation` to distinguish a legitimate rebuild from a replay (7.3). |
-| Backfill running while the live trigger is active | Both take the same guard document in a transaction; the loser is a no-op. |
-| A prize counted in both monthly and annual totals | Intended, not double counting — they are different aggregates. The invariant `Σ months == year` (15.3) asserts consistency. |
+| Backfill re-applies an already-counted prize | **Cannot occur — there is no backfill** (3.4, 7.3). Ranking state is append-only from activation forward. |
+| Reconciliation double-counting an event | **Cannot occur** — reconciliation is read-only and never writes ranking state (14.2). |
+| Pre-activation prize pulled in later | Excluded by `firstActiveSeasonId` and explicitly forbidden in reconciliation (3.4, 14.2). |
 | Two prize rows for one tournament | Structurally impossible: the id is `prize_{tournamentid}`. If one is ever found, it is a suspicious event (10.9). |
 | Cash and beta both counted into one total | Structurally impossible: separate season documents, no combined field exists (6.1). |
 | `player_activity` mistaken for a financial signal | Excluded by design; it carries no amount. |
@@ -1513,9 +2091,13 @@ Constants: `ACTIVITY_TIMEZONE`, `STATS_TIMEZONE`, `MAX_CENTAVOS`, `MAX_BALANCE_C
 `ECONOMY_CASH`, `ECONOMY_BETA_CREDIT`, `COMPLETED_STATUS`, `STATUS_OPEN`, `STATUS_IN_PROGRESS`,
 `STATUS_COMPLETED`, `STATUS_CANCELLED`, `REGISTRATION_CONFIRMED`.
 
-The proposed names `season_rankings`, `ranking_events`, `admin_metrics_daily`,
-`onPrizeTransactionCreated`, `getSeasonLeaderboard`, `getMySeasonRanking`, `getAdminMetrics`,
-`MAX_AGGREGATE_CENTAVOS` collide with nothing at this base.
+The proposed names `season_rankings`, `ranking_events`, `admin_metrics_daily`, `public_player_ids`,
+`public_player_id_index`, `onPrizeTransactionCreated`, `getSeasonLeaderboard`, `getMySeasonRanking`,
+`getAdminMetrics`, `MAX_AGGREGATE_CENTAVOS` and `publicPlayerId` collide with nothing at this base.
+
+Note that `player_id` (the existing `PLR-######` field on `users`) and `publicPlayerId` are
+**different things** and must never be conflated: the former stays an internal, collision-prone
+handle; the latter is the public pseudonymous identity of section 5.
 
 ### R.8 Compatibility expectations for existing Flutter consumers
 
@@ -1525,9 +2107,13 @@ The proposed names `season_rankings`, `ranking_events`, `admin_metrics_daily`,
 * No existing collection, field, category, document id, callable name or region changes. There is no
   data migration and no client-visible breaking change.
 * New callables are purely additive; a client that does not call them is unaffected.
-* Clients must treat `null` metric values in `getAdminMetrics` as "unavailable", never as zero, and
-  should render the accompanying `unavailable[].reason`.
-* Clients must treat `medianCentavos` as an interval and `windowMode` as meaningful.
+* Clients must treat a metric's `value: null` / `available: false` as "unavailable", never as zero,
+  and should branch on the stable `unavailableReason` enum (10.11).
+* Clients must treat `medianCentavos` as an **interval**, never collapsing it to a single number
+  presented as "the median" (10.5).
+* Clients must compose ranges longer than 31 days from consecutive `getAdminMetrics` calls (10.2).
+* The leaderboard exposes **no UID**; a client that needs to identify "me" in a page compares
+  `publicPlayerId` against the value returned by `getMySeasonRanking` (5.4, 9.2).
 
 ### R.9 Registration statistics vs prize rankings vs partner attribution
 
