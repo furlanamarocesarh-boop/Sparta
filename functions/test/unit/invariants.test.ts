@@ -14,6 +14,10 @@ import {
   validateWithdrawalAmount,
 } from "../../src/domain/operations.js";
 import {
+  prizeTransactionId,
+  registrationId,
+} from "../../src/domain/settlement.js";
+import {
   isFull,
   readParticipantCounts,
 } from "../../src/domain/tournamentFields.js";
@@ -199,26 +203,43 @@ describe("tournament capacity", () => {
 });
 
 describe("idempotency and duplicate registration", () => {
-  it("derives a deterministic registration id that blocks a second entry", () => {
-    // `jointournament` writes registrations/{uid}_{tournamentid}. Because the id
-    // is derived rather than random, a second attempt targets the SAME document,
-    // and the transaction's existence check rejects it. The rejection itself is
-    // exercised against the emulator (test/rules), not here — this asserts the
-    // property the guarantee rests on.
-    const registrationId = (uid: string, tid: string) => `${uid}_${tid}`;
+  // These exercise the SHIPPED derivations imported from `settlement.ts`. A
+  // locally redeclared copy would assert only itself and would keep passing
+  // after the real derivation changed — which is exactly how the retired
+  // `prize_{winneruid}_{tournamentid}` scheme survived here unnoticed.
 
-    assert.equal(registrationId("u1", "t1"), "u1_t1");
+  it("derives a deterministic registration id that blocks a second entry", () => {
+    // `jointournament` writes registrations/{registrationId(uid, tid)}. Because
+    // the id is derived rather than random, a second attempt targets the SAME
+    // document and the transaction's existence check rejects it. The rejection
+    // itself is exercised against the emulator (test/rules), not here — this
+    // asserts the property the guarantee rests on.
     assert.equal(registrationId("u1", "t1"), registrationId("u1", "t1"));
     assert.notEqual(registrationId("u1", "t1"), registrationId("u2", "t1"));
+    assert.notEqual(registrationId("u1", "t1"), registrationId("u1", "t2"));
   });
 
-  it("derives a deterministic prize external id, so a prize cannot be paid twice", () => {
-    // payprize defaults externalid to `prize_{winneruid}_{tournamentid}`, and
-    // transactions/{externalid} must not already exist. Same winner + same
-    // tournament therefore collides by construction.
-    const prizeId = (winner: string, tid: string) => `prize_${winner}_${tid}`;
+  it("derives ONE prize id per tournament, so a prize cannot be paid twice", () => {
+    // `declareTournamentResult` writes transactions/{prizeTransactionId(tid)}
+    // and refuses to settle when that document already exists, so a second
+    // settlement of the same tournament collides by construction.
+    assert.equal(prizeTransactionId("t1"), prizeTransactionId("t1"));
+    assert.notEqual(prizeTransactionId("t1"), prizeTransactionId("t2"));
+  });
 
-    assert.equal(prizeId("w1", "t1"), "prize_w1_t1");
-    assert.equal(prizeId("w1", "t1"), prizeId("w1", "t1"));
+  it("keeps the prize id winner-independent — one prize slot per tournament", () => {
+    // The tournament id is the ONLY input: the winner cannot influence the
+    // document the prize lands in. This is what makes `placement: 1` a real
+    // constraint rather than a convention.
+    //
+    // The retired `prize_{winneruid}_{tournamentid}` scheme derived a different
+    // id per winner, so the existence check could not see the first payout and
+    // one tournament could pay two winners. Asserting the arity here fails
+    // loudly if a winner argument is ever reintroduced.
+    assert.equal(
+      prizeTransactionId.length,
+      1,
+      "prizeTransactionId must take the tournament id and nothing else"
+    );
   });
 });
