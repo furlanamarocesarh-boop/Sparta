@@ -36,100 +36,129 @@ function regionOf(fn: ExportedFn): string[] | undefined {
 const CENTRAL = "us-central1";
 const EAST = "us-east1";
 
+/**
+ * THE MANIFEST — the single authorized deployment surface.
+ *
+ * One entry per deployable Function: its exact exported name (casing included)
+ * mapped to the ONE region it must declare. Every assertion below is derived
+ * from this object, so the surface is stated exactly once.
+ *
+ * This is an ALLOWLIST, deliberately closed. It is not a mirror of whatever
+ * `index.ts` happens to export: an export that is not listed here FAILS, even
+ * if it carries a valid `__trigger`. That is the protection — a new endpoint
+ * (and therefore a new deploy target, a new attack surface and a new billing
+ * line) must be authorized here on purpose, never merely by appearing.
+ *
+ * ADDING AN AUTHORIZED FUNCTION: add exactly one entry, `name: REGION`. Its
+ * presence, its casing and its region are then all verified automatically —
+ * there is no second list to keep in sync.
+ */
+const AUTHORIZED_FUNCTIONS: Readonly<Record<string, string>> = {
+  onUserCreated: EAST,
+  testdeposit: CENTRAL,
+  requestwithdrawal: CENTRAL,
+  jointournament: CENTRAL,
+  payprize: CENTRAL,
+  createTournament: CENTRAL,
+  createtournament: CENTRAL,
+  setTournamentRoom: CENTRAL,
+  getTournamentRoom: CENTRAL,
+  startTournament: CENTRAL,
+  declareTournamentResult: CENTRAL,
+  grantBetaCredit: CENTRAL,
+  cancelTournament: CENTRAL,
+  recordDailyAppOpen: CENTRAL,
+  getPlayerEngagementStats: CENTRAL,
+};
+
+/**
+ * Names that must NEVER exist. This is the opposite contract to the manifest —
+ * a denylist of retired camelCase aliases — so it is a separate structure by
+ * design, not a second copy of the surface.
+ */
+const FORBIDDEN_LEGACY_ALIASES = [
+  "joinTournament",
+  "payPrize",
+  "requestWithdrawal",
+] as const;
+
+/**
+ * The exports that are actually deployable: those carrying `__trigger`.
+ *
+ * Discovered dynamically, which is what lets an UNAUTHORIZED export be caught.
+ * The filter also drops `default`/`__esModule` from the CommonJS↔ESM interop
+ * and every exported helper that is not a deployable endpoint (for example
+ * createTournamentHandler, declareTournamentResultHandler,
+ * recordDailyAppOpenHandler, getPlayerEngagementStatsHandler).
+ */
+function deployableExports(fns: Record<string, ExportedFn>): string[] {
+  return Object.keys(fns)
+    .filter((k) => (fns[k] as ExportedFn).__trigger != null)
+    .sort();
+}
+
 describe("regiões explícitas por função", () => {
-  it("onUserCreated está em us-east1 (nunca no default us-central1)", async () => {
+  it("a superfície implantável é EXATAMENTE a autorizada no manifest", async () => {
     const fns = await loadFunctions();
-    assert.deepEqual(regionOf(fns.onUserCreated), [EAST]);
+    const actual = deployableExports(fns);
+    const authorized = Object.keys(AUTHORIZED_FUNCTIONS).sort();
+
+    // Separado em duas asserções para que a falha diga QUAL é o problema:
+    // uma Function sumiu, ou uma Function não autorizada apareceu.
+    const missing = authorized.filter((name) => !actual.includes(name));
+    assert.deepEqual(
+      missing,
+      [],
+      `Functions autorizadas AUSENTES do build (removidas ou renomeadas?): ${missing.join(", ")}`
+    );
+
+    const unauthorized = actual.filter(
+      (name) => !Object.prototype.hasOwnProperty.call(AUTHORIZED_FUNCTIONS, name)
+    );
+    assert.deepEqual(
+      unauthorized,
+      [],
+      `Exports implantáveis NÃO autorizados: ${unauthorized.join(", ")}. ` +
+        `Se forem legítimos, adicione cada um ao manifest AUTHORIZED_FUNCTIONS ` +
+        `com sua região esperada.`
+    );
+
+    // Rede de segurança: cobre também casing divergente e qualquer duplicata.
+    assert.deepEqual(actual, authorized);
   });
 
-  it("as quatorze callables estão em us-central1", async () => {
+  it("cada Function do manifest declara EXATAMENTE a região autorizada", async () => {
     const fns = await loadFunctions();
-    for (const name of [
-      "testdeposit",
-      "requestwithdrawal",
-      "jointournament",
-      "payprize",
-      "createTournament",
-      "createtournament",
-      "setTournamentRoom",
-      "getTournamentRoom",
-      "startTournament",
-      "declareTournamentResult",
-      "grantBetaCredit",
-      "cancelTournament",
-      "recordDailyAppOpen",
-      "getPlayerEngagementStats",
-    ]) {
+    for (const [name, expectedRegion] of Object.entries(AUTHORIZED_FUNCTIONS)) {
+      assert.ok(fns[name], `${name} não foi exportada`);
       assert.deepEqual(
         regionOf(fns[name]),
-        [CENTRAL],
-        `${name} deve estar em ${CENTRAL}`
+        [expectedRegion],
+        `${name} deve estar em ${expectedRegion}`
       );
     }
   });
 
-  it("toda função exportada tem uma região EXPLÍCITA (nenhuma implícita)", async () => {
+  it("nenhuma Function usa região IMPLÍCITA (default do SDK)", async () => {
     const fns = await loadFunctions();
-    for (const name of [
-      "onUserCreated",
-      "testdeposit",
-      "requestwithdrawal",
-      "jointournament",
-      "payprize",
-      "createTournament",
-      "createtournament",
-      "setTournamentRoom",
-      "getTournamentRoom",
-      "startTournament",
-      "declareTournamentResult",
-      "grantBetaCredit",
-      "cancelTournament",
-      "recordDailyAppOpen",
-      "getPlayerEngagementStats",
-    ]) {
+    for (const name of Object.keys(AUTHORIZED_FUNCTIONS)) {
       const regions = regionOf(fns[name]);
       assert.ok(
         Array.isArray(regions) && regions.length === 1,
-        `${name} deve ter exatamente uma região explícita`
+        `${name} deve ter exatamente uma região explícita — ` +
+          `esquecer .region(...) faz o deploy cair no default ${CENTRAL}`
       );
     }
-  });
-
-  it("os quinze exports implantáveis existem, com casing idêntico", async () => {
-    const fns = await loadFunctions();
-    // Só exports que SÃO gatilho implantável (têm `__trigger`) — ignora
-    // `default`/`__esModule` do interop CommonJS↔ESM e quaisquer helpers
-    // exportados que NÃO são funções deployáveis (ex.: createTournamentHandler,
-    // setTournamentRoomHandler, getTournamentRoomHandler,
-    // startTournamentHandler, declareTournamentResultHandler,
-    // grantBetaCreditHandler, cancelTournamentHandler,
-    // recordDailyAppOpenHandler, getPlayerEngagementStatsHandler).
-    const exported = Object.keys(fns)
-      .filter((k) => (fns[k] as ExportedFn).__trigger != null)
-      .sort();
-    assert.deepEqual(exported, [
-      "cancelTournament",
-      "createTournament",
-      "createtournament",
-      "declareTournamentResult",
-      "getPlayerEngagementStats",
-      "getTournamentRoom",
-      "grantBetaCredit",
-      "jointournament",
-      "onUserCreated",
-      "payprize",
-      "recordDailyAppOpen",
-      "requestwithdrawal",
-      "setTournamentRoom",
-      "startTournament",
-      "testdeposit",
-    ]);
   });
 
   it("não existe nenhum alias camelCase legado (joinTournament/payPrize/requestWithdrawal)", async () => {
     const fns = await loadFunctions();
-    assert.equal(fns.joinTournament, undefined);
-    assert.equal(fns.payPrize, undefined);
-    assert.equal(fns.requestWithdrawal, undefined);
+    for (const alias of FORBIDDEN_LEGACY_ALIASES) {
+      assert.equal(fns[alias], undefined, `${alias} não pode voltar a existir`);
+      assert.ok(
+        !Object.prototype.hasOwnProperty.call(AUTHORIZED_FUNCTIONS, alias),
+        `${alias} é um alias proibido e nunca pode ser autorizado no manifest`
+      );
+    }
   });
 });

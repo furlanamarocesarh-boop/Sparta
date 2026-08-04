@@ -1811,11 +1811,22 @@ indexes are eventually applied (a later phase), a new assertion should cover eac
 rebuild. Consequently no `lib/ranking` entry is needed in `firebase.json`'s deploy-ignore list.
 
 [functions/test/unit/functionRegions.test.ts](../../functions/test/unit/functionRegions.test.ts)
-pins regions by asserting `__trigger.regions` against an **explicit hardcoded list** of the fourteen
-current callables. It does **not** discover exports automatically, so a new callable that forgets
-`.region(...)` would silently deploy to the SDK default `us-central1` and the test would still pass.
-Every new export in section 17 must therefore be added to that list explicitly — this is a required
-step, not a nicety.
+guards the deployment surface. It **discovers the deployable exports dynamically** — every export
+carrying a `__trigger` — and compares that discovered set against a **closed authorized surface**
+held in a single manifest, which maps each Function name to the one region it must declare.
+
+Consequences for the new exports in this section:
+
+* **A new Function never passes silently.** An unlisted deployable export fails the surface
+  assertion even though its `__trigger` is perfectly valid.
+* Each new export must be **explicitly authorized by adding one entry to that manifest**, with its
+  expected region. This is a required step, not a nicety — it is what keeps a new deploy target a
+  deliberate decision rather than a side effect of writing code.
+* Once that single entry exists, **both its presence and its region are verified automatically**.
+* **Forgetting `.region(...)` fails**, because the manifest's expected region is asserted against
+  `__trigger.regions` and an implicit region does not match it.
+* The name does **not** need repeating across several lists — the manifest is the only place a
+  Function's authorized name and region are declared.
 
 ---
 
