@@ -14,6 +14,7 @@ import {
 import {
   addCentavos,
   centavosToReais,
+  inspectReais,
   storedReaisToCentavos,
   subtractCentavos,
   toCentavos,
@@ -94,12 +95,31 @@ import {
   activityDaysInMonth,
   aggregateLedger,
   dailyNetArray,
+  monthOfDayKey,
   normalizeMonth,
   normalizeStatsUid,
   STATS_TIMEZONE,
   type EconomyTotals,
   type LedgerRow,
 } from "./domain/engagementStats.js";
+import {
+  checkExistingGuard,
+  classifyPrizeCategory,
+  decideActivation,
+  decideEntry,
+  decideParent,
+  FIRST_ACTIVE_SEASON_ID,
+  isCompletedStatus,
+  isPrizeTransactionId,
+  RANKING_EVENTS_COLLECTION,
+  RANKING_TIMEZONE,
+  SEASON_ENTRIES_SUBCOLLECTION,
+  SEASON_RANKINGS_COLLECTION,
+  seasonDocumentId,
+  seasonWindow,
+  toUsableDate,
+  type PrizeRankingEvent,
+} from "./domain/seasonRanking.js";
 import {
   assertPublicPlayerId,
   decidePublicPlayerIdReservation,
@@ -2396,6 +2416,273 @@ export const ensurePublicPlayerIdHandler = async (
       `${PUBLIC_PLAYER_ID_MAX_RESERVATION_ATTEMPTS} tentativas.`
   );
 };
+
+/**
+ * A canonical `users/{uid}` reference, reduced to the uid it names.
+ *
+ * Duck-typed rather than `instanceof DocumentReference` so the same code runs
+ * against a snapshot produced by the emulator and one produced by a test. The
+ * path is re-derived and compared, so a reference into another collection — or
+ * one whose id and path disagree — is rejected instead of silently supplying a
+ * uid from the wrong namespace.
+ */
+function referencedUserId(value: unknown): string | null {
+  if (value === null || typeof value !== "object") return null;
+
+  const { id, path } = value as { id?: unknown; path?: unknown };
+  if (typeof id !== "string" || id.length === 0) return null;
+  if (typeof path !== "string") return null;
+  if (path !== `users/${id}`) return null;
+
+  return id;
+}
+
+/** True when the value is a usable Firestore document reference. */
+function isUsableReference(value: unknown): boolean {
+  if (value === null || typeof value !== "object") return false;
+
+  const { id, path } = value as { id?: unknown; path?: unknown };
+  return typeof id === "string" && id.length > 0 && typeof path === "string";
+}
+
+/**
+ * Test-only seams. Production passes neither and gets the frozen source
+ * configuration and the real identity primitive, following the
+ * options-with-defaults convention already used by `ensurePublicPlayerIdHandler`
+ * and `scanCollection`.
+ *
+ * Neither seam is reachable by a client: this handler has no callable surface,
+ * and the options are a TypeScript parameter, never a payload field. They are
+ * also NOT runtime configuration — nothing reads them from Firestore, the
+ * environment or Remote Config.
+ */
+export interface OnPrizeTransactionCreatedOptions {
+  readonly firstActiveSeasonId?: string | null;
+  readonly ensureIdentity?: (
+    uid: string
+  ) => Promise<{ publicPlayerId: string; created: boolean }>;
+}
+
+/** Why a delivery produced no ranking write. Returned for tests and logs. */
+export type PrizeRankingOutcome =
+  | { readonly applied: true; readonly seasonId: string; readonly economy: string }
+  | { readonly applied: false; readonly reason: string };
+
+/**
+ * Applies one settled prize to its monthly season ranking.
+ *
+ * WHY A TRIGGER AND NOT A SETTLEMENT CALL. The prize is already committed when
+ * this runs, so a ranking failure can never delay, reverse or duplicate a
+ * payout — the financial invariant stays the only thing settlement guarantees
+ * atomically. Nothing here reads or writes a wallet, a transaction, a
+ * tournament, a registration or a result.
+ *
+ * WHY IT WATCHES EVERY TRANSACTION. Firestore v1 triggers match a document
+ * path, not a query, so `transactions/{transactionId}` is the only available
+ * selector and the filtering is done here. That is deliberate: the eligibility
+ * rules live in one readable place instead of being encoded in a path.
+ *
+ * INELIGIBLE IS A SILENT NO-OP. A non-prize row, a wrong status, a malformed
+ * amount, an unusable timestamp or a broken reference must not throw: throwing
+ * would make Firestore retry a delivery that can never succeed. Once an event is
+ * ACCEPTED, however, every later failure — identity, corruption, overflow —
+ * propagates so the delivery is retried with nothing half-written.
+ */
+export const onPrizeTransactionCreatedHandler = async (
+  snapshot: any,
+  options: OnPrizeTransactionCreatedOptions = {}
+): Promise<PrizeRankingOutcome> => {
+  // ── Front door: everything below is a silent no-op ────────────────────────
+  const transactionId = snapshot?.id;
+  if (!isPrizeTransactionId(transactionId)) {
+    return { applied: false, reason: "not-a-prize-id" };
+  }
+
+  const data = (snapshot.data?.() ?? {}) as Record<string, unknown>;
+
+  const economy = classifyPrizeCategory(data.category);
+  if (economy === null) {
+    return { applied: false, reason: "category-not-ranking-bearing" };
+  }
+
+  if (!isCompletedStatus(data.status)) {
+    return { applied: false, reason: "status-not-completed" };
+  }
+
+  // The ONE conversion from stored reais to centavos, at the boundary.
+  const amount = inspectReais(data.amount, { allowZero: true });
+  if (!amount.ok) {
+    return { applied: false, reason: `amount-${amount.problem}` };
+  }
+
+  const prizeAt = toUsableDate(data.timestamp);
+  if (prizeAt === null) {
+    return { applied: false, reason: "timestamp-unusable" };
+  }
+
+  const uid = referencedUserId(data.user_ref);
+  if (uid === null) {
+    return { applied: false, reason: "user-ref-unusable" };
+  }
+
+  if (!isUsableReference(data.tournament_ref)) {
+    return { applied: false, reason: "tournament-ref-unusable" };
+  }
+
+  const dayKey = businessDayKey(prizeAt, RANKING_TIMEZONE);
+  const seasonId = monthOfDayKey(dayKey);
+
+  // ── Activation gate: BEFORE any identity and any transaction ─────────────
+  const configured =
+    options.firstActiveSeasonId === undefined
+      ? FIRST_ACTIVE_SEASON_ID
+      : options.firstActiveSeasonId;
+
+  const activation = decideActivation(configured, seasonId);
+  if (activation.kind === "inert") {
+    return { applied: false, reason: "first-active-season-not-configured" };
+  }
+  if (activation.kind === "before-first-season") {
+    return { applied: false, reason: "before-first-active-season" };
+  }
+
+  // ── Accepted. From here, failures propagate and the delivery is retried ──
+  const ensureIdentity = options.ensureIdentity ?? ensurePublicPlayerIdHandler;
+  const { publicPlayerId } = await ensureIdentity(uid);
+
+  const event: PrizeRankingEvent = {
+    transactionId,
+    publicPlayerId,
+    economy,
+    amountCentavos: amount.centavos,
+    seasonId,
+    dayKey,
+    prizeAt,
+  };
+
+  const window = seasonWindow(seasonId);
+
+  const guardRef = db.collection(RANKING_EVENTS_COLLECTION).doc(transactionId);
+  const parentRef = db
+    .collection(SEASON_RANKINGS_COLLECTION)
+    .doc(seasonDocumentId(economy, seasonId));
+  const entryRef = parentRef
+    .collection(SEASON_ENTRIES_SUBCOLLECTION)
+    .doc(publicPlayerId);
+
+  const transactionRef = snapshot.ref;
+
+  await db.runTransaction(async (transaction) => {
+    // The guard is read FIRST: a canonical one ends the delivery before any
+    // other document is even looked at.
+    const guardSnap = await transaction.get(guardRef);
+    const storedGuard = guardSnap.exists ? guardSnap.data() ?? {} : null;
+
+    const guardDecision = checkExistingGuard({
+      event,
+      expectedTransactionRefPath: transactionRef.path,
+      stored:
+        storedGuard === null
+          ? null
+          : {
+              transactionRefPath: (
+                storedGuard.transactionRef as { path?: unknown } | undefined
+              )?.path,
+              publicPlayerId: storedGuard.publicPlayerId,
+              economy: storedGuard.economy,
+              amountCentavos: storedGuard.amountCentavos,
+              seasonId: storedGuard.seasonId,
+              dayKey: storedGuard.dayKey,
+              appliedAt: storedGuard.appliedAt,
+            },
+    });
+
+    if (guardDecision.kind === "replay") {
+      // Entry and parent were committed with this guard, atomically. Nothing
+      // to repair and nothing to add.
+      return;
+    }
+
+    // Every remaining read before the first write.
+    const entrySnap = await transaction.get(entryRef);
+    const parentSnap = await transaction.get(parentRef);
+
+    const entryPlan = decideEntry({
+      event,
+      stored: entrySnap.exists ? (entrySnap.data() ?? {}) : null,
+    });
+
+    const parentPlan = decideParent({
+      event,
+      stored: parentSnap.exists ? (parentSnap.data() ?? {}) : null,
+      entryCreated: entryPlan.kind === "create",
+      window,
+    });
+
+    // ONE server-timestamp sentinel, so every stamp in this commit resolves to
+    // the same instant.
+    const stampedAt = admin.firestore.FieldValue.serverTimestamp();
+
+    if (entryPlan.kind === "create") {
+      transaction.set(entryRef, {
+        publicPlayerId,
+        economy,
+        seasonId,
+        scoreCentavos: entryPlan.scoreCentavos,
+        winsCount: entryPlan.winsCount,
+        firstPrizeAt: admin.firestore.Timestamp.fromDate(entryPlan.firstPrizeAt),
+        lastPrizeAt: admin.firestore.Timestamp.fromDate(entryPlan.lastPrizeAt),
+        updatedAt: stampedAt,
+      });
+    } else {
+      transaction.update(entryRef, {
+        scoreCentavos: entryPlan.scoreCentavos,
+        winsCount: entryPlan.winsCount,
+        lastPrizeAt: admin.firestore.Timestamp.fromDate(entryPlan.lastPrizeAt),
+        updatedAt: stampedAt,
+      });
+    }
+
+    if (parentPlan.kind === "create") {
+      transaction.set(parentRef, {
+        economy,
+        seasonId,
+        timezone: RANKING_TIMEZONE,
+        playerCount: parentPlan.playerCount,
+        totalScoreCentavos: parentPlan.totalScoreCentavos,
+        windowStart: admin.firestore.Timestamp.fromDate(parentPlan.windowStart),
+        windowEnd: admin.firestore.Timestamp.fromDate(parentPlan.windowEnd),
+        updatedAt: stampedAt,
+      });
+    } else {
+      transaction.update(parentRef, {
+        playerCount: parentPlan.playerCount,
+        totalScoreCentavos: parentPlan.totalScoreCentavos,
+        updatedAt: stampedAt,
+      });
+    }
+
+    // create() and nothing else: the guard is written once and can never be
+    // overwritten, so its presence always means a completed application.
+    transaction.create(guardRef, {
+      transactionRef,
+      publicPlayerId,
+      economy,
+      amountCentavos: event.amountCentavos,
+      seasonId,
+      dayKey,
+      appliedAt: stampedAt,
+    });
+  });
+
+  return { applied: true, seasonId, economy };
+};
+
+export const onPrizeTransactionCreated = central.firestore
+  .document("transactions/{transactionId}")
+  .onCreate(async (snapshot) => {
+    await onPrizeTransactionCreatedHandler(snapshot);
+  });
 
 /**
  * A Firestore Timestamp (production), a Date (tests), or null for anything

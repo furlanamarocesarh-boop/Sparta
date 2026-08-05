@@ -583,12 +583,4 @@ describe("guarda estrutural — a reserva é create-only", () => {
       }
     }
   });
-
-  it("não tem call site: esta fase entrega a primitiva, não seu consumidor", () => {
-    assert.equal(
-      occurrences(SOURCE, "ensurePublicPlayerIdHandler"),
-      1,
-      "a única ocorrência deve ser a própria declaração"
-    );
-  });
 });

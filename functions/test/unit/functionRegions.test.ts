@@ -69,6 +69,7 @@ const AUTHORIZED_FUNCTIONS: Readonly<Record<string, string>> = {
   cancelTournament: CENTRAL,
   recordDailyAppOpen: CENTRAL,
   getPlayerEngagementStats: CENTRAL,
+  onPrizeTransactionCreated: CENTRAL,
 };
 
 /**
