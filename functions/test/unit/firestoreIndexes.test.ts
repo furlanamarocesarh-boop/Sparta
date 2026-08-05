@@ -68,6 +68,42 @@ describe("firestore.indexes.json", () => {
     assert.equal(equivalents.length, 1, "no duplicated equivalent index");
   });
 
+  it("contém EXATAMENTE o índice do leaderboard (scoreCentavos DESC, winsCount DESC, publicPlayerId ASC)", () => {
+    const parsed = JSON.parse(raw) as {
+      indexes: Array<{
+        collectionGroup: string;
+        queryScope: string;
+        fields: Array<{ fieldPath: string; order: string }>;
+      }>;
+    };
+
+    // A ordem canônica da seção 4.3, na direção em que o leaderboard pagina.
+    // As três contagens disjuntas de getMySeasonRanking são prefixos deste
+    // mesmo índice, então uma única entrada serve leitura e posição.
+    const match = parsed.indexes.find(
+      (index) =>
+        index.collectionGroup === "entries" &&
+        index.queryScope === "COLLECTION" &&
+        index.fields.length === 3 &&
+        index.fields[0].fieldPath === "scoreCentavos" &&
+        index.fields[0].order === "DESCENDING" &&
+        index.fields[1].fieldPath === "winsCount" &&
+        index.fields[1].order === "DESCENDING" &&
+        index.fields[2].fieldPath === "publicPlayerId" &&
+        index.fields[2].order === "ASCENDING"
+    );
+    assert.ok(match, "the leaderboard composite index must be present");
+
+    // Sem duplicatas equivalentes.
+    const equivalents = parsed.indexes.filter(
+      (index) =>
+        index.collectionGroup === "entries" &&
+        JSON.stringify(index.fields.map((f) => f.fieldPath)) ===
+          JSON.stringify(["scoreCentavos", "winsCount", "publicPlayerId"])
+    );
+    assert.equal(equivalents.length, 1, "no duplicated equivalent index");
+  });
+
   it("firebase.json aponta para o arquivo de índices", () => {
     const firebaseJson = JSON.parse(
       readFileSync(join(repoRoot(), "firebase.json"), "utf8")

@@ -119,7 +119,17 @@ import {
   seasonWindow,
   toUsableDate,
   type PrizeRankingEvent,
+  type RankingEconomy,
 } from "./domain/seasonRanking.js";
+import {
+  decodeCursor,
+  encodeCursor,
+  normalizeEconomy,
+  normalizeLimit,
+  publicEntry,
+  rankFromAhead,
+  type OrderKey,
+} from "./domain/seasonLeaderboard.js";
 import {
   assertPublicPlayerId,
   decidePublicPlayerIdReservation,
@@ -2683,6 +2693,253 @@ export const onPrizeTransactionCreated = central.firestore
   .onCreate(async (snapshot) => {
     await onPrizeTransactionCreatedHandler(snapshot);
   });
+
+/** The entries subcollection of one season, ordered canonically. */
+function seasonEntriesQuery(
+  economy: RankingEconomy,
+  seasonId: string
+): admin.firestore.CollectionReference {
+  return db
+    .collection(SEASON_RANKINGS_COLLECTION)
+    .doc(seasonDocumentId(economy, seasonId))
+    .collection(SEASON_ENTRIES_SUBCOLLECTION);
+}
+
+/** `playerCount` from the season parent, or 0 while the season has no entries. */
+async function seasonPlayerCount(
+  economy: RankingEconomy,
+  seasonId: string
+): Promise<number> {
+  const snap = await db
+    .collection(SEASON_RANKINGS_COLLECTION)
+    .doc(seasonDocumentId(economy, seasonId))
+    .get();
+
+  if (!snap.exists) return 0;
+
+  const stored = (snap.data() ?? {}).playerCount;
+  return typeof stored === "number" && Number.isSafeInteger(stored) && stored >= 0
+    ? stored
+    : 0;
+}
+
+/**
+ * One page of a monthly season leaderboard.
+ *
+ * ORDER AND POSITION COME FROM ONE PLACE. The query orders by the canonical
+ * comparator of design section 4.3 and the position is the cursor's absolute
+ * offset plus the row's index — so page 2 continues page 1's numbering without
+ * recomputing anything, and no `position` field is ever stored (section 8.3).
+ *
+ * PAGING IS CURSOR-ONLY. An offset-based page would renumber rows whenever a
+ * concurrent prize lands mid-page; `startAfter` on the full ordering tuple does
+ * not. The cursor is opaque, server-produced and bound to this season and
+ * economy — one minted elsewhere is rejected rather than silently restarted.
+ *
+ * The response carries only the allowlisted projection: no uid, in any field,
+ * and none in the cursor either, because the entry is keyed by `publicPlayerId`.
+ */
+export const getSeasonLeaderboardHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    assertSignedIn(
+      context,
+      "Você precisa estar logado para ver o ranking."
+    );
+
+    assertExactPayload(data ?? {}, ["economy", "seasonId", "limit", "cursor"]);
+
+    const economy = normalizeEconomy((data ?? {}).economy);
+    const seasonId = normalizeMonth((data ?? {}).seasonId).key;
+    const limit = normalizeLimit((data ?? {}).limit);
+
+    const rawCursor = (data ?? {}).cursor;
+    const cursor =
+      rawCursor === undefined || rawCursor === null
+        ? null
+        : decodeCursor(rawCursor, { economy, seasonId });
+
+    let query = seasonEntriesQuery(economy, seasonId)
+      .orderBy("scoreCentavos", "desc")
+      .orderBy("winsCount", "desc")
+      .orderBy("publicPlayerId", "asc");
+
+    if (cursor !== null) {
+      query = query.startAfter(
+        cursor.after.scoreCentavos,
+        cursor.after.winsCount,
+        cursor.after.publicPlayerId
+      );
+    }
+
+    // One extra row decides whether another page exists, without a second query.
+    const snap = await query.limit(limit + 1).get();
+    const page = snap.docs.slice(0, limit);
+    const hasMore = snap.docs.length > limit;
+
+    const startOffset = cursor === null ? 0 : cursor.offset;
+    const entries = page.map((doc, index) =>
+      publicEntry(startOffset + index + 1, doc.data() ?? {})
+    );
+
+    const last = entries[entries.length - 1];
+    const nextCursor =
+      hasMore && last !== undefined
+        ? encodeCursor({
+            economy,
+            seasonId,
+            after: {
+              scoreCentavos: last.scoreCentavos,
+              winsCount: last.winsCount,
+              publicPlayerId: last.publicPlayerId,
+            },
+            offset: startOffset + entries.length,
+          })
+        : null;
+
+    return {
+      success: true,
+      timezone: RANKING_TIMEZONE,
+      amountUnit: "centavos",
+      economy,
+      seasonId,
+      playerCount: await seasonPlayerCount(economy, seasonId),
+      entries,
+      nextCursor,
+    };
+  } catch (error) {
+    console.error("getSeasonLeaderboard error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const getSeasonLeaderboard = central.https.onCall(
+  getSeasonLeaderboardHandler
+);
+
+/**
+ * The caller's own placement in a monthly season.
+ *
+ * THE CALLER IS THE TOKEN. There is no uid in the payload — a player can only
+ * ever ask about themselves — and the uid is never echoed back: it is resolved
+ * to the pseudonym through the server-only identity map, and only the pseudonym
+ * appears in the response.
+ *
+ * THE ORDINAL IS EXACT, not a page scan. Three disjoint counts cover precisely
+ * the entries ahead under section 4.3 — a strictly better score, or the same
+ * score with more wins, or both equal with a lower `publicPlayerId` — so the
+ * answer is identical to the position the paged leaderboard would show, at any
+ * season size.
+ *
+ * A player with no qualifying prize is NOT ranked: `isRanked: false` and
+ * `rank: null`, with no document created and no synthetic zero-score row.
+ */
+export const getMySeasonRankingHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertSignedIn(
+      context,
+      "Você precisa estar logado para ver sua posição."
+    );
+
+    // `uid` is deliberately NOT an accepted key.
+    assertExactPayload(data ?? {}, ["economy", "seasonId"]);
+
+    const economy = normalizeEconomy((data ?? {}).economy);
+    const seasonId = normalizeMonth((data ?? {}).seasonId).key;
+    const uid = normalizeIdentityUid(callerAuth.uid);
+
+    const notRanked = async (): Promise<Record<string, unknown>> => ({
+      success: true,
+      timezone: RANKING_TIMEZONE,
+      amountUnit: "centavos",
+      economy,
+      seasonId,
+      isRanked: false,
+      rank: null,
+      entry: null,
+      playerCount: await seasonPlayerCount(economy, seasonId),
+    });
+
+    // Read-only: an identity is MINTED by settlement, never by a leaderboard
+    // read, so a player who has never been paid stays unregistered.
+    const mapSnap = await db
+      .collection(PUBLIC_PLAYER_ID_COLLECTION)
+      .doc(uid)
+      .get();
+
+    const publicPlayerId = mapSnap.exists
+      ? (mapSnap.data() ?? {}).publicPlayerId
+      : null;
+
+    if (!isPublicPlayerId(publicPlayerId)) {
+      return await notRanked();
+    }
+
+    const entries = seasonEntriesQuery(economy, seasonId);
+    const entrySnap = await entries.doc(publicPlayerId).get();
+    if (!entrySnap.exists) {
+      return await notRanked();
+    }
+
+    const mine = publicEntry(1, entrySnap.data() ?? {});
+    const key: OrderKey = {
+      scoreCentavos: mine.scoreCentavos,
+      winsCount: mine.winsCount,
+      publicPlayerId: mine.publicPlayerId,
+    };
+
+    // Three DISJOINT counts covering exactly the entries ahead (section 9.2).
+    const [betterScore, sameScoreMoreWins, sameScoreSameWinsEarlierId] =
+      await Promise.all([
+        entries.where("scoreCentavos", ">", key.scoreCentavos).count().get(),
+        entries
+          .where("scoreCentavos", "==", key.scoreCentavos)
+          .where("winsCount", ">", key.winsCount)
+          .count()
+          .get(),
+        entries
+          .where("scoreCentavos", "==", key.scoreCentavos)
+          .where("winsCount", "==", key.winsCount)
+          .where("publicPlayerId", "<", key.publicPlayerId)
+          .count()
+          .get(),
+      ]);
+
+    const ahead =
+      betterScore.data().count +
+      sameScoreMoreWins.data().count +
+      sameScoreSameWinsEarlierId.data().count;
+
+    return {
+      success: true,
+      timezone: RANKING_TIMEZONE,
+      amountUnit: "centavos",
+      economy,
+      seasonId,
+      isRanked: true,
+      rank: rankFromAhead(ahead),
+      entry: {
+        publicPlayerId: mine.publicPlayerId,
+        label: mine.label,
+        scoreCentavos: mine.scoreCentavos,
+        winsCount: mine.winsCount,
+      },
+      playerCount: await seasonPlayerCount(economy, seasonId),
+    };
+  } catch (error) {
+    console.error("getMySeasonRanking error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const getMySeasonRanking = central.https.onCall(
+  getMySeasonRankingHandler
+);
 
 /**
  * A Firestore Timestamp (production), a Date (tests), or null for anything

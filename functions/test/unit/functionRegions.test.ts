@@ -70,6 +70,8 @@ const AUTHORIZED_FUNCTIONS: Readonly<Record<string, string>> = {
   recordDailyAppOpen: CENTRAL,
   getPlayerEngagementStats: CENTRAL,
   onPrizeTransactionCreated: CENTRAL,
+  getSeasonLeaderboard: CENTRAL,
+  getMySeasonRanking: CENTRAL,
 };
 
 /**
