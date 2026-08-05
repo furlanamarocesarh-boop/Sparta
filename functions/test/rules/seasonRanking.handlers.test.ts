@@ -742,6 +742,55 @@ describe("idempotência", () => {
     );
   });
 
+  it("parent apagado com entries órfãs falha fechado, sem reconstruir", async () => {
+    // Dois vencedores distintos: o parent chega legitimamente a playerCount 2.
+    await onPrizeTransactionCreatedHandler(await seedPrize(), ACTIVE);
+    await onPrizeTransactionCreatedHandler(
+      await seedPrize({ uid: OTHER, amount: 300 }, "prize_t2"),
+      ACTIVE
+    );
+
+    const healthy = await readDoc(parentPath(ECONOMY_CASH));
+    assert.equal(healthy!.playerCount, 2);
+    assert.equal(healthy!.totalScoreCentavos, 80_000);
+
+    // Fora de banda: apaga SÓ o documento pai. O Firestore preserva a
+    // subcoleção, então as entries sobrevivem órfãs e intactas.
+    await db.doc(parentPath(ECONOMY_CASH)).delete();
+    const orphans = await db
+      .doc(parentPath(ECONOMY_CASH))
+      .collection(SEASON_ENTRIES_SUBCOLLECTION)
+      .get();
+    assert.equal(orphans.size, 2, "as entries precisam sobreviver ao pai");
+
+    // O próximo prêmio de um jogador que JÁ tem entry não pode reconstruir o
+    // parent: isso republicaria playerCount 1 e um total de um prêmio só.
+    const third = await seedPrize({ amount: 100 }, "prize_t3");
+    assert.equal(
+      await expectFailure(() =>
+        onPrizeTransactionCreatedHandler(third, ACTIVE)
+      ),
+      "failed-precondition"
+    );
+
+    // E nada foi escrito: nem parent reconstruído, nem guard do evento.
+    assert.equal(await readDoc(parentPath(ECONOMY_CASH)), null);
+    assert.equal(
+      await readDoc(`${RANKING_EVENTS_COLLECTION}/prize_t3`),
+      null
+    );
+    const stillOrphans = await db
+      .doc(parentPath(ECONOMY_CASH))
+      .collection(SEASON_ENTRIES_SUBCOLLECTION)
+      .get();
+    assert.equal(stillOrphans.size, 2);
+    assert.deepEqual(
+      stillOrphans.docs.map((d) => d.data().scoreCentavos).sort(),
+      orphans.docs.map((d) => d.data().scoreCentavos).sort(),
+      "as entries órfãs não podem ser alteradas"
+    );
+  });
+
   it("um guard incompleto falha fechado", async () => {
     const snap = await seedPrize();
     await onPrizeTransactionCreatedHandler(snap, ACTIVE);

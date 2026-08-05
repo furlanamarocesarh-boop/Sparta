@@ -473,6 +473,13 @@ export type ParentPlan =
  * itself is new. `totalScoreCentavos` always accumulates. The stored window is
  * re-derived and compared rather than trusted, so a parent written under a
  * different calendar interpretation is caught instead of being extended.
+ *
+ * A MISSING parent is only legitimate alongside a NEW entry. Firestore keeps a
+ * subcollection alive after its parent document is deleted, so "no parent but
+ * the entry already exists" is a real, reachable state — and rebuilding from it
+ * would silently republish `playerCount: 1` and a single-prize total over
+ * however many entries actually survive. That is precisely the silent repair the
+ * design forbids, so it fails closed instead.
  */
 export function decideParent(input: {
   readonly event: PrizeRankingEvent;
@@ -483,6 +490,12 @@ export function decideParent(input: {
   const { event, stored, window } = input;
 
   if (stored === null) {
+    if (!input.entryCreated) {
+      throw corrupt(
+        "o parent da temporada não existe, mas a entry do jogador já existe"
+      );
+    }
+
     return {
       kind: "create",
       playerCount: 1,

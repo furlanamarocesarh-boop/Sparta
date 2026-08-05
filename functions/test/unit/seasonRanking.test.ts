@@ -496,6 +496,41 @@ describe("parent — criação sob demanda", () => {
     assert.equal(plan.windowStart.getTime(), window.start.getTime());
     assert.equal(plan.windowEnd.getTime(), window.end.getTime());
   });
+
+  it("parent AUSENTE com entry já existente falha fechado", () => {
+    // O Firestore mantém a subcoleção viva depois que o documento pai é
+    // apagado, então "sem parent, mas com entry" é alcançável de verdade.
+    // Reconstruir daí republicaria playerCount 1 e o total de um único prêmio
+    // por cima de quantas entries tiverem sobrevivido — reparo silencioso, que
+    // o contrato proíbe.
+    assertDomain(
+      () =>
+        decideParent({
+          event: eventOf(),
+          stored: null,
+          entryCreated: false,
+          window: seasonWindow("2026-08"),
+        }),
+      "failed-precondition",
+      "parent ausente com entry existente"
+    );
+  });
+
+  it("nunca devolve um plano de criação quando a entry não é nova", () => {
+    // Blindagem contra regressão: qualquer retorno aqui já seria perda de dados.
+    let returned: unknown = "not called";
+    try {
+      returned = decideParent({
+        event: eventOf(),
+        stored: null,
+        entryCreated: false,
+        window: seasonWindow("2026-08"),
+      });
+    } catch {
+      returned = "threw";
+    }
+    assert.equal(returned, "threw");
+  });
 });
 
 describe("parent — atualização", () => {
