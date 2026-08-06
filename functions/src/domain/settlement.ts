@@ -37,6 +37,22 @@ export type Check = { readonly ok: true } | { readonly ok: false; readonly messa
  * exact allowlist. This is what makes `amount`, `externalid`, `transactionid`,
  * `prize`, `status`, and any stray reference an `invalid-argument` rather than a
  * silently ignored field.
+ *
+ * THE SHAPE IS VALIDATED, NOT JUST THE KEYS. `Object.keys` alone is bypassable:
+ * a JSON body with a `__proto__` member reaches the handler (through the SDK's
+ * `obj[k] = v` decode loop) as an object whose PROTOTYPE carries the smuggled
+ * fields — its own key set is empty, yet `(data ?? {}).x` still resolves them
+ * through the chain. So a payload must also:
+ *
+ *   - sit directly on `Object.prototype` (or none at all) — any other
+ *     prototype is client-controlled;
+ *   - carry no symbol keys — JSON cannot produce them;
+ *   - hold every field as an OWN PLAIN DATA property — no accessors, and the
+ *     own-name enumeration (`getOwnPropertyNames`, not `Object.keys`) also
+ *     catches a literal own `__proto__` / non-enumerable smuggling.
+ *
+ * Every structural rejection uses one GENERIC public message: the shape of a
+ * hostile payload is not information we return to its author.
  */
 export function assertExactPayload(
   data: unknown,
@@ -45,12 +61,30 @@ export function assertExactPayload(
   if (data === null || typeof data !== "object" || Array.isArray(data)) {
     throw new DomainError("invalid-argument", "Payload inválido.");
   }
-  for (const key of Object.keys(data as Record<string, unknown>)) {
+
+  const proto = Object.getPrototypeOf(data);
+  if (proto !== Object.prototype && proto !== null) {
+    throw new DomainError("invalid-argument", "Payload inválido.");
+  }
+
+  if (Object.getOwnPropertySymbols(data).length > 0) {
+    throw new DomainError("invalid-argument", "Payload inválido.");
+  }
+
+  for (const key of Object.getOwnPropertyNames(data)) {
     if (!allowed.includes(key)) {
       throw new DomainError(
         "invalid-argument",
         `Campo não permitido: ${key}.`
       );
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(data, key);
+    if (
+      descriptor === undefined ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
+      throw new DomainError("invalid-argument", "Payload inválido.");
     }
   }
 }

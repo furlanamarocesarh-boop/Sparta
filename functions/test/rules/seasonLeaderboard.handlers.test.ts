@@ -51,6 +51,17 @@ const SEASON = "2026-08";
  */
 const TEST_CURSOR_SECRET = "emulator-cursor-signing-key-0123456789ab";
 
+/**
+ * Deterministic clock: EVERY test in this suite runs "at" 2026-08-15 12:00 in
+ * São Paulo — inside the fixed SEASON's month — injected through the internal
+ * `now` seam, so nothing here depends on the real wall clock and the suite
+ * stays green after August 2027 when 2026-08 leaves the retention window. A
+ * test that needs a different instant (the retention boundaries) passes its
+ * own `now`, which wins via the spread. Production keeps the REAL clock: the
+ * seam exists only in the handlers' internal options, never in the payload.
+ */
+const FIXED_NOW = new Date("2026-08-15T15:00:00Z");
+
 /** Deterministic pseudonyms, ascending so tie-break order is predictable. */
 const IDS = [
   "Aaaaaaaaaaaaaaaaaaaaaa",
@@ -73,8 +84,16 @@ before(async () => {
     getSeasonLeaderboardHandler: Handler;
     getMySeasonRankingHandler: Handler;
   };
-  getSeasonLeaderboardHandler = mod.getSeasonLeaderboardHandler;
-  getMySeasonRankingHandler = mod.getMySeasonRankingHandler;
+  getSeasonLeaderboardHandler = (data, context, options = {}) =>
+    mod.getSeasonLeaderboardHandler(data, context, {
+      now: FIXED_NOW,
+      ...options,
+    });
+  getMySeasonRankingHandler = (data, context, options = {}) =>
+    mod.getMySeasonRankingHandler(data, context, {
+      now: FIXED_NOW,
+      ...options,
+    });
   db = admin.firestore();
 });
 
@@ -1128,6 +1147,12 @@ describe("getMySeasonRanking — conjunto elegível", () => {
       ],
       "o leaderboard serve exatamente A e C"
     );
+    assert.equal(
+      board.playerCount,
+      2,
+      "o playerCount do LEADERBOARD também vem do conjunto elegível — o " +
+        "parent declara 3 e a resposta mesmo assim diz 2"
+    );
 
     const mine = await getMySeasonRankingHandler(
       { economy: ECONOMY_CASH, seasonId: SEASON },
@@ -1152,13 +1177,16 @@ describe("getMySeasonRanking — conjunto elegível", () => {
       { publicPlayerId: "Zzzzzzzzzzzzzzzzzzzzzz", winsCount: 99 },
     ],
   ] as const) {
-    it(`entry ${label} não altera rank nem playerCount de ninguém`, async () => {
+    it(`entry ${label} não altera rank nem NENHUM dos dois playerCount`, async () => {
       await seedStandardSeason();
       await seedMalformedEntry("Zzzzzzzzzzzzzzzzzzzzzz", {
         economy: ECONOMY_CASH,
         seasonId: SEASON,
         ...fields,
       });
+      // O parent declara 6 — o valor materializado, contando a entry
+      // malformada — para provar que AMBAS as respostas usam o count elegível.
+      await seedParent(ECONOMY_CASH, 6, 1100);
       await bindIdentity("uid-c", IDS[2]); // C: 200/2 -> posição 3
 
       const board = await getSeasonLeaderboardHandler(
@@ -1169,6 +1197,11 @@ describe("getMySeasonRanking — conjunto elegível", () => {
         (board.entries as any[]).length,
         5,
         "o leaderboard continua servindo só as 5 entries completas"
+      );
+      assert.equal(
+        board.playerCount,
+        5,
+        "o playerCount do leaderboard vem do conjunto elegível"
       );
 
       const mine = await getMySeasonRankingHandler(
@@ -1362,5 +1395,263 @@ describe("retenção — somente a temporada corrente e as 11 anteriores", () =>
       }
     }
     assert.equal(messages[0], messages[1], "uma única mensagem pública");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Payload endurecido — protótipo, herança, accessors e symbols
+// ---------------------------------------------------------------------------
+
+describe("payload endurecido — protótipo e campos herdados", () => {
+  // Valores-canário: se qualquer um vazar numa mensagem de erro, o teste de
+  // discrição falha. Nenhum deles é, ou deriva de, um segredo real.
+  const CANARY_SECRET = "canary-attacker-chosen-key-0123456789abcdef";
+  const CANARY_VALUE = "canary-smuggled-value-xyz";
+
+  const VALID = { economy: ECONOMY_CASH, seasonId: SEASON };
+
+  /** Both ranking callables, invoked at runtime through the wrapped handlers. */
+  const CALLABLES: ReadonlyArray<
+    [string, (data: unknown) => Promise<Record<string, unknown>>]
+  > = [
+    ["getSeasonLeaderboard", (data) => getSeasonLeaderboardHandler(data, ctxOf("u1"))],
+    ["getMySeasonRanking", (data) => getMySeasonRankingHandler(data, ctxOf("u1"))],
+  ];
+
+  /** Captures the error an invocation raises, code and message. */
+  async function capture(
+    fn: () => Promise<unknown>
+  ): Promise<{ code: string; message: string }> {
+    try {
+      await fn();
+    } catch (error) {
+      return {
+        code: String((error as { code?: unknown }).code ?? "NO_CODE"),
+        message: String((error as Error).message ?? ""),
+      };
+    }
+    return assert.fail("esperava uma rejeição, mas resolveu");
+  }
+
+  it("payload normal continua aceito nas duas callables", async () => {
+    await seedStandardSeason();
+    await bindIdentity("uid-a", IDS[0]);
+
+    const board = await getSeasonLeaderboardHandler({ ...VALID }, ctxOf("u1"));
+    assert.equal(board.success, true);
+
+    const mine = await getMySeasonRankingHandler({ ...VALID }, ctxOf("uid-a"));
+    assert.equal(mine.success, true);
+    assert.equal(mine.rank, 1);
+  });
+
+  it("REJEITA campos válidos que existem SOMENTE no protótipo", async () => {
+    // Exatamente o bypass: Object.keys(payload) fica vazio, mas (data ?? {}).x
+    // resolveria pela cadeia de protótipos.
+    for (const [name, call] of CALLABLES) {
+      const smuggled = Object.create({ ...VALID });
+      const res = await capture(() => call(smuggled));
+      assert.equal(res.code, "invalid-argument", name);
+    }
+  });
+
+  it("REJEITA cursorSecret herdado — a chave nunca pode vir do payload", async () => {
+    const smuggled = Object.create({ ...VALID, cursorSecret: CANARY_SECRET });
+    const res = await capture(() =>
+      getSeasonLeaderboardHandler(smuggled, ctxOf("u1"))
+    );
+    assert.equal(res.code, "invalid-argument");
+    assert.ok(!res.message.includes(CANARY_SECRET), "canário não pode vazar");
+  });
+
+  it("REJEITA now herdado — o relógio nunca pode vir do payload", async () => {
+    for (const [name, call] of CALLABLES) {
+      const smuggled = Object.create({
+        ...VALID,
+        now: new Date("2030-01-01T00:00:00Z"),
+      });
+      const res = await capture(() => call(smuggled));
+      assert.equal(res.code, "invalid-argument", name);
+    }
+  });
+
+  it("REJEITA campo extra herdado", async () => {
+    for (const [name, call] of CALLABLES) {
+      const smuggled = Object.create({ ...VALID, bogus: CANARY_VALUE });
+      const res = await capture(() => call(smuggled));
+      assert.equal(res.code, "invalid-argument", name);
+      assert.ok(!res.message.includes(CANARY_VALUE), `${name}: canário vazou`);
+    }
+  });
+
+  it("REJEITA a propriedade PRÓPRIA __proto__ criada por JSON.parse", async () => {
+    // JSON.parse não invoca o setter — cria uma própria enumerável "__proto__".
+    const parsed = JSON.parse(
+      `{"economy":"${ECONOMY_CASH}","seasonId":"${SEASON}","__proto__":{"bogus":1}}`
+    );
+    for (const [name, call] of CALLABLES) {
+      const res = await capture(() => call(parsed));
+      assert.equal(res.code, "invalid-argument", name);
+    }
+  });
+
+  it("REJEITA array e objeto com protótipo personalizado", async () => {
+    for (const [name, call] of CALLABLES) {
+      // Array continua rejeitado.
+      assert.equal((await capture(() => call([]))).code, "invalid-argument", name);
+
+      // Protótipo de terceiros com campos próprios VÁLIDOS: a forma é hostil
+      // mesmo quando o conteúdo parece certo.
+      const custom = Object.create({ polluted: true });
+      custom.economy = ECONOMY_CASH;
+      custom.seasonId = SEASON;
+      assert.equal(
+        (await capture(() => call(custom))).code,
+        "invalid-argument",
+        `${name}: protótipo personalizado`
+      );
+    }
+  });
+
+  it("REJEITA accessor em campo permitido e symbol key", async () => {
+    for (const [name, call] of CALLABLES) {
+      // Getter num campo da allowlist: valor computado sob demanda é hostil.
+      const withGetter: Record<string, unknown> = { seasonId: SEASON };
+      Object.defineProperty(withGetter, "economy", {
+        enumerable: true,
+        get: () => ECONOMY_CASH,
+      });
+      assert.equal(
+        (await capture(() => call(withGetter))).code,
+        "invalid-argument",
+        `${name}: accessor`
+      );
+
+      // Symbol key nunca pertence a um payload JSON.
+      const withSymbol: Record<string | symbol, unknown> = { ...VALID };
+      (withSymbol as Record<symbol, unknown>)[Symbol("contrabando")] = 1;
+      assert.equal(
+        (await capture(() => call(withSymbol))).code,
+        "invalid-argument",
+        `${name}: symbol`
+      );
+    }
+  });
+
+  it("REJEITA as opções internas como chaves PRÓPRIAS do payload", async () => {
+    // O caminho antigo (allowlist) continua fechado para as seams.
+    for (const [payload, call] of [
+      [{ ...VALID, cursorSecret: CANARY_SECRET }, CALLABLES[0][1]],
+      [{ ...VALID, now: "2030-01-01" }, CALLABLES[0][1]],
+      [{ ...VALID, now: "2030-01-01" }, CALLABLES[1][1]],
+      [{ ...VALID, afterFirstRead: 1 }, CALLABLES[1][1]],
+    ] as const) {
+      const res = await capture(() => call(payload));
+      assert.equal(res.code, "invalid-argument");
+      assert.ok(!res.message.includes(CANARY_SECRET));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Parent malformado — falha fechada nas duas callables
+// ---------------------------------------------------------------------------
+
+describe("parent malformado — falha fechada nas duas callables", () => {
+  /** Overwrites the season parent with an arbitrary (possibly bad) counter. */
+  async function seedParentWithCounter(playerCount: unknown): Promise<void> {
+    const base: Record<string, unknown> = {
+      economy: ECONOMY_CASH,
+      seasonId: SEASON,
+      timezone: "America/Sao_Paulo",
+      totalScoreCentavos: 1100,
+      windowStart: admin.firestore.Timestamp.fromDate(
+        new Date("2026-08-01T03:00:00Z")
+      ),
+      windowEnd: admin.firestore.Timestamp.fromDate(
+        new Date("2026-09-01T03:00:00Z")
+      ),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    if (playerCount !== undefined) base.playerCount = playerCount;
+    await parentRef(ECONOMY_CASH).set(base);
+  }
+
+  for (const [label, bad] of [
+    ["ausente", undefined],
+    ["com tipo incorreto (string)", "5"],
+    ["negativo", -1],
+    ["não inteiro", 2.5],
+    ["NaN", NaN],
+  ] as const) {
+    it(`playerCount ${label}: ambas as callables falham fechado`, async () => {
+      await seedStandardSeason();
+      await seedParentWithCounter(bad);
+      await bindIdentity("uid-a", IDS[0]);
+
+      for (const [name, fail] of [
+        [
+          "getMySeasonRanking",
+          () =>
+            getMySeasonRankingHandler(
+              { economy: ECONOMY_CASH, seasonId: SEASON },
+              ctxOf("uid-a")
+            ),
+        ],
+        [
+          "getSeasonLeaderboard",
+          () =>
+            getSeasonLeaderboardHandler(
+              { economy: ECONOMY_CASH, seasonId: SEASON },
+              ctxOf("uid-a")
+            ),
+        ],
+      ] as const) {
+        assert.equal(
+          await expectFailure(fail),
+          "failed-precondition",
+          `${name}: parent malformado deve falhar fechado`
+        );
+      }
+    });
+  }
+
+  it("a mensagem pública não revela o valor malformado", async () => {
+    await seedStandardSeason();
+    await seedParentWithCounter("valor-canario-97531");
+    await bindIdentity("uid-a", IDS[0]);
+
+    try {
+      await getMySeasonRankingHandler(
+        { economy: ECONOMY_CASH, seasonId: SEASON },
+        ctxOf("uid-a")
+      );
+      assert.fail("deveria ter falhado");
+    } catch (error) {
+      assert.ok(
+        !String((error as Error).message).includes("97531"),
+        "o valor armazenado não pode aparecer na mensagem"
+      );
+    }
+  });
+
+  it("mismatch de um contador VÁLIDO não muda a resposta elegível", async () => {
+    // Contrato deste passo: formato é validado, igualdade NÃO é exigida.
+    await seedStandardSeason();
+    await seedParentWithCounter(42); // válido, mas diferente das 5 elegíveis
+    await bindIdentity("uid-a", IDS[0]);
+
+    const board = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-a")
+    );
+    assert.equal(board.playerCount, 5, "leaderboard responde o count elegível");
+
+    const mine = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-a")
+    );
+    assert.equal(mine.rank, 1);
+    assert.equal(mine.playerCount, 5, "posição responde o count elegível");
   });
 });

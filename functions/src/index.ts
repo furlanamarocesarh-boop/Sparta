@@ -2708,22 +2708,29 @@ function seasonEntriesQuery(
     .collection(SEASON_ENTRIES_SUBCOLLECTION);
 }
 
-/** `playerCount` from the season parent, or 0 while the season has no entries. */
-async function seasonPlayerCount(
-  economy: RankingEconomy,
-  seasonId: string
-): Promise<number> {
-  const snap = await db
-    .collection(SEASON_RANKINGS_COLLECTION)
-    .doc(seasonDocumentId(economy, seasonId))
-    .get();
-
-  if (!snap.exists) return 0;
-
-  const stored = (snap.data() ?? {}).playerCount;
-  return typeof stored === "number" && Number.isSafeInteger(stored) && stored >= 0
-    ? stored
-    : 0;
+/**
+ * Fails closed when a season parent EXISTS but its stored counter is
+ * malformed — absent, non-numeric, negative or fractional.
+ *
+ * The write path (`decideParent`) never produces such a document, so one is
+ * out-of-band corruption; serving a ranking from it would silently endorse a
+ * state the domain forbids. The counter's VALUE is deliberately not compared
+ * to the eligible count here (the response derives from the aggregate, not
+ * from this field), and the malformed value never reaches the public message.
+ */
+function assertParentCounterShape(parentData: Record<string, unknown>): void {
+  const stored = parentData.playerCount;
+  if (
+    typeof stored !== "number" ||
+    !Number.isSafeInteger(stored) ||
+    stored < 0
+  ) {
+    throw new DomainError(
+      "failed-precondition",
+      "Documento de ranking inconsistente: o contador de jogadores da " +
+        "temporada é inválido."
+    );
+  }
 }
 
 /**
@@ -2802,11 +2809,16 @@ export const getSeasonLeaderboardHandler = async (
         ? null
         : decodeCursor(rawCursor, { economy, seasonId }, cursorSecret);
 
-    let query = seasonEntriesQuery(economy, seasonId)
+    // The ELIGIBLE set: the ordered page and the total below share this exact
+    // shape, so the rows served and the playerCount published can never
+    // describe different sets (§8.3) — an entry missing any comparator field
+    // is invisible to both, and both are served by the one declared index.
+    const eligible = seasonEntriesQuery(economy, seasonId)
       .orderBy("scoreCentavos", "desc")
       .orderBy("winsCount", "desc")
       .orderBy("publicPlayerId", "asc");
 
+    let query: admin.firestore.Query = eligible;
     if (cursor !== null) {
       query = query.startAfter(
         cursor.after.scoreCentavos,
@@ -2815,10 +2827,39 @@ export const getSeasonLeaderboardHandler = async (
       );
     }
 
-    // One extra row decides whether another page exists, without a second query.
-    const snap = await query.limit(limit + 1).get();
-    const page = snap.docs.slice(0, limit);
-    const hasMore = snap.docs.length > limit;
+    // ── ONE consistent snapshot ─────────────────────────────────────────────
+    // Parent (structural validation), the page and the eligible total are read
+    // through the SAME read-only transaction: the rows and the playerCount of
+    // one response always belong to one state of the season. `readOnly: true`
+    // makes a write structurally impossible on this path.
+    const snapshot = await db.runTransaction(
+      async (transaction) => {
+        const parentSnap = await transaction.get(
+          db
+            .collection(SEASON_RANKINGS_COLLECTION)
+            .doc(seasonDocumentId(economy, seasonId))
+        );
+        if (parentSnap.exists) {
+          assertParentCounterShape(parentSnap.data() ?? {});
+        }
+
+        // One extra row decides whether another page exists, without a second
+        // query.
+        const [pageSnap, totalSnap] = await Promise.all([
+          transaction.get(query.limit(limit + 1)),
+          transaction.get(eligible.count()),
+        ]);
+
+        return {
+          docs: pageSnap.docs,
+          playerCount: totalSnap.data().count,
+        };
+      },
+      { readOnly: true }
+    );
+
+    const page = snapshot.docs.slice(0, limit);
+    const hasMore = snapshot.docs.length > limit;
 
     const startOffset = cursor === null ? 0 : cursor.offset;
     const entries = page.map((doc, index) =>
@@ -2849,7 +2890,7 @@ export const getSeasonLeaderboardHandler = async (
       amountUnit: "centavos",
       economy,
       seasonId,
-      playerCount: await seasonPlayerCount(economy, seasonId),
+      playerCount: snapshot.playerCount,
       entries,
       nextCursor,
     };
@@ -3003,6 +3044,10 @@ export const getMySeasonRankingHandler = async (
           }
           return { ranked: false as const, playerCount: 0 };
         }
+
+        // The parent exists: its stored counter must at least be well-formed,
+        // even though the RESPONSE derives from the eligible aggregate.
+        assertParentCounterShape(parentSnap.data() ?? {});
 
         if (entrySnap === null || !entrySnap.exists) {
           const total = await transaction.get(eligible.count());
