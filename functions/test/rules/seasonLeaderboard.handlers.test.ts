@@ -991,3 +991,376 @@ describe("getMySeasonRanking — snapshot único e consistente", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// Reauditoria — cenários que isolam CADA aggregate individualmente
+// ---------------------------------------------------------------------------
+
+describe("getMySeasonRanking — isolamento por aggregate", () => {
+  // O teste original de concorrência só discrimina o 1º count (score maior).
+  // Estes dois cenários movem um concorrente para dentro de EXATAMENTE um dos
+  // outros dois conjuntos, então cada um falha se — e somente se — o SEU
+  // aggregate escapar da transação.
+
+  it("Cenário A — SÓ o segundo count muda: wins de um empatado em score", async () => {
+    await seedStandardSeason();
+    await bindIdentity("uid-c", IDS[2]); // C: 200/2 -> posição 3
+
+    let fired = 0;
+    const res = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-c"),
+      {
+        afterFirstRead: async () => {
+          fired += 1;
+          // E: 100/1 -> 200/3. Para C isso altera EXCLUSIVAMENTE o 2º conjunto:
+          //   1º (score > 200): E chega EM 200, não acima — inalterado {A};
+          //   2º (==200, wins > 2): E entra — {B} vira {B, E};
+          //   3º (==200, ==2, id < C): E tem id posterior a C — inalterado {};
+          //   elegível: E já existia — count total inalterado (5).
+          await seedEntry(ECONOMY_CASH, IDS[4], 200, 3);
+        },
+      }
+    );
+
+    assert.equal(fired, 1, "a seam precisa disparar exatamente uma vez");
+    assert.equal(res.isRanked, true);
+    assert.equal(
+      res.rank,
+      3,
+      "o 2º count veio do snapshot — um vazamento SÓ dele já daria 4"
+    );
+    assert.equal(res.playerCount, 5, "playerCount do mesmo snapshot");
+
+    // A escrita era real: fora da transação o estado novo vale.
+    const depois = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-c")
+    );
+    assert.equal(depois.rank, 4, "a escrita concorrente foi efetiva");
+    assert.equal(depois.playerCount, 5);
+  });
+
+  it("Cenário B — SÓ o terceiro count muda: empate total com id anterior", async () => {
+    // X: id lexicograficamente ANTERIOR a C, seed inicial fora dos três
+    // conjuntos à frente de C (100/1 não supera nem empata os 200 de C).
+    const X = "Baaaaaaaaaaaaaaaaaaaaa";
+    await seedStandardSeason();
+    await seedEntry(ECONOMY_CASH, X, 100, 1);
+    await seedParent(ECONOMY_CASH, 6, 1200);
+    await bindIdentity("uid-c", IDS[2]); // C: 200/2
+
+    let fired = 0;
+    const res = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-c"),
+      {
+        afterFirstRead: async () => {
+          fired += 1;
+          // X: 100/1 -> 200/2. Para C isso altera EXCLUSIVAMENTE o 3º conjunto:
+          //   1º (score > 200): X chega EM 200 — inalterado {A};
+          //   2º (==200, wins > 2): X empata em 2, não supera — inalterado {B};
+          //   3º (==200, ==2, id < C): "Baaa…" < "Cccc…" — {} vira {X};
+          //   elegível: X já existia — count total inalterado (6).
+          await seedEntry(ECONOMY_CASH, X, 200, 2);
+        },
+      }
+    );
+
+    assert.equal(fired, 1, "a seam precisa disparar exatamente uma vez");
+    assert.equal(res.isRanked, true);
+    assert.equal(
+      res.rank,
+      3,
+      "o 3º count veio do snapshot — um vazamento SÓ dele já daria 4"
+    );
+    assert.equal(res.playerCount, 6, "playerCount do mesmo snapshot");
+
+    const depois = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-c")
+    );
+    assert.equal(depois.rank, 4, "a escrita concorrente foi efetiva");
+    assert.equal(depois.playerCount, 6);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reauditoria — conjunto elegível: paridade estrutural com o leaderboard
+// ---------------------------------------------------------------------------
+
+describe("getMySeasonRanking — conjunto elegível", () => {
+  /** Uma entry estruturalmente incompleta, escrita como um write fora de banda. */
+  async function seedMalformedEntry(
+    id: string,
+    fields: Record<string, unknown>
+  ): Promise<void> {
+    await parentRef(ECONOMY_CASH)
+      .collection(SEASON_ENTRIES_SUBCOLLECTION)
+      .doc(id)
+      .set(fields);
+  }
+
+  it("entry sem winsCount é invisível para o leaderboard E para o rank", async () => {
+    // O cenário exato do probe da reauditoria: A 300/2, C 200/2 e uma entry
+    // Z com score 500 mas SEM winsCount. O parent declara 3 — o valor
+    // materializado — para provar que playerCount vem do count elegível.
+    await seedEntry(ECONOMY_CASH, IDS[0], 300, 2);
+    await seedEntry(ECONOMY_CASH, IDS[2], 200, 2);
+    await seedParent(ECONOMY_CASH, 3, 1000);
+    await seedMalformedEntry("Zzzzzzzzzzzzzzzzzzzzzz", {
+      publicPlayerId: "Zzzzzzzzzzzzzzzzzzzzzz",
+      economy: ECONOMY_CASH,
+      seasonId: SEASON,
+      scoreCentavos: 500,
+    });
+    await bindIdentity("uid-c", IDS[2]);
+
+    const board = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-c")
+    );
+    assert.deepEqual(
+      (board.entries as any[]).map((e) => [e.publicPlayerId, e.position]),
+      [
+        [IDS[0], 1],
+        [IDS[2], 2],
+      ],
+      "o leaderboard serve exatamente A e C"
+    );
+
+    const mine = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-c")
+    );
+    assert.equal(mine.rank, 2, "o mesmo ordinal que o leaderboard mostra");
+    assert.equal(
+      mine.playerCount,
+      2,
+      "playerCount conta o conjunto ELEGÍVEL, não o materializado"
+    );
+  });
+
+  for (const [label, fields] of [
+    [
+      "sem winsCount",
+      { publicPlayerId: "Zzzzzzzzzzzzzzzzzzzzzz", scoreCentavos: 999 },
+    ],
+    ["sem publicPlayerId", { scoreCentavos: 999, winsCount: 9 }],
+    [
+      "sem scoreCentavos",
+      { publicPlayerId: "Zzzzzzzzzzzzzzzzzzzzzz", winsCount: 99 },
+    ],
+  ] as const) {
+    it(`entry ${label} não altera rank nem playerCount de ninguém`, async () => {
+      await seedStandardSeason();
+      await seedMalformedEntry("Zzzzzzzzzzzzzzzzzzzzzz", {
+        economy: ECONOMY_CASH,
+        seasonId: SEASON,
+        ...fields,
+      });
+      await bindIdentity("uid-c", IDS[2]); // C: 200/2 -> posição 3
+
+      const board = await getSeasonLeaderboardHandler(
+        { economy: ECONOMY_CASH, seasonId: SEASON },
+        ctxOf("uid-c")
+      );
+      assert.equal(
+        (board.entries as any[]).length,
+        5,
+        "o leaderboard continua servindo só as 5 entries completas"
+      );
+
+      const mine = await getMySeasonRankingHandler(
+        { economy: ECONOMY_CASH, seasonId: SEASON },
+        ctxOf("uid-c")
+      );
+      assert.equal(mine.rank, 3, "o rank de C não se move");
+      assert.equal(mine.playerCount, 5, "o playerCount elegível não se move");
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Reauditoria — parent e entry, todas as combinações
+// ---------------------------------------------------------------------------
+
+describe("getMySeasonRanking — parent e entry", () => {
+  it("parent e entry ausentes: não ranqueado com playerCount 0", async () => {
+    await bindIdentity("uid-x", "Xxxxxxxxxxxxxxxxxxxxxx");
+
+    const res = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-x")
+    );
+
+    assert.equal(res.isRanked, false);
+    assert.equal(res.rank, null);
+    assert.equal(res.entry, null);
+    assert.equal(res.playerCount, 0);
+  });
+
+  it("parent AUSENTE com entry EXISTENTE falha fechado — nunca rank com playerCount 0", async () => {
+    // O mesmo estado que o write path (decideParent) já trata como corrupção.
+    await seedEntry(ECONOMY_CASH, IDS[2], 200, 2); // entry sem parent
+    await bindIdentity("uid-c", IDS[2]);
+
+    assert.equal(
+      await expectFailure(() =>
+        getMySeasonRankingHandler(
+          { economy: ECONOMY_CASH, seasonId: SEASON },
+          ctxOf("uid-c")
+        )
+      ),
+      "failed-precondition",
+      "a leitura responde do mesmo invariante fail-closed do write path"
+    );
+  });
+
+  it("parent EXISTENTE com entry ausente: não ranqueado com o playerCount elegível", async () => {
+    await seedStandardSeason();
+    await bindIdentity("uid-x", "Xxxxxxxxxxxxxxxxxxxxxx");
+
+    const res = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-x")
+    );
+
+    assert.equal(res.isRanked, false);
+    assert.equal(res.rank, null);
+    assert.equal(res.playerCount, 5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reauditoria — retenção: a janela de 12 temporadas (§8.4)
+// ---------------------------------------------------------------------------
+
+describe("retenção — somente a temporada corrente e as 11 anteriores", () => {
+  // Relógios determinísticos, meio do mês para ficar longe de qualquer borda
+  // de fuso. SEASON = 2026-08 em todos os casos; o que muda é o "agora".
+  const AGO_2026 = new Date("2026-08-15T12:00:00Z"); // corrente: idade 0
+  const JUL_2027 = new Date("2027-07-15T12:00:00Z"); // 11ª anterior (cruza o ano)
+  const AGO_2027 = new Date("2027-08-15T12:00:00Z"); // 12ª anterior: expira
+  const FUTURA = "2026-09"; // com AGO_2026, um mês no futuro
+
+  it("getSeasonLeaderboard serve a temporada corrente", async () => {
+    await seedStandardSeason();
+    const res = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("u1"),
+      { now: AGO_2026 }
+    );
+    assert.equal(res.success, true);
+    assert.equal((res.entries as any[]).length, 5);
+  });
+
+  it("getSeasonLeaderboard serve a 11ª temporada anterior, cruzando o ano", async () => {
+    await seedStandardSeason();
+    const res = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("u1"),
+      { now: JUL_2027 }
+    );
+    assert.equal(res.success, true);
+    assert.equal((res.entries as any[]).length, 5);
+  });
+
+  it("getSeasonLeaderboard REJEITA a 12ª temporada anterior", async () => {
+    await seedStandardSeason();
+    assert.equal(
+      await expectFailure(() =>
+        getSeasonLeaderboardHandler(
+          { economy: ECONOMY_CASH, seasonId: SEASON },
+          ctxOf("u1"),
+          { now: AGO_2027 }
+        )
+      ),
+      "invalid-argument"
+    );
+  });
+
+  it("getSeasonLeaderboard REJEITA uma temporada futura", async () => {
+    assert.equal(
+      await expectFailure(() =>
+        getSeasonLeaderboardHandler(
+          { economy: ECONOMY_CASH, seasonId: FUTURA },
+          ctxOf("u1"),
+          { now: AGO_2026 }
+        )
+      ),
+      "invalid-argument"
+    );
+  });
+
+  it("getMySeasonRanking serve a temporada corrente", async () => {
+    await seedStandardSeason();
+    await bindIdentity("uid-a", IDS[0]);
+    const res = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-a"),
+      { now: AGO_2026 }
+    );
+    assert.equal(res.rank, 1);
+  });
+
+  it("getMySeasonRanking serve a 11ª temporada anterior, cruzando o ano", async () => {
+    await seedStandardSeason();
+    await bindIdentity("uid-a", IDS[0]);
+    const res = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-a"),
+      { now: JUL_2027 }
+    );
+    assert.equal(res.rank, 1);
+  });
+
+  it("getMySeasonRanking REJEITA a 12ª temporada anterior", async () => {
+    await seedStandardSeason();
+    await bindIdentity("uid-a", IDS[0]);
+    assert.equal(
+      await expectFailure(() =>
+        getMySeasonRankingHandler(
+          { economy: ECONOMY_CASH, seasonId: SEASON },
+          ctxOf("uid-a"),
+          { now: AGO_2027 }
+        )
+      ),
+      "invalid-argument"
+    );
+  });
+
+  it("getMySeasonRanking REJEITA uma temporada futura", async () => {
+    assert.equal(
+      await expectFailure(() =>
+        getMySeasonRankingHandler(
+          { economy: ECONOMY_CASH, seasonId: FUTURA },
+          ctxOf("u1"),
+          { now: AGO_2026 }
+        )
+      ),
+      "invalid-argument"
+    );
+  });
+
+  it("a mensagem de rejeição é GENÉRICA: igual para expirada e futura", async () => {
+    // Distinguir expirada de futura revelaria quais temporadas têm dados.
+    const messages: string[] = [];
+    for (const [seasonId, now] of [
+      [SEASON, AGO_2027],
+      [FUTURA, AGO_2026],
+    ] as const) {
+      try {
+        await getSeasonLeaderboardHandler(
+          { economy: ECONOMY_CASH, seasonId },
+          ctxOf("u1"),
+          { now }
+        );
+        assert.fail("deveria ter sido rejeitada");
+      } catch (error) {
+        messages.push((error as Error).message);
+      }
+    }
+    assert.equal(messages[0], messages[1], "uma única mensagem pública");
+  });
+});

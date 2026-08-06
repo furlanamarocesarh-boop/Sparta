@@ -16,7 +16,15 @@ import { describe, it } from "node:test";
  */
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-type ExportedFn = { __trigger?: { regions?: string[] } };
+type ExportedFn = {
+  __trigger?: { regions?: string[] };
+  __endpoint?: {
+    region?: string[];
+    platform?: string;
+    callableTrigger?: unknown;
+    secretEnvironmentVariables?: Array<{ key?: unknown }>;
+  };
+};
 
 // O index compilado fica em lib-test/src/index.js quando compilado por
 // tsconfig.test.json (rootDir = ".").
@@ -31,6 +39,21 @@ async function loadFunctions(): Promise<Record<string, ExportedFn>> {
 /** A região declarada de um export Gen 1 v1. */
 function regionOf(fn: ExportedFn): string[] | undefined {
   return fn.__trigger?.regions;
+}
+
+/**
+ * Os secrets que o ARTEFATO realmente declara para um export.
+ *
+ * Lidos de `__endpoint.secretEnvironmentVariables` — a representação que o
+ * deploy consome — e não do texto-fonte, porque o defeito que este teste trava
+ * é invisível no fonte: `FunctionBuilder.prototype.runWith()` MUTA o builder
+ * compartilhado e retorna `this`, então um `central.runWith({secrets})` contamina
+ * silenciosamente todo export declarado depois dele.
+ */
+function secretsOf(fn: ExportedFn): string[] {
+  return (fn.__endpoint?.secretEnvironmentVariables ?? [])
+    .map((s) => String(s.key))
+    .sort();
 }
 
 const CENTRAL = "us-central1";
@@ -72,6 +95,18 @@ const AUTHORIZED_FUNCTIONS: Readonly<Record<string, string>> = {
   onPrizeTransactionCreated: CENTRAL,
   getSeasonLeaderboard: CENTRAL,
   getMySeasonRanking: CENTRAL,
+};
+
+/**
+ * THE SECRET MANIFEST — which deployable Functions may declare which secrets.
+ *
+ * Least privilege, stated once and closed: a Function absent from this map may
+ * declare NO secret at all. Today exactly one callable holds exactly one secret
+ * — the cursor-signing key of the leaderboard. `getMySeasonRanking` never signs
+ * or verifies a cursor, so it must not carry the key.
+ */
+const AUTHORIZED_SECRETS: Readonly<Record<string, readonly string[]>> = {
+  getSeasonLeaderboard: ["RANKING_CURSOR_HMAC_SECRET"],
 };
 
 /**
@@ -151,6 +186,46 @@ describe("regiões explícitas por função", () => {
         `${name} deve ter exatamente uma região explícita — ` +
           `esquecer .region(...) faz o deploy cair no default ${CENTRAL}`
       );
+    }
+  });
+
+  it("cada Function declara EXATAMENTE os secrets autorizados — verificado no ARTEFATO", async () => {
+    const fns = await loadFunctions();
+
+    // Nenhum secret autorizado pode apontar para uma Function fora do manifest.
+    for (const name of Object.keys(AUTHORIZED_SECRETS)) {
+      assert.ok(
+        Object.prototype.hasOwnProperty.call(AUTHORIZED_FUNCTIONS, name),
+        `${name} tem secret autorizado mas não é uma Function autorizada`
+      );
+    }
+
+    for (const name of Object.keys(AUTHORIZED_FUNCTIONS)) {
+      const expected = [...(AUTHORIZED_SECRETS[name] ?? [])].sort();
+      assert.deepEqual(
+        secretsOf(fns[name]),
+        expected,
+        expected.length > 0
+          ? `${name} deve declarar exatamente [${expected.join(", ")}]`
+          : `${name} NÃO pode declarar secret nenhum. Se este teste falhou, ` +
+            `provavelmente um runWith({secrets}) rodou no builder COMPARTILHADO ` +
+            `e contaminou os exports declarados depois dele — use um builder ` +
+            `exclusivo: region(...).runWith({secrets}).https.onCall(...)`
+      );
+    }
+  });
+
+  it("as callables do ranking continuam Gen1, callable e na região autorizada", async () => {
+    const fns = await loadFunctions();
+    for (const name of ["getSeasonLeaderboard", "getMySeasonRanking"]) {
+      const endpoint = fns[name]?.__endpoint;
+      assert.ok(endpoint, `${name} não expõe __endpoint`);
+      assert.equal(endpoint.platform, "gcfv1", `${name} deve continuar Gen1`);
+      assert.ok(
+        endpoint.callableTrigger !== undefined,
+        `${name} deve continuar callable`
+      );
+      assert.deepEqual(endpoint.region, [CENTRAL], `${name} deve estar em ${CENTRAL}`);
     }
   });
 

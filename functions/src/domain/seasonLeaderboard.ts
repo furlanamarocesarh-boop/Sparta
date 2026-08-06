@@ -58,6 +58,52 @@ export function normalizeEconomy(raw: unknown): RankingEconomy {
   throw invalidArgument('Economia inválida. Use "cash" ou "beta_credit".');
 }
 
+// ── Retention ───────────────────────────────────────────────────────────────
+
+/**
+ * Design section 8.4 (frozen): the current season plus the 11 preceding
+ * monthly seasons stay servable — a rolling window of at most 12. Older
+ * seasons are simply not served, and neither is a FUTURE season.
+ */
+export const SEASON_RETENTION_MONTHS = 12;
+
+const SEASON_KEY_PATTERN = /^(\d{4})-(\d{2})$/;
+
+/** Zero-based absolute month index of a `YYYY-MM` key, for exact month math. */
+function monthIndexOf(seasonId: string): number {
+  const match = SEASON_KEY_PATTERN.exec(seasonId);
+  if (match === null) {
+    throw invalidArgument("Temporada indisponível.");
+  }
+  const month = Number(match[2]);
+  if (month < 1 || month > 12) {
+    throw invalidArgument("Temporada indisponível.");
+  }
+  return Number(match[1]) * 12 + (month - 1);
+}
+
+/**
+ * Rejects any season outside the retention window.
+ *
+ * Exact arithmetic on the two `YYYY-MM` keys — no day counting, no Date math
+ * and no local timezone. The CALLER derives `currentSeasonId` from the
+ * business calendar (America/Sao_Paulo, via `seasonIdFromInstant`), so the
+ * window boundary moves exactly when the business month does.
+ *
+ * The rejection is deliberately GENERIC: one public message for an expired
+ * season, a future season and a season that never existed alike —
+ * distinguishing them would reveal which seasons hold data.
+ */
+export function assertSeasonServable(
+  seasonId: string,
+  currentSeasonId: string
+): void {
+  const age = monthIndexOf(currentSeasonId) - monthIndexOf(seasonId);
+  if (age < 0 || age >= SEASON_RETENTION_MONTHS) {
+    throw invalidArgument("Temporada indisponível.");
+  }
+}
+
 // ── Canonical order ─────────────────────────────────────────────────────────
 
 /** The three comparator levels, as stored on an entry. */
@@ -181,9 +227,17 @@ function macOf(payload: string, key: Buffer): Buffer {
 /**
  * The opaque cursor for the row after [cursor.after]. Server-produced only.
  *
- * The tag is a keyed MAC, not a checksum: without the key a client cannot
- * produce one, so a cursor cannot be forged — only replayed verbatim, which
- * reaches exactly the page it already described.
+ * The tag is a keyed MAC, not a checksum: it authenticates the cursor's ORIGIN
+ * and INTEGRITY — without the key a client cannot mint or alter one. That is
+ * ALL it guarantees. A legitimately issued cursor can still be REPLAYED, and
+ * the MAC says nothing about time: `startAfter` resumes after the encoded
+ * ordering tuple against LIVE data, and the carried absolute offset only
+ * continues the visual numbering. There is no snapshot between pages — an
+ * entry that moves in the ordering between requests changes which rows the
+ * remaining pages return and what their live positions are: one that moved
+ * ahead of the tuple is OMITTED from the rest of the run, and one that moved
+ * behind it would REPEAT (reachable only by an out-of-band write, since a
+ * prize never lowers a key).
  */
 export function encodeCursor(
   cursor: LeaderboardCursor,

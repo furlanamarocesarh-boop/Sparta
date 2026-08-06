@@ -116,12 +116,14 @@ import {
   SEASON_ENTRIES_SUBCOLLECTION,
   SEASON_RANKINGS_COLLECTION,
   seasonDocumentId,
+  seasonIdFromInstant,
   seasonWindow,
   toUsableDate,
   type PrizeRankingEvent,
   type RankingEconomy,
 } from "./domain/seasonRanking.js";
 import {
+  assertSeasonServable,
   decodeCursor,
   encodeCursor,
   normalizeEconomy,
@@ -2732,10 +2734,17 @@ async function seasonPlayerCount(
  * offset plus the row's index — so page 2 continues page 1's numbering without
  * recomputing anything, and no `position` field is ever stored (section 8.3).
  *
- * PAGING IS CURSOR-ONLY. An offset-based page would renumber rows whenever a
- * concurrent prize lands mid-page; `startAfter` on the full ordering tuple does
- * not. The cursor is opaque, server-produced and bound to this season and
- * economy — one minted elsewhere is rejected rather than silently restarted.
+ * PAGING IS CURSOR-ONLY, and the cursor is opaque, server-produced (HMAC) and
+ * bound to this season and economy — one minted elsewhere is rejected rather
+ * than silently restarted. `startAfter` on the full ordering tuple resumes
+ * after a stable KEY instead of a row number, so a page never re-serves the
+ * rows the cursor already covered. It does NOT freeze the season: there is no
+ * snapshot between pages, and the carried absolute offset is only the visual
+ * numbering continuation. A concurrent prize can still move an entry across
+ * the cursor tuple between requests — a row that moved ahead of it is omitted
+ * from the rest of the run, one that moved behind it would repeat (out-of-band
+ * writes only, since a prize never lowers a key), and visual numbers on later
+ * pages can lag the live ordinals `getMySeasonRanking` reports.
  *
  * The response carries only the allowlisted projection: no uid, in any field,
  * and none in the cursor either, because the entry is keyed by `publicPlayerId`.
@@ -2749,6 +2758,13 @@ export interface SeasonLeaderboardOptions {
    * NOT a payload field: a client can neither supply nor influence it.
    */
   readonly cursorSecret?: string;
+  /**
+   * Clock override, injected only by tests so the retention window can be
+   * exercised deterministically. Production never passes it.
+   *
+   * NOT a payload field: a client can neither supply nor influence it.
+   */
+  readonly now?: Date;
 }
 
 export const getSeasonLeaderboardHandler = async (
@@ -2767,6 +2783,13 @@ export const getSeasonLeaderboardHandler = async (
     const economy = normalizeEconomy((data ?? {}).economy);
     const seasonId = normalizeMonth((data ?? {}).seasonId).key;
     const limit = normalizeLimit((data ?? {}).limit);
+
+    // Retention (§8.4): only the current business month and the 11 before it
+    // are served. Checked BEFORE any read, cursor work or signing.
+    assertSeasonServable(
+      seasonId,
+      seasonIdFromInstant(options.now ?? new Date())
+    );
 
     // Environment only. Absent, empty or under 32 bytes fails closed inside the
     // domain — there is no unsigned fallback and no derived default.
@@ -2836,7 +2859,16 @@ export const getSeasonLeaderboardHandler = async (
   }
 };
 
-export const getSeasonLeaderboard = central
+/**
+ * DEDICATED builder, never `central`: `FunctionBuilder.prototype.runWith()`
+ * MUTATES the builder it is called on and returns `this`, so running it on the
+ * shared `central` would silently attach the cursor secret to EVERY export
+ * declared after this line (it did — that was the re-audit's HIGH finding).
+ * The module-level `region()` factory returns a fresh builder per call, which
+ * confines the secret to exactly this one callable. `functionRegions.test.ts`
+ * asserts the resulting per-export secret sets on the built artifact.
+ */
+export const getSeasonLeaderboard = region(REGION_CALLABLES)
   .runWith({ secrets: [RANKING_CURSOR_SECRET_ENV] })
   .https.onCall(getSeasonLeaderboardHandler);
 
@@ -2867,6 +2899,13 @@ export interface MySeasonRankingOptions {
    * NOT a payload field and not client-reachable.
    */
   readonly afterFirstRead?: () => Promise<void>;
+  /**
+   * Clock override, injected only by tests so the retention window can be
+   * exercised deterministically. Production never passes it.
+   *
+   * NOT a payload field: a client can neither supply nor influence it.
+   */
+  readonly now?: Date;
 }
 
 export const getMySeasonRankingHandler = async (
@@ -2885,6 +2924,14 @@ export const getMySeasonRankingHandler = async (
 
     const economy = normalizeEconomy((data ?? {}).economy);
     const seasonId = normalizeMonth((data ?? {}).seasonId).key;
+
+    // Retention (§8.4): only the current business month and the 11 before it
+    // are served. Checked BEFORE any read.
+    assertSeasonServable(
+      seasonId,
+      seasonIdFromInstant(options.now ?? new Date())
+    );
+
     const uid = normalizeIdentityUid(callerAuth.uid);
 
     // Resolved BEFORE the snapshot: the pseudonym is immutable once assigned,
@@ -2906,31 +2953,34 @@ export const getMySeasonRankingHandler = async (
       .doc(seasonDocumentId(economy, seasonId));
 
     // ── ONE consistent snapshot ──────────────────────────────────────────────
-    // Parent, entry and all three counts are read through the SAME read-only
-    // transaction, so they share one read timestamp. Issuing them independently
-    // let a competitor cross between two of the disjoint sets mid-read and be
-    // counted twice — or missed — producing an ordinal that matched no state
-    // the season was ever actually in.
+    // Parent, entry and all four aggregates (the three disjoint ahead-counts
+    // and the eligible total that becomes playerCount) are read through the
+    // SAME read-only transaction, so they share one read timestamp. Issuing
+    // them independently let a competitor cross between two of the disjoint
+    // sets mid-read and be counted twice — or missed — producing an ordinal
+    // that matched no state the season was ever actually in.
     //
     // `readOnly: true` is not decoration: Firestore refuses writes inside it, so
     // a read path can never acquire one by accident.
+    // THE ELIGIBLE SET. The leaderboard page orders by all three comparator
+    // fields, and Firestore drops a document from an `orderBy` when the field
+    // is missing — so a structurally incomplete entry is invisible to the
+    // leaderboard. Every aggregate below carries the same `orderBy` chain,
+    // which makes the counted set IDENTICAL to the served set: an entry that
+    // cannot appear on any page can never shift a rank or the playerCount
+    // (§8.3 — the two paths cannot disagree). Same declared composite index.
+    const eligible = entries
+      .orderBy("scoreCentavos", "desc")
+      .orderBy("winsCount", "desc")
+      .orderBy("publicPlayerId", "asc");
+
     const snapshot = await db.runTransaction(
       async (transaction) => {
         const parentSnap = await transaction.get(parentRef);
-        const storedCount = (parentSnap.data() ?? {}).playerCount;
-        const playerCount =
-          parentSnap.exists &&
-          typeof storedCount === "number" &&
-          Number.isSafeInteger(storedCount) &&
-          storedCount >= 0
-            ? storedCount
-            : 0;
 
-        if (!isPublicPlayerId(publicPlayerId)) {
-          return { ranked: false as const, playerCount };
-        }
-
-        const entrySnap = await transaction.get(entries.doc(publicPlayerId));
+        const entrySnap = isPublicPlayerId(publicPlayerId)
+          ? await transaction.get(entries.doc(publicPlayerId))
+          : null;
 
         // Test-only seam: lets a concurrency test mutate a competitor AFTER the
         // snapshot is fixed but BEFORE the counts run. Never reachable from a
@@ -2939,8 +2989,27 @@ export const getMySeasonRankingHandler = async (
           await options.afterFirstRead();
         }
 
-        if (!entrySnap.exists) {
-          return { ranked: false as const, playerCount };
+        // The write path (decideParent) treats an entry without its season
+        // parent as corruption and fails closed rather than repairing it. The
+        // read path answers from the same invariant: publishing a rank next to
+        // `playerCount: 0` would describe a season state that must not exist.
+        if (!parentSnap.exists) {
+          if (entrySnap !== null && entrySnap.exists) {
+            throw new DomainError(
+              "failed-precondition",
+              "Documento de ranking inconsistente: o parent da temporada não " +
+                "existe, mas a entry do jogador já existe."
+            );
+          }
+          return { ranked: false as const, playerCount: 0 };
+        }
+
+        if (entrySnap === null || !entrySnap.exists) {
+          const total = await transaction.get(eligible.count());
+          return {
+            ranked: false as const,
+            playerCount: total.data().count,
+          };
         }
 
         const mine = publicEntry(1, entrySnap.data() ?? {});
@@ -2950,31 +3019,46 @@ export const getMySeasonRankingHandler = async (
           publicPlayerId: mine.publicPlayerId,
         };
 
-        // Three DISJOINT counts covering exactly the entries ahead (§9.2),
-        // every one of them read through this transaction.
-        const [betterScore, sameScoreMoreWins, sameScoreSameWinsEarlierId] =
-          await Promise.all([
-            transaction.get(
-              entries.where("scoreCentavos", ">", key.scoreCentavos).count()
-            ),
-            transaction.get(
-              entries
-                .where("scoreCentavos", "==", key.scoreCentavos)
-                .where("winsCount", ">", key.winsCount)
-                .count()
-            ),
-            transaction.get(
-              entries
-                .where("scoreCentavos", "==", key.scoreCentavos)
-                .where("winsCount", "==", key.winsCount)
-                .where("publicPlayerId", "<", key.publicPlayerId)
-                .count()
-            ),
-          ]);
+        // Three DISJOINT counts covering exactly the ELIGIBLE entries ahead
+        // (§9.2), plus the eligible total — all four read through this
+        // transaction, all four constrained to the same field set the ordered
+        // page requires.
+        const [
+          betterScore,
+          sameScoreMoreWins,
+          sameScoreSameWinsEarlierId,
+          total,
+        ] = await Promise.all([
+          transaction.get(
+            entries
+              .where("scoreCentavos", ">", key.scoreCentavos)
+              .orderBy("scoreCentavos", "desc")
+              .orderBy("winsCount", "desc")
+              .orderBy("publicPlayerId", "asc")
+              .count()
+          ),
+          transaction.get(
+            entries
+              .where("scoreCentavos", "==", key.scoreCentavos)
+              .where("winsCount", ">", key.winsCount)
+              .orderBy("winsCount", "desc")
+              .orderBy("publicPlayerId", "asc")
+              .count()
+          ),
+          transaction.get(
+            entries
+              .where("scoreCentavos", "==", key.scoreCentavos)
+              .where("winsCount", "==", key.winsCount)
+              .where("publicPlayerId", "<", key.publicPlayerId)
+              .orderBy("publicPlayerId", "asc")
+              .count()
+          ),
+          transaction.get(eligible.count()),
+        ]);
 
         return {
           ranked: true as const,
-          playerCount,
+          playerCount: total.data().count,
           mine,
           ahead:
             betterScore.data().count +
