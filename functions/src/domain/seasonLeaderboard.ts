@@ -1,5 +1,7 @@
+import { createHmac, timingSafeEqual } from "node:crypto";
+
 import { ECONOMY_BETA_CREDIT, ECONOMY_CASH } from "./economy.js";
-import { DomainError, invalidArgument } from "./errors.js";
+import { DomainError, failedPrecondition, invalidArgument } from "./errors.js";
 import { isPublicPlayerId, publicPlayerLabel } from "./publicPlayerId.js";
 import type { RankingEconomy } from "./seasonRanking.js";
 
@@ -116,28 +118,49 @@ export interface LeaderboardCursor {
   readonly offset: number;
 }
 
+/** The environment variable holding the cursor signing key in production. */
+export const RANKING_CURSOR_SECRET_ENV = "RANKING_CURSOR_HMAC_SECRET";
+
 /**
- * A non-cryptographic checksum over the cursor payload.
- *
- * FNV-1a, chosen because it is deterministic, dependency-free and adequate for
- * what a cursor actually needs: detecting corruption and casual tampering.
- *
- * IT IS NOT A SIGNATURE, and deliberately so. A cursor carries no privilege —
- * every row it can reach is already visible to any authenticated caller through
- * ordinary paging — so there is nothing to forge one's way into. The binding
- * that matters is the economy/season check in [decodeCursor], which is enforced
- * against the REQUEST rather than trusted from the cursor.
+ * Minimum key length. 32 bytes matches the HMAC-SHA256 block security level;
+ * anything shorter is rejected rather than stretched, so a placeholder value
+ * cannot quietly become the production key.
  */
-function checksum(payload: string): string {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < payload.length; i += 1) {
-    hash ^= payload.charCodeAt(i);
-    // FNV prime, in 32-bit arithmetic.
-    hash = Math.imul(hash, 0x01000193) >>> 0;
+export const MIN_CURSOR_SECRET_BYTES = 32;
+
+/**
+ * Upper bound on an inbound cursor, checked BEFORE any decoding.
+ *
+ * A real cursor is ~120 characters. This bounds the work an unauthenticated-shaped
+ * input can cause before it is rejected, and costs nothing for legitimate use.
+ */
+export const MAX_CURSOR_CHARS = 512;
+
+/**
+ * The signing key, validated.
+ *
+ * Fails CLOSED: absent, empty, non-string or too short all raise rather than
+ * falling back to an unsigned or weakly-keyed cursor. There is deliberately no
+ * default and no derivation from public data — a key derived from the project
+ * id, the season or a uid would be reproducible by anyone who can see those.
+ */
+function cursorKey(secret: unknown): Buffer {
+  if (typeof secret !== "string" || secret.length === 0) {
+    throw failedPrecondition("Assinatura de cursor não configurada.");
   }
-  return hash.toString(36);
+
+  const key = Buffer.from(secret, "utf8");
+  if (key.length < MIN_CURSOR_SECRET_BYTES) {
+    throw failedPrecondition("Assinatura de cursor não configurada.");
+  }
+
+  return key;
 }
 
+/**
+ * The canonical payload the MAC covers — every field the cursor carries, in a
+ * fixed order, so no component can be swapped without invalidating the tag.
+ */
 function payloadOf(cursor: LeaderboardCursor): string {
   return JSON.stringify([
     LEADERBOARD_CURSOR_VERSION,
@@ -150,27 +173,56 @@ function payloadOf(cursor: LeaderboardCursor): string {
   ]);
 }
 
-/** The opaque cursor for the row after [cursor.after]. Server-produced only. */
-export function encodeCursor(cursor: LeaderboardCursor): string {
+/** HMAC-SHA256 over the canonical payload. */
+function macOf(payload: string, key: Buffer): Buffer {
+  return createHmac("sha256", key).update(payload, "utf8").digest();
+}
+
+/**
+ * The opaque cursor for the row after [cursor.after]. Server-produced only.
+ *
+ * The tag is a keyed MAC, not a checksum: without the key a client cannot
+ * produce one, so a cursor cannot be forged — only replayed verbatim, which
+ * reaches exactly the page it already described.
+ */
+export function encodeCursor(
+  cursor: LeaderboardCursor,
+  secret: unknown
+): string {
+  const key = cursorKey(secret);
   const payload = payloadOf(cursor);
-  return Buffer.from(`${payload}.${checksum(payload)}`, "utf8").toString(
-    "base64url"
-  );
+  const tag = macOf(payload, key).toString("base64url");
+
+  return Buffer.from(`${payload}.${tag}`, "utf8").toString("base64url");
 }
 
 /**
  * Decodes a cursor, or rejects it.
  *
- * REJECTED, never reinterpreted: a malformed string, a corrupted or tampered
- * payload, an unknown version, and — the case that matters most — a cursor
- * minted for a DIFFERENT season or economy. Silently restarting such a request
- * from page 1 would let a client interleave two rankings without noticing.
+ * THE MAC IS VERIFIED BEFORE ANY FIELD IS READ. Nothing inside the payload is
+ * parsed, trusted or acted upon until the tag proves the payload is one this
+ * server produced — so a forged offset or ordering tuple never reaches the
+ * validation logic, let alone a query.
+ *
+ * Comparison is constant-time, and the tag length is checked first because
+ * `timingSafeEqual` throws on a length mismatch rather than returning false.
+ *
+ * REJECTED, never reinterpreted: a malformed string, a wrong or truncated tag,
+ * an unknown version, an implausible field, and a cursor minted for a DIFFERENT
+ * season or economy — silently restarting that from page 1 would let a client
+ * interleave two rankings without noticing.
  */
 export function decodeCursor(
   raw: unknown,
-  expected: { readonly economy: RankingEconomy; readonly seasonId: string }
+  expected: { readonly economy: RankingEconomy; readonly seasonId: string },
+  secret: unknown
 ): LeaderboardCursor {
+  const key = cursorKey(secret);
+
   if (typeof raw !== "string" || raw.length === 0) {
+    throw invalidArgument("Cursor inválido.");
+  }
+  if (raw.length > MAX_CURSOR_CHARS) {
     throw invalidArgument("Cursor inválido.");
   }
 
@@ -185,7 +237,20 @@ export function decodeCursor(
   if (split <= 0) throw invalidArgument("Cursor inválido.");
 
   const payload = decoded.slice(0, split);
-  if (decoded.slice(split + 1) !== checksum(payload)) {
+
+  let presented: Buffer;
+  try {
+    presented = Buffer.from(decoded.slice(split + 1), "base64url");
+  } catch {
+    throw invalidArgument("Cursor inválido.");
+  }
+
+  const expectedTag = macOf(payload, key);
+  // Length first: timingSafeEqual THROWS on differing lengths.
+  if (
+    presented.length !== expectedTag.length ||
+    !timingSafeEqual(presented, expectedTag)
+  ) {
     throw invalidArgument("Cursor inválido.");
   }
 

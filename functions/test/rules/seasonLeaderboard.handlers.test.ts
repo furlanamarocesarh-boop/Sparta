@@ -29,13 +29,27 @@ import {
  * hook asserts FIRESTORE_EMULATOR_HOST) and uses a DISTINCT emulator project id.
  */
 
-type Handler = (data: any, context: any) => Promise<Record<string, unknown>>;
+type Handler = (
+  data: any,
+  context: any,
+  options?: any
+) => Promise<Record<string, unknown>>;
 
 let getSeasonLeaderboardHandler: Handler;
 let getMySeasonRankingHandler: Handler;
 let db: admin.firestore.Firestore;
 
 const SEASON = "2026-08";
+
+/**
+ * Cursor signing key for the emulator run.
+ *
+ * A TEST value: it is not, and does not derive from, any production secret —
+ * the real key exists only in Secret Manager and is injected into
+ * `RANKING_CURSOR_HMAC_SECRET` for the deployed callable. Setting the same
+ * environment variable here exercises the exact production resolution path.
+ */
+const TEST_CURSOR_SECRET = "emulator-cursor-signing-key-0123456789ab";
 
 /** Deterministic pseudonyms, ascending so tie-break order is predictable. */
 const IDS = [
@@ -54,6 +68,7 @@ before(async () => {
     "these tests MUST run under the Firestore emulator (npm run test:rules)"
   );
   process.env.GCLOUD_PROJECT = "demo-sparta-battle-leaderboard-handlers";
+  process.env.RANKING_CURSOR_HMAC_SECRET = TEST_CURSOR_SECRET;
   const mod = (await import("../../src/index.js")) as unknown as {
     getSeasonLeaderboardHandler: Handler;
     getMySeasonRankingHandler: Handler;
@@ -695,5 +710,284 @@ describe("getMySeasonRanking — privacidade e isolamento", () => {
 
     assert.equal(beta.isRanked, false, "o jogador não pontuou em beta");
     assert.equal(beta.rank, null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Correção 1 — cursor autenticado, na callable real
+// ---------------------------------------------------------------------------
+
+describe("getSeasonLeaderboard — cursor autenticado ponta a ponta", () => {
+  /** Um cursor legítimo da página 1, emitido pela própria callable. */
+  async function mintCursor(): Promise<string> {
+    await seedStandardSeason();
+    const page1 = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON, limit: 2 },
+      ctxOf("uid-1")
+    );
+    const cursor = page1.nextCursor;
+    assert.equal(typeof cursor, "string", "a página 1 precisa emitir um cursor");
+    return cursor as string;
+  }
+
+  it("o cursor emitido é aceito de volta e continua a numeração", async () => {
+    const cursor = await mintCursor();
+    const page2 = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON, limit: 2, cursor },
+      ctxOf("uid-1")
+    );
+    assert.deepEqual(
+      (page2.entries as any[]).map((e) => e.position),
+      [3, 4]
+    );
+  });
+
+  it("REJEITA um cursor forjado com o checksum FNV-1a público", async () => {
+    await seedStandardSeason();
+    // O ataque exato do achado: o FNV-1a é recomputável por qualquer cliente.
+    const payload = JSON.stringify([1, ECONOMY_CASH, SEASON, 300, 2, IDS[0], 0]);
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < payload.length; i += 1) {
+      hash ^= payload.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    const forged = Buffer.from(
+      `${payload}.${hash.toString(36)}`,
+      "utf8"
+    ).toString("base64url");
+
+    assert.equal(
+      await expectFailure(() =>
+        getSeasonLeaderboardHandler(
+          { economy: ECONOMY_CASH, seasonId: SEASON, cursor: forged },
+          ctxOf("uid-1")
+        )
+      ),
+      "invalid-argument"
+    );
+  });
+
+  it("REJEITA um cursor válido com o offset adulterado", async () => {
+    const cursor = await mintCursor();
+    const inner = Buffer.from(cursor, "base64url").toString("utf8");
+    const split = inner.lastIndexOf(".");
+    const tampered = `${inner.slice(0, split).replace(/,2\]$/, ",999999]")}.${inner.slice(split + 1)}`;
+    assert.notEqual(tampered, inner, "a mutação precisa mudar o payload");
+
+    assert.equal(
+      await expectFailure(() =>
+        getSeasonLeaderboardHandler(
+          {
+            economy: ECONOMY_CASH,
+            seasonId: SEASON,
+            cursor: Buffer.from(tampered, "utf8").toString("base64url"),
+          },
+          ctxOf("uid-1")
+        )
+      ),
+      "invalid-argument"
+    );
+  });
+
+  it("FALHA FECHADO quando o segredo não está no ambiente", async () => {
+    await seedStandardSeason();
+    const saved = process.env.RANKING_CURSOR_HMAC_SECRET;
+    try {
+      delete process.env.RANKING_CURSOR_HMAC_SECRET;
+      // Sem chave não se emite cursor...
+      assert.equal(
+        await expectFailure(() =>
+          getSeasonLeaderboardHandler(
+            { economy: ECONOMY_CASH, seasonId: SEASON, limit: 2 },
+            ctxOf("uid-1")
+          )
+        ),
+        "failed-precondition"
+      );
+      // ...nem se aceita um.
+      assert.equal(
+        await expectFailure(() =>
+          getSeasonLeaderboardHandler(
+            { economy: ECONOMY_CASH, seasonId: SEASON, cursor: "qualquer" },
+            ctxOf("uid-1")
+          )
+        ),
+        "failed-precondition"
+      );
+    } finally {
+      process.env.RANKING_CURSOR_HMAC_SECRET = saved;
+    }
+  });
+
+  it("REJEITA um cursor assinado com OUTRA chave", async () => {
+    const cursor = await mintCursor();
+    const saved = process.env.RANKING_CURSOR_HMAC_SECRET;
+    try {
+      process.env.RANKING_CURSOR_HMAC_SECRET =
+        "a-rotated-cursor-signing-key-0123456789ab";
+      assert.equal(
+        await expectFailure(() =>
+          getSeasonLeaderboardHandler(
+            { economy: ECONOMY_CASH, seasonId: SEASON, cursor },
+            ctxOf("uid-1")
+          )
+        ),
+        "invalid-argument"
+      );
+    } finally {
+      process.env.RANKING_CURSOR_HMAC_SECRET = saved;
+    }
+  });
+
+  it("o cliente NÃO controla a chave: cursorSecret no payload é rejeitado", async () => {
+    await seedStandardSeason();
+    assert.equal(
+      await expectFailure(() =>
+        getSeasonLeaderboardHandler(
+          {
+            economy: ECONOMY_CASH,
+            seasonId: SEASON,
+            cursorSecret: "chave-escolhida-pelo-atacante-0123456789",
+          },
+          ctxOf("uid-1")
+        )
+      ),
+      "invalid-argument",
+      "cursorSecret não está na allowlist do payload"
+    );
+  });
+
+  it("o segredo nunca aparece na resposta nem no cursor", async () => {
+    const cursor = await mintCursor();
+    const page = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON, limit: 2, cursor },
+      ctxOf("uid-1")
+    );
+    const blob = JSON.stringify(page) + cursor;
+    assert.ok(!blob.includes(TEST_CURSOR_SECRET));
+    assert.ok(!blob.includes("RANKING_CURSOR_HMAC_SECRET"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Correção 2 — ordinal a partir de UM snapshot consistente
+// ---------------------------------------------------------------------------
+
+describe("getMySeasonRanking — snapshot único e consistente", () => {
+  it("as contagens NÃO enxergam uma escrita concorrente iniciada após a 1ª leitura", async () => {
+    await seedStandardSeason();
+    await bindIdentity("uid-c", IDS[2]); // C: 200/2 -> posição 3
+
+    let fired = 0;
+    const res = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-c"),
+      {
+        // A transação já fixou seu snapshot; esta escrita é posterior a ele.
+        afterFirstRead: async () => {
+          fired += 1;
+          // E (100/1) salta para 999/9, o que colocaria C em 4º
+          // se as contagens fossem lidas fora da transação.
+          await seedEntry(ECONOMY_CASH, IDS[4], 999, 9);
+        },
+      }
+    );
+
+    assert.equal(fired, 1, "o ponto de sincronização precisa ter rodado");
+    assert.equal(res.isRanked, true);
+    assert.equal(
+      res.rank,
+      3,
+      "a posição vem do snapshot da transação, não de leituras intercaladas"
+    );
+
+    // E a escrita realmente aconteceu: a leitura seguinte já a enxerga.
+    const depois = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-c")
+    );
+    assert.equal(depois.rank, 4, "a escrita concorrente era real e efetiva");
+  });
+
+  it("rank e playerCount vêm do MESMO snapshot", async () => {
+    await seedStandardSeason();
+    await bindIdentity("uid-a", IDS[0]);
+
+    const res = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-a"),
+      {
+        afterFirstRead: async () => {
+          await seedParent(ECONOMY_CASH, 99, 999_999);
+          await seedEntry(ECONOMY_CASH, "Zzzzzzzzzzzzzzzzzzzzzz", 500, 5);
+        },
+      }
+    );
+
+    assert.equal(res.rank, 1, "A continua líder no snapshot");
+    assert.equal(res.playerCount, 5, "playerCount é do mesmo snapshot do rank");
+  });
+
+  it("o não-ranqueado também responde a partir de um snapshot", async () => {
+    await seedStandardSeason();
+    await bindIdentity("uid-x", "Xxxxxxxxxxxxxxxxxxxxxx"); // sem entry
+
+    const res = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-x"),
+      {
+        afterFirstRead: async () => {
+          await seedParent(ECONOMY_CASH, 42, 4200);
+        },
+      }
+    );
+
+    assert.equal(res.isRanked, false);
+    assert.equal(res.rank, null);
+    assert.equal(res.playerCount, 5, "o parent lido é o do snapshot");
+  });
+
+  it("os três desempates continuam exatos dentro da transação", async () => {
+    await seedStandardSeason();
+    for (let i = 0; i < IDS.length; i += 1) await bindIdentity(`uid-${i}`, IDS[i]);
+
+    const ranks: number[] = [];
+    for (let i = 0; i < IDS.length; i += 1) {
+      const res = await getMySeasonRankingHandler(
+        { economy: ECONOMY_CASH, seasonId: SEASON },
+        ctxOf(`uid-${i}`)
+      );
+      ranks.push(res.rank as number);
+    }
+    // A:300/2  B:200/3  C:200/2  D:200/2  E:100/1 — inclui empate triplo em 200.
+    assert.deepEqual(ranks, [1, 2, 3, 4, 5]);
+    assert.equal(new Set(ranks).size, 5, "nenhuma posição se repete");
+  });
+
+  it("a transação é somente leitura: nada é persistido pela consulta", async () => {
+    await seedStandardSeason();
+    await bindIdentity("uid-a", IDS[0]);
+
+    const antes = await parentRef(ECONOMY_CASH)
+      .collection(SEASON_ENTRIES_SUBCOLLECTION)
+      .doc(IDS[0])
+      .get();
+
+    await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-a")
+    );
+
+    const depois = await parentRef(ECONOMY_CASH)
+      .collection(SEASON_ENTRIES_SUBCOLLECTION)
+      .doc(IDS[0])
+      .get();
+
+    assert.deepEqual(depois.data(), antes.data(), "a entry não foi tocada");
+    assert.equal(
+      depois.updateTime!.isEqual(antes.updateTime!),
+      true,
+      "nem o updateTime mudou — nenhuma escrita, nem de posição"
+    );
   });
 });

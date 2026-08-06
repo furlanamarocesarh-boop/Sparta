@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { describe, it } from "node:test";
 
 import {
@@ -10,11 +11,15 @@ import {
   compareEntries,
   decodeCursor,
   encodeCursor,
+  LEADERBOARD_CURSOR_VERSION,
   LEADERBOARD_DEFAULT_LIMIT,
   LEADERBOARD_MAX_LIMIT,
+  MAX_CURSOR_CHARS,
+  MIN_CURSOR_SECRET_BYTES,
   normalizeEconomy,
   normalizeLimit,
   publicEntry,
+  RANKING_CURSOR_SECRET_ENV,
   rankFromAhead,
   type OrderKey,
 } from "../../src/domain/seasonLeaderboard.js";
@@ -218,7 +223,13 @@ describe("economia", () => {
 // Cursor
 // ---------------------------------------------------------------------------
 
-describe("cursor — opaco, vinculado e verificado", () => {
+describe("cursor — autenticado, opaco e vinculado", () => {
+  // Chaves de teste. Nenhuma delas é, ou deriva de, um segredo de produção:
+  // o valor real vive apenas no Secret Manager, injetado em
+  // process.env[RANKING_CURSOR_SECRET_ENV] na callable.
+  const SECRET = "unit-test-cursor-signing-key-0123456789ab";
+  const OTHER_SECRET = "a-completely-different-key-0123456789abcd";
+
   const base = {
     economy: ECONOMY_CASH,
     seasonId: "2026-08",
@@ -227,133 +238,300 @@ describe("cursor — opaco, vinculado e verificado", () => {
   };
   const expected = { economy: ECONOMY_CASH, seasonId: "2026-08" };
 
+  /** O texto interno de um cursor válido, antes do envelope base64url. */
+  const innerOf = (cursor: string): string =>
+    Buffer.from(cursor, "base64url").toString("utf8");
+
+  const envelope = (inner: string): string =>
+    Buffer.from(inner, "utf8").toString("base64url");
+
+  /** Reassina um payload arbitrário com a chave indicada. */
+  const sign = (payload: string, secret = SECRET): string =>
+    envelope(
+      `${payload}.${createHmac("sha256", Buffer.from(secret, "utf8"))
+        .update(payload, "utf8")
+        .digest("base64url")}`
+    );
+
+  /** O checksum FNV-1a público que o cursor usava antes desta correção. */
+  const fnv1a = (input: string): string => {
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < input.length; i += 1) {
+      hash ^= input.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(36);
+  };
+
+  it("nomeia o segredo por variável de ambiente, sem valor no repositório", () => {
+    assert.equal(RANKING_CURSOR_SECRET_ENV, "RANKING_CURSOR_HMAC_SECRET");
+    assert.equal(MIN_CURSOR_SECRET_BYTES, 32);
+  });
+
   it("faz round-trip preservando a tupla e o offset", () => {
-    const decoded = decodeCursor(encodeCursor(base), expected);
+    const decoded = decodeCursor(encodeCursor(base, SECRET), expected, SECRET);
     assert.deepEqual(decoded.after, base.after);
     assert.equal(decoded.offset, 50);
     assert.equal(decoded.economy, ECONOMY_CASH);
     assert.equal(decoded.seasonId, "2026-08");
   });
 
-  it("é opaco: não vaza os campos em texto claro", () => {
-    const cursor = encodeCursor(base);
+  it("é determinístico para a mesma entrada e a mesma chave", () => {
+    assert.equal(encodeCursor(base, SECRET), encodeCursor({ ...base }, SECRET));
+  });
+
+  it("muda inteiramente quando a chave muda", () => {
+    assert.notEqual(encodeCursor(base, SECRET), encodeCursor(base, OTHER_SECRET));
+  });
+
+  it("é opaco: não vaza os campos em texto claro no envelope", () => {
+    const cursor = encodeCursor(base, SECRET);
     assert.ok(!cursor.includes("2026-08"));
     assert.ok(!cursor.includes(P1));
     assert.ok(!cursor.includes("scoreCentavos"));
   });
 
-  it("nunca carrega uid — não há uid para carregar", () => {
-    const decoded = Buffer.from(encodeCursor(base), "base64url").toString("utf8");
-    assert.ok(!decoded.includes("uid"));
-    assert.ok(decoded.includes(P1), "carrega o pseudônimo, não a conta");
+  it("nunca carrega uid — não há uid para carregar, nem o segredo", () => {
+    const inner = innerOf(encodeCursor(base, SECRET));
+    assert.ok(!inner.includes("uid"));
+    assert.ok(!inner.includes(SECRET), "o segredo nunca entra no cursor");
+    assert.ok(inner.includes(P1), "carrega o pseudônimo, não a conta");
   });
 
-  it("é determinístico para a mesma entrada", () => {
-    assert.equal(encodeCursor(base), encodeCursor({ ...base }));
+  // ── Falha fechada quando não há chave utilizável ──────────────────────────
+
+  it("FALHA FECHADO sem segredo — não existe cursor não assinado", () => {
+    for (const missing of [undefined, null, "", 0, {}, []]) {
+      assertDomain(
+        () => encodeCursor(base, missing),
+        "failed-precondition",
+        `encode ${String(missing)}`
+      );
+      assertDomain(
+        () => decodeCursor(encodeCursor(base, SECRET), expected, missing),
+        "failed-precondition",
+        `decode ${String(missing)}`
+      );
+    }
   });
 
-  it("REJEITA um cursor de outra temporada", () => {
-    const other = encodeCursor({ ...base, seasonId: "2026-09" });
+  it("FALHA FECHADO com segredo curto demais (< 32 bytes)", () => {
+    const short = "x".repeat(MIN_CURSOR_SECRET_BYTES - 1);
+    assertDomain(() => encodeCursor(base, short), "failed-precondition", "encode");
     assertDomain(
-      () => decodeCursor(other, expected),
+      () => decodeCursor(encodeCursor(base, SECRET), expected, short),
+      "failed-precondition",
+      "decode"
+    );
+    // Exatamente 32 bytes já serve.
+    const exact = "x".repeat(MIN_CURSOR_SECRET_BYTES);
+    assert.equal(decodeCursor(encodeCursor(base, exact), expected, exact).offset, 50);
+  });
+
+  // ── O MAC é a barreira ────────────────────────────────────────────────────
+
+  it("REJEITA um cursor assinado com OUTRA chave", () => {
+    assertDomain(
+      () => decodeCursor(encodeCursor(base, OTHER_SECRET), expected, SECRET),
+      "invalid-argument",
+      "chave errada"
+    );
+  });
+
+  it("REJEITA adulteração de QUALQUER campo coberto pelo MAC", () => {
+    const inner = innerOf(encodeCursor(base, SECRET));
+    const mutations: Array<[string, string, string]> = [
+      ["offset", ",50]", ",999999]"],
+      ["scoreCentavos", "50000,", "99999,"],
+      ["winsCount", ",2,", ",7,"],
+      ["publicPlayerId", P1, P2],
+      ["economy", "cash", "beta_credit"],
+      ["seasonId", "2026-08", "2026-09"],
+      ["version", "[1,", "[2,"],
+    ];
+
+    for (const [label, from, to] of mutations) {
+      const tampered = inner.replace(from, to);
+      assert.notEqual(tampered, inner, `${label}: a mutação precisa mudar o texto`);
+      assertDomain(
+        () => decodeCursor(envelope(tampered), expected, SECRET),
+        "invalid-argument",
+        `adulterado: ${label}`
+      );
+    }
+  });
+
+  it("REJEITA mesmo que o atacante recalcule o checksum FNV-1a antigo", () => {
+    // Exatamente o ataque do achado de auditoria: o FNV-1a é público e
+    // recomputável, então antes desta correção este cursor era ACEITO.
+    const payload = JSON.stringify([
+      LEADERBOARD_CURSOR_VERSION,
+      ECONOMY_CASH,
+      "2026-08",
+      50_000,
+      2,
+      P1,
+      999_999,
+    ]);
+    const forged = envelope(`${payload}.${fnv1a(payload)}`);
+
+    assertDomain(
+      () => decodeCursor(forged, expected, SECRET),
+      "invalid-argument",
+      "FNV recomputado"
+    );
+  });
+
+  it("REJEITA um MAC arbitrário do comprimento correto", () => {
+    const inner = innerOf(encodeCursor(base, SECRET));
+    const payload = inner.slice(0, inner.lastIndexOf("."));
+    const realTag = Buffer.from(inner.slice(inner.lastIndexOf(".") + 1), "base64url");
+    assert.equal(realTag.length, 32, "HMAC-SHA256 tem 32 bytes");
+
+    for (const filler of [0x00, 0xab, 0xff]) {
+      const bogus = Buffer.alloc(32, filler).toString("base64url");
+      assertDomain(
+        () => decodeCursor(envelope(`${payload}.${bogus}`), expected, SECRET),
+        "invalid-argument",
+        `MAC arbitrário 0x${filler.toString(16)}`
+      );
+    }
+  });
+
+  it("REJEITA um MAC truncado, estendido ou ausente", () => {
+    const inner = innerOf(encodeCursor(base, SECRET));
+    const split = inner.lastIndexOf(".");
+    const payload = inner.slice(0, split);
+    const tag = Buffer.from(inner.slice(split + 1), "base64url");
+
+    const variants: Array<[string, string]> = [
+      ["truncado", tag.subarray(0, 16).toString("base64url")],
+      ["1 byte a menos", tag.subarray(0, 31).toString("base64url")],
+      ["estendido", Buffer.concat([tag, Buffer.alloc(1)]).toString("base64url")],
+      ["vazio", ""],
+    ];
+
+    for (const [label, bogus] of variants) {
+      assertDomain(
+        () => decodeCursor(envelope(`${payload}.${bogus}`), expected, SECRET),
+        "invalid-argument",
+        label
+      );
+    }
+    // Sem separador não há MAC nenhum.
+    assertDomain(
+      () => decodeCursor(envelope(payload), expected, SECRET),
+      "invalid-argument",
+      "sem separador"
+    );
+  });
+
+  it("REJEITA um MAC válido colado em outro payload", () => {
+    const a = innerOf(encodeCursor(base, SECRET));
+    const b = innerOf(encodeCursor({ ...base, offset: 999 }, SECRET));
+    const payloadA = a.slice(0, a.lastIndexOf("."));
+    const tagB = b.slice(b.lastIndexOf(".") + 1);
+
+    assertDomain(
+      () => decodeCursor(envelope(`${payloadA}.${tagB}`), expected, SECRET),
+      "invalid-argument",
+      "MAC trocado"
+    );
+  });
+
+  // ── Vínculo com a requisição, verificado DEPOIS do MAC ────────────────────
+
+  it("REJEITA um cursor legitimamente assinado de OUTRA temporada", () => {
+    const other = encodeCursor({ ...base, seasonId: "2026-09" }, SECRET);
+    assertDomain(
+      () => decodeCursor(other, expected, SECRET),
       "invalid-argument",
       "outra temporada"
     );
   });
 
-  it("REJEITA um cursor de outra economia", () => {
-    const other = encodeCursor({ ...base, economy: ECONOMY_BETA_CREDIT });
+  it("REJEITA um cursor legitimamente assinado de OUTRA economia", () => {
+    const other = encodeCursor({ ...base, economy: ECONOMY_BETA_CREDIT }, SECRET);
     assertDomain(
-      () => decodeCursor(other, expected),
+      () => decodeCursor(other, expected, SECRET),
       "invalid-argument",
       "outra economia"
     );
   });
 
-  it("REJEITA um cursor adulterado", () => {
-    const valid = encodeCursor(base);
-    const raw = Buffer.from(valid, "base64url").toString("utf8");
-    // Mexe no offset sem recalcular o checksum.
-    const tampered = raw.replace(",50]", ",999]");
-    assert.notEqual(tampered, raw, "a mutação precisa mudar o texto");
-    const forged = Buffer.from(tampered, "utf8").toString("base64url");
+  // ── Validação de campos, que roda mesmo com MAC genuíno ───────────────────
 
-    assertDomain(
-      () => decodeCursor(forged, expected),
-      "invalid-argument",
-      "adulterado"
-    );
-  });
-
-  it("REJEITA lixo, vazio e não texto", () => {
+  it("REJEITA lixo, vazio, não texto e cursor gigante", () => {
     for (const bad of ["", "not-a-cursor", "!!!!", undefined, null, 42, {}]) {
       assertDomain(
-        () => decodeCursor(bad, expected),
+        () => decodeCursor(bad, expected, SECRET),
         "invalid-argument",
         String(bad)
       );
     }
-  });
-
-  it("REJEITA um cursor com pseudônimo malformado", () => {
-    const raw = JSON.stringify([1, "cash", "2026-08", 100, 1, "PLR-123", 0]);
-    // Recalcula o checksum para provar que a validação NÃO depende só dele.
-    let hash = 0x811c9dc5;
-    for (let i = 0; i < raw.length; i += 1) {
-      hash ^= raw.charCodeAt(i);
-      hash = Math.imul(hash, 0x01000193) >>> 0;
-    }
-    const forged = Buffer.from(
-      `${raw}.${hash.toString(36)}`,
-      "utf8"
-    ).toString("base64url");
-
     assertDomain(
-      () => decodeCursor(forged, expected),
+      () => decodeCursor("A".repeat(MAX_CURSOR_CHARS + 1), expected, SECRET),
       "invalid-argument",
-      "pseudônimo malformado"
+      "cursor gigante"
     );
   });
 
-  it("REJEITA valores negativos ou fracionários na tupla", () => {
+  it("REJEITA payloads implausíveis AINDA QUE assinados com a chave correta", () => {
+    // Prova que a validação de campos não depende do MAC: mesmo quem detém a
+    // chave não consegue injetar uma tupla impossível.
     for (const payload of [
+      [1, "cash", "2026-08", 100, 1, "PLR-123", 0], // pseudônimo malformado
       [1, "cash", "2026-08", -1, 1, P1, 0],
       [1, "cash", "2026-08", 100, -1, P1, 0],
       [1, "cash", "2026-08", 100, 1, P1, -5],
       [1, "cash", "2026-08", 1.5, 1, P1, 0],
+      [1, "cash", "2026-08", 100, 1, P1, 1.5],
+      [99, "cash", "2026-08", 100, 1, P1, 0], // versão desconhecida
+      [1, "cash", "2026-08", 100, 1, P1], // aridade errada
+      [1, "cash", "2026-08", 100, 1, P1, 0, "extra"],
     ]) {
-      const raw = JSON.stringify(payload);
-      let hash = 0x811c9dc5;
-      for (let i = 0; i < raw.length; i += 1) {
-        hash ^= raw.charCodeAt(i);
-        hash = Math.imul(hash, 0x01000193) >>> 0;
-      }
-      const forged = Buffer.from(`${raw}.${hash.toString(36)}`, "utf8").toString(
-        "base64url"
-      );
       assertDomain(
-        () => decodeCursor(forged, expected),
+        () => decodeCursor(sign(JSON.stringify(payload)), expected, SECRET),
         "invalid-argument",
         JSON.stringify(payload)
       );
     }
   });
 
-  it("REJEITA uma versão desconhecida", () => {
-    const raw = JSON.stringify([99, "cash", "2026-08", 100, 1, P1, 0]);
-    let hash = 0x811c9dc5;
-    for (let i = 0; i < raw.length; i += 1) {
-      hash ^= raw.charCodeAt(i);
-      hash = Math.imul(hash, 0x01000193) >>> 0;
+  // ── Discrição das mensagens de erro ───────────────────────────────────────
+
+  it("nenhuma mensagem de erro revela segredo, MAC ou payload decodificado", () => {
+    const valid = encodeCursor(base, SECRET);
+    const inner = innerOf(valid);
+    const payload = inner.slice(0, inner.lastIndexOf("."));
+    const tag = inner.slice(inner.lastIndexOf(".") + 1);
+
+    const attempts: Array<() => unknown> = [
+      () => decodeCursor(envelope(inner.replace(",50]", ",999999]")), expected, SECRET),
+      () => decodeCursor(encodeCursor(base, OTHER_SECRET), expected, SECRET),
+      () => decodeCursor(encodeCursor({ ...base, seasonId: "2026-09" }, SECRET), expected, SECRET),
+      () => decodeCursor(sign(JSON.stringify([1, "cash", "2026-08", 100, 1, "PLR-1", 0])), expected, SECRET),
+      () => decodeCursor("not-a-cursor", expected, SECRET),
+      () => decodeCursor(valid, expected, "short"),
+    ];
+
+    for (const attempt of attempts) {
+      let message = "";
+      try {
+        attempt();
+        assert.fail("deveria ter sido rejeitado");
+      } catch (error) {
+        assert.ok(error instanceof DomainError, "erro tipado");
+        message = `${error.message} ${JSON.stringify((error as { details?: unknown }).details ?? null)}`;
+      }
+
+      for (const forbidden of [SECRET, OTHER_SECRET, tag, payload, P1, "50000", "999999"]) {
+        assert.ok(
+          !message.includes(forbidden),
+          `mensagem vazou "${forbidden.slice(0, 12)}…": ${message}`
+        );
+      }
     }
-    const forged = Buffer.from(`${raw}.${hash.toString(36)}`, "utf8").toString(
-      "base64url"
-    );
-    assertDomain(
-      () => decodeCursor(forged, expected),
-      "invalid-argument",
-      "versão desconhecida"
-    );
   });
 });
 

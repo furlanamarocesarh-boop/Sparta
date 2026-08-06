@@ -127,6 +127,7 @@ import {
   normalizeEconomy,
   normalizeLimit,
   publicEntry,
+  RANKING_CURSOR_SECRET_ENV,
   rankFromAhead,
   type OrderKey,
 } from "./domain/seasonLeaderboard.js";
@@ -2739,9 +2740,21 @@ async function seasonPlayerCount(
  * The response carries only the allowlisted projection: no uid, in any field,
  * and none in the cursor either, because the entry is keyed by `publicPlayerId`.
  */
+export interface SeasonLeaderboardOptions {
+  /**
+   * Cursor signing key, injected only by tests so a signature can be exercised
+   * without any real secret existing. Production never passes it and reads
+   * `RANKING_CURSOR_HMAC_SECRET` from the environment instead.
+   *
+   * NOT a payload field: a client can neither supply nor influence it.
+   */
+  readonly cursorSecret?: string;
+}
+
 export const getSeasonLeaderboardHandler = async (
   data: any,
-  context: any
+  context: any,
+  options: SeasonLeaderboardOptions = {}
 ): Promise<Record<string, unknown>> => {
   try {
     assertSignedIn(
@@ -2755,11 +2768,16 @@ export const getSeasonLeaderboardHandler = async (
     const seasonId = normalizeMonth((data ?? {}).seasonId).key;
     const limit = normalizeLimit((data ?? {}).limit);
 
+    // Environment only. Absent, empty or under 32 bytes fails closed inside the
+    // domain — there is no unsigned fallback and no derived default.
+    const cursorSecret =
+      options.cursorSecret ?? process.env[RANKING_CURSOR_SECRET_ENV];
+
     const rawCursor = (data ?? {}).cursor;
     const cursor =
       rawCursor === undefined || rawCursor === null
         ? null
-        : decodeCursor(rawCursor, { economy, seasonId });
+        : decodeCursor(rawCursor, { economy, seasonId }, cursorSecret);
 
     let query = seasonEntriesQuery(economy, seasonId)
       .orderBy("scoreCentavos", "desc")
@@ -2787,16 +2805,19 @@ export const getSeasonLeaderboardHandler = async (
     const last = entries[entries.length - 1];
     const nextCursor =
       hasMore && last !== undefined
-        ? encodeCursor({
-            economy,
-            seasonId,
-            after: {
-              scoreCentavos: last.scoreCentavos,
-              winsCount: last.winsCount,
-              publicPlayerId: last.publicPlayerId,
+        ? encodeCursor(
+            {
+              economy,
+              seasonId,
+              after: {
+                scoreCentavos: last.scoreCentavos,
+                winsCount: last.winsCount,
+                publicPlayerId: last.publicPlayerId,
+              },
+              offset: startOffset + entries.length,
             },
-            offset: startOffset + entries.length,
-          })
+            cursorSecret
+          )
         : null;
 
     return {
@@ -2815,9 +2836,9 @@ export const getSeasonLeaderboardHandler = async (
   }
 };
 
-export const getSeasonLeaderboard = central.https.onCall(
-  getSeasonLeaderboardHandler
-);
+export const getSeasonLeaderboard = central
+  .runWith({ secrets: [RANKING_CURSOR_SECRET_ENV] })
+  .https.onCall(getSeasonLeaderboardHandler);
 
 /**
  * The caller's own placement in a monthly season.
@@ -2836,9 +2857,22 @@ export const getSeasonLeaderboard = central.https.onCall(
  * A player with no qualifying prize is NOT ranked: `isRanked: false` and
  * `rank: null`, with no document created and no synthetic zero-score row.
  */
+export interface MySeasonRankingOptions {
+  /**
+   * Test-only synchronisation point, awaited after the first transactional
+   * read. It exists solely so a concurrency test can mutate a competitor once
+   * the snapshot is already fixed, proving the later counts still observe the
+   * state the transaction started from.
+   *
+   * NOT a payload field and not client-reachable.
+   */
+  readonly afterFirstRead?: () => Promise<void>;
+}
+
 export const getMySeasonRankingHandler = async (
   data: any,
-  context: any
+  context: any,
+  options: MySeasonRankingOptions = {}
 ): Promise<Record<string, unknown>> => {
   try {
     const callerAuth = assertSignedIn(
@@ -2853,20 +2887,10 @@ export const getMySeasonRankingHandler = async (
     const seasonId = normalizeMonth((data ?? {}).seasonId).key;
     const uid = normalizeIdentityUid(callerAuth.uid);
 
-    const notRanked = async (): Promise<Record<string, unknown>> => ({
-      success: true,
-      timezone: RANKING_TIMEZONE,
-      amountUnit: "centavos",
-      economy,
-      seasonId,
-      isRanked: false,
-      rank: null,
-      entry: null,
-      playerCount: await seasonPlayerCount(economy, seasonId),
-    });
-
-    // Read-only: an identity is MINTED by settlement, never by a leaderboard
-    // read, so a player who has never been paid stays unregistered.
+    // Resolved BEFORE the snapshot: the pseudonym is immutable once assigned,
+    // so it cannot drift under us, and this read is not part of the ordinal.
+    // Read-only in the strict sense — an identity is MINTED by settlement,
+    // never by a leaderboard read, so a player never paid stays unregistered.
     const mapSnap = await db
       .collection(PUBLIC_PLAYER_ID_COLLECTION)
       .doc(uid)
@@ -2876,44 +2900,104 @@ export const getMySeasonRankingHandler = async (
       ? (mapSnap.data() ?? {}).publicPlayerId
       : null;
 
-    if (!isPublicPlayerId(publicPlayerId)) {
-      return await notRanked();
-    }
-
     const entries = seasonEntriesQuery(economy, seasonId);
-    const entrySnap = await entries.doc(publicPlayerId).get();
-    if (!entrySnap.exists) {
-      return await notRanked();
+    const parentRef = db
+      .collection(SEASON_RANKINGS_COLLECTION)
+      .doc(seasonDocumentId(economy, seasonId));
+
+    // ── ONE consistent snapshot ──────────────────────────────────────────────
+    // Parent, entry and all three counts are read through the SAME read-only
+    // transaction, so they share one read timestamp. Issuing them independently
+    // let a competitor cross between two of the disjoint sets mid-read and be
+    // counted twice — or missed — producing an ordinal that matched no state
+    // the season was ever actually in.
+    //
+    // `readOnly: true` is not decoration: Firestore refuses writes inside it, so
+    // a read path can never acquire one by accident.
+    const snapshot = await db.runTransaction(
+      async (transaction) => {
+        const parentSnap = await transaction.get(parentRef);
+        const storedCount = (parentSnap.data() ?? {}).playerCount;
+        const playerCount =
+          parentSnap.exists &&
+          typeof storedCount === "number" &&
+          Number.isSafeInteger(storedCount) &&
+          storedCount >= 0
+            ? storedCount
+            : 0;
+
+        if (!isPublicPlayerId(publicPlayerId)) {
+          return { ranked: false as const, playerCount };
+        }
+
+        const entrySnap = await transaction.get(entries.doc(publicPlayerId));
+
+        // Test-only seam: lets a concurrency test mutate a competitor AFTER the
+        // snapshot is fixed but BEFORE the counts run. Never reachable from a
+        // client — it is a handler parameter, not a payload field.
+        if (options.afterFirstRead !== undefined) {
+          await options.afterFirstRead();
+        }
+
+        if (!entrySnap.exists) {
+          return { ranked: false as const, playerCount };
+        }
+
+        const mine = publicEntry(1, entrySnap.data() ?? {});
+        const key: OrderKey = {
+          scoreCentavos: mine.scoreCentavos,
+          winsCount: mine.winsCount,
+          publicPlayerId: mine.publicPlayerId,
+        };
+
+        // Three DISJOINT counts covering exactly the entries ahead (§9.2),
+        // every one of them read through this transaction.
+        const [betterScore, sameScoreMoreWins, sameScoreSameWinsEarlierId] =
+          await Promise.all([
+            transaction.get(
+              entries.where("scoreCentavos", ">", key.scoreCentavos).count()
+            ),
+            transaction.get(
+              entries
+                .where("scoreCentavos", "==", key.scoreCentavos)
+                .where("winsCount", ">", key.winsCount)
+                .count()
+            ),
+            transaction.get(
+              entries
+                .where("scoreCentavos", "==", key.scoreCentavos)
+                .where("winsCount", "==", key.winsCount)
+                .where("publicPlayerId", "<", key.publicPlayerId)
+                .count()
+            ),
+          ]);
+
+        return {
+          ranked: true as const,
+          playerCount,
+          mine,
+          ahead:
+            betterScore.data().count +
+            sameScoreMoreWins.data().count +
+            sameScoreSameWinsEarlierId.data().count,
+        };
+      },
+      { readOnly: true }
+    );
+
+    if (!snapshot.ranked) {
+      return {
+        success: true,
+        timezone: RANKING_TIMEZONE,
+        amountUnit: "centavos",
+        economy,
+        seasonId,
+        isRanked: false,
+        rank: null,
+        entry: null,
+        playerCount: snapshot.playerCount,
+      };
     }
-
-    const mine = publicEntry(1, entrySnap.data() ?? {});
-    const key: OrderKey = {
-      scoreCentavos: mine.scoreCentavos,
-      winsCount: mine.winsCount,
-      publicPlayerId: mine.publicPlayerId,
-    };
-
-    // Three DISJOINT counts covering exactly the entries ahead (section 9.2).
-    const [betterScore, sameScoreMoreWins, sameScoreSameWinsEarlierId] =
-      await Promise.all([
-        entries.where("scoreCentavos", ">", key.scoreCentavos).count().get(),
-        entries
-          .where("scoreCentavos", "==", key.scoreCentavos)
-          .where("winsCount", ">", key.winsCount)
-          .count()
-          .get(),
-        entries
-          .where("scoreCentavos", "==", key.scoreCentavos)
-          .where("winsCount", "==", key.winsCount)
-          .where("publicPlayerId", "<", key.publicPlayerId)
-          .count()
-          .get(),
-      ]);
-
-    const ahead =
-      betterScore.data().count +
-      sameScoreMoreWins.data().count +
-      sameScoreSameWinsEarlierId.data().count;
 
     return {
       success: true,
@@ -2922,14 +3006,14 @@ export const getMySeasonRankingHandler = async (
       economy,
       seasonId,
       isRanked: true,
-      rank: rankFromAhead(ahead),
+      rank: rankFromAhead(snapshot.ahead),
       entry: {
-        publicPlayerId: mine.publicPlayerId,
-        label: mine.label,
-        scoreCentavos: mine.scoreCentavos,
-        winsCount: mine.winsCount,
+        publicPlayerId: snapshot.mine.publicPlayerId,
+        label: snapshot.mine.label,
+        scoreCentavos: snapshot.mine.scoreCentavos,
+        winsCount: snapshot.mine.winsCount,
       },
-      playerCount: await seasonPlayerCount(economy, seasonId),
+      playerCount: snapshot.playerCount,
     };
   } catch (error) {
     console.error("getMySeasonRanking error:", error);
