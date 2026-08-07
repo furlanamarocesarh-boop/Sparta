@@ -60,6 +60,120 @@ describe("assertExactPayload", () => {
     );
     // A subset is fine here — the missing key is caught by normalization.
     assert.doesNotThrow(() => assertExactPayload({}, ["tournamentid"]));
+    // A null prototype is a legitimate JSON-shaped object.
+    const bare = Object.create(null) as Record<string, unknown>;
+    bare.tournamentid = "t";
+    assert.doesNotThrow(() => assertExactPayload(bare, ["tournamentid"]));
+  });
+
+  it("NUNCA ecoa o nome do campo escolhido pelo cliente", () => {
+    // O nome é texto do atacante: ecoá-lo o entrega ao cliente E ao stream de
+    // log, e JSON aceita quebras de linha numa chave, o que permitiria forjar
+    // linhas de log.
+    for (const canary of [
+      "campo_canario_98765",
+      "linha1\nlinha2 FORJADA",
+      "../../etc/passwd",
+    ]) {
+      let message = "";
+      try {
+        assertExactPayload({ [canary]: 1 }, ["tournamentid"]);
+        assert.fail("deveria rejeitar");
+      } catch (error) {
+        assert.ok(error instanceof DomainError);
+        assert.equal(error.code, "invalid-argument");
+        message = error.message;
+      }
+      assert.equal(message, "Payload inválido.", "mensagem genérica");
+      assert.ok(
+        !message.includes(canary.slice(0, 10)),
+        `o nome do campo vazou: ${message}`
+      );
+    }
+  });
+
+  it("operações reflexivas que lançam viram invalid-argument, não internal", () => {
+    // Um Proxy hostil não chega pelo decode JSON da callable, mas uma invocação
+    // direta não pode transformar um TypeError de trap num 500 que parece falha
+    // do servidor — nem repassar a mensagem da trap.
+    const TRAP = "MENSAGEM-DA-TRAP-13579";
+    const hostile: ReadonlyArray<readonly [string, () => unknown]> = [
+      ["ownKeys", () => new Proxy({}, { ownKeys() { throw new Error(TRAP); } })],
+      [
+        "getPrototypeOf",
+        () => new Proxy({}, { getPrototypeOf() { throw new Error(TRAP); } }),
+      ],
+      [
+        "getOwnPropertyDescriptor",
+        () =>
+          new Proxy(
+            { tournamentid: "t" },
+            { getOwnPropertyDescriptor() { throw new Error(TRAP); } }
+          ),
+      ],
+      [
+        "revoked",
+        () => {
+          const r = Proxy.revocable({}, {});
+          r.revoke();
+          return r.proxy;
+        },
+      ],
+    ];
+
+    for (const [label, build] of hostile) {
+      let message = "";
+      try {
+        assertExactPayload(build(), ["tournamentid"]);
+        assert.fail(`${label}: deveria rejeitar`);
+      } catch (error) {
+        assert.ok(error instanceof DomainError, `${label}: virou erro interno`);
+        assert.equal(error.code, "invalid-argument", label);
+        message = error.message;
+      }
+      assert.equal(message, "Payload inválido.", label);
+      assert.ok(!message.includes(TRAP), `${label}: a mensagem da trap vazou`);
+    }
+  });
+
+  it("rejeita accessors SEM executar o getter", () => {
+    let calls = 0;
+    const withGetter: Record<string, unknown> = {};
+    Object.defineProperty(withGetter, "tournamentid", {
+      enumerable: true,
+      get() {
+        calls += 1;
+        throw new Error("NUNCA DEVE RODAR");
+      },
+    });
+
+    assertCode(() => assertExactPayload(withGetter, ["tournamentid"]), "invalid-argument");
+    assert.equal(calls, 0, "o getter não pode ser invocado durante a validação");
+  });
+
+  it("rejeita propriedade própria não enumerável e symbol", () => {
+    const hidden = { tournamentid: "t" } as Record<string, unknown>;
+    Object.defineProperty(hidden, "escondido", { value: 1, enumerable: false });
+    assertCode(() => assertExactPayload(hidden, ["tournamentid"]), "invalid-argument");
+
+    const symbolic = { tournamentid: "t" } as Record<string | symbol, unknown>;
+    (symbolic as Record<symbol, unknown>)[Symbol("contrabando")] = 1;
+    assertCode(() => assertExactPayload(symbolic, ["tournamentid"]), "invalid-argument");
+  });
+
+  it("rejeita protótipo controlado pelo cliente e __proto__ próprio", () => {
+    assertCode(
+      () => assertExactPayload(Object.create({ tournamentid: "t" }), ["tournamentid"]),
+      "invalid-argument"
+    );
+    assertCode(
+      () =>
+        assertExactPayload(
+          JSON.parse('{"tournamentid":"t","__proto__":{"x":1}}'),
+          ["tournamentid"]
+        ),
+      "invalid-argument"
+    );
   });
 });
 

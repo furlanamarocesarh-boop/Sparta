@@ -8,8 +8,10 @@ import {
 } from "../../src/domain/economy.js";
 import { DomainError } from "../../src/domain/errors.js";
 import {
+  buildRankKey,
   compareEntries,
   decodeCursor,
+  decodeRankKey,
   encodeCursor,
   LEADERBOARD_CURSOR_VERSION,
   LEADERBOARD_DEFAULT_LIMIT,
@@ -19,6 +21,8 @@ import {
   normalizeEconomy,
   normalizeLimit,
   publicEntry,
+  RANK_KEY_MAX,
+  RANK_KEY_MIN,
   RANKING_CURSOR_SECRET_ENV,
   rankFromAhead,
   type OrderKey,
@@ -55,9 +59,146 @@ const stored = (
   publicPlayerId,
   economy: ECONOMY_CASH,
   seasonId: "2026-08",
+  rankKey: buildRankKey(scoreCentavos, winsCount, publicPlayerId),
   scoreCentavos,
   winsCount,
   ...extra,
+});
+
+// ---------------------------------------------------------------------------
+// Chave canônica
+// ---------------------------------------------------------------------------
+
+describe("chave canônica — a ordenação É a chave", () => {
+  it("um sort ASCENDENTE da chave reproduz a ordem canônica exata", () => {
+    // Mesmas linhas do teste do comparador, ordenadas pelos DOIS caminhos.
+    const rows: OrderKey[] = [
+      key(100, 2, P2),
+      key(100, 2, P1),
+      key(200, 1, P3),
+      key(100, 3, P3),
+      key(0, 1, P1),
+    ];
+
+    const byComparator = [...rows].sort(compareEntries);
+    const byRankKey = [...rows].sort((a, b) => {
+      const ka = buildRankKey(a.scoreCentavos, a.winsCount, a.publicPlayerId);
+      const kb = buildRankKey(b.scoreCentavos, b.winsCount, b.publicPlayerId);
+      return ka < kb ? -1 : ka > kb ? 1 : 0;
+    });
+
+    assert.deepEqual(byRankKey, byComparator, "a chave precisa ser a ordenação");
+  });
+
+  it("é uma ordem total sobre um conjunto gerado — chave e comparador concordam", () => {
+    const rows: OrderKey[] = [];
+    for (const s of [0, 100, 200]) {
+      for (const w of [0, 1, 2]) {
+        for (const p of [P1, P2, P3]) rows.push(key(s, w, p));
+      }
+    }
+    for (const a of rows) {
+      for (const b of rows) {
+        const ka = buildRankKey(a.scoreCentavos, a.winsCount, a.publicPlayerId);
+        const kb = buildRankKey(b.scoreCentavos, b.winsCount, b.publicPlayerId);
+        const viaKey = ka < kb ? -1 : ka > kb ? 1 : 0;
+        assert.equal(
+          viaKey,
+          Math.sign(compareEntries(a, b)),
+          `divergência em ${JSON.stringify([a, b])}`
+        );
+      }
+    }
+  });
+
+  it("é ÚNICA: entries distintas nunca compartilham chave", () => {
+    const seen = new Set<string>();
+    for (const s of [0, 1, 100]) {
+      for (const w of [0, 1, 9]) {
+        for (const p of [P1, P2, P3]) {
+          const k = buildRankKey(s, w, p);
+          assert.equal(seen.has(k), false, `chave repetida: ${k}`);
+          seen.add(k);
+        }
+      }
+    }
+    // O último componente é o id, que é o document id — logo duas entries só
+    // colidiriam se compartilhassem o document id, o que é impossível.
+    assert.ok(buildRankKey(100, 1, P1) !== buildRankKey(100, 1, P2));
+  });
+
+  it("cai SEMPRE dentro da faixa consultável da versão", () => {
+    for (const [s, w, p] of [
+      [0, 0, P1],
+      [Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, P3],
+      [123_456, 7, P2],
+    ] as const) {
+      const k = buildRankKey(s, w, p);
+      assert.ok(k >= RANK_KEY_MIN, `${k} abaixo do piso`);
+      assert.ok(k < RANK_KEY_MAX, `${k} acima do teto`);
+    }
+  });
+
+  it("faz round-trip: decodeRankKey devolve exatamente os valores originais", () => {
+    for (const [s, w, p] of [
+      [0, 0, P1],
+      [125_000, 3, P2],
+      [Number.MAX_SAFE_INTEGER, 1, P3],
+    ] as const) {
+      assert.deepEqual(decodeRankKey(buildRankKey(s, w, p)), {
+        scoreCentavos: s,
+        winsCount: w,
+        publicPlayerId: p,
+      });
+    }
+  });
+
+  it("RECUSA construir a chave de uma entry estruturalmente inválida", () => {
+    for (const bad of [null, undefined, "100", true, -1, 1.5, NaN, Infinity]) {
+      assertDomain(
+        () => buildRankKey(bad, 1, P1),
+        "failed-precondition",
+        `score ${String(bad)}`
+      );
+      assertDomain(
+        () => buildRankKey(100, bad, P1),
+        "failed-precondition",
+        `wins ${String(bad)}`
+      );
+    }
+    for (const bad of [null, undefined, 42, "", "PLR-1", P1 + "x"]) {
+      assertDomain(
+        () => buildRankKey(100, 1, bad),
+        "failed-precondition",
+        `id ${String(bad)}`
+      );
+    }
+  });
+
+  it("RECUSA decodificar uma chave ausente, de outro tipo ou malformada", () => {
+    for (const bad of [
+      undefined,
+      null,
+      42,
+      true,
+      {},
+      [],
+      "",
+      "v1|",
+      "v0|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + P1, // versão errada
+      "v2|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + P1, // versão futura
+      "v1|abc|def|" + P1, // componentes não numéricos
+      "v1|" + "0".repeat(15) + "|" + "0".repeat(16) + "|" + P1, // largura errada
+      "v1|" + "0".repeat(16) + "|" + "0".repeat(16) + "|PLR-1", // id malformado
+      "v1|" + "9".repeat(16) + "|" + "0".repeat(16) + "|" + P1, // complemento fora da faixa
+    ]) {
+      assertDomain(
+        () => decodeRankKey(bad),
+        "failed-precondition",
+        JSON.stringify(bad)
+      );
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -233,7 +374,7 @@ describe("cursor — autenticado, opaco e vinculado", () => {
   const base = {
     economy: ECONOMY_CASH,
     seasonId: "2026-08",
-    after: key(50_000, 2, P1),
+    afterRankKey: buildRankKey(50_000, 2, P1),
     offset: 50,
   };
   const expected = { economy: ECONOMY_CASH, seasonId: "2026-08" };
@@ -270,7 +411,7 @@ describe("cursor — autenticado, opaco e vinculado", () => {
 
   it("faz round-trip preservando a tupla e o offset", () => {
     const decoded = decodeCursor(encodeCursor(base, SECRET), expected, SECRET);
-    assert.deepEqual(decoded.after, base.after);
+    assert.equal(decoded.afterRankKey, base.afterRankKey);
     assert.equal(decoded.offset, 50);
     assert.equal(decoded.economy, ECONOMY_CASH);
     assert.equal(decoded.seasonId, "2026-08");
@@ -342,12 +483,12 @@ describe("cursor — autenticado, opaco e vinculado", () => {
     const inner = innerOf(encodeCursor(base, SECRET));
     const mutations: Array<[string, string, string]> = [
       ["offset", ",50]", ",999999]"],
-      ["scoreCentavos", "50000,", "99999,"],
-      ["winsCount", ",2,", ",7,"],
+      ["rankKey score", "9007199254690991", "9007199254690891"],
+      ["rankKey wins", "9007199254740989", "9007199254740889"],
       ["publicPlayerId", P1, P2],
       ["economy", "cash", "beta_credit"],
       ["seasonId", "2026-08", "2026-09"],
-      ["version", "[1,", "[2,"],
+      ["version", "[2,", "[3,"],
     ];
 
     for (const [label, from, to] of mutations) {
@@ -368,9 +509,7 @@ describe("cursor — autenticado, opaco e vinculado", () => {
       LEADERBOARD_CURSOR_VERSION,
       ECONOMY_CASH,
       "2026-08",
-      50_000,
-      2,
-      P1,
+      buildRankKey(50_000, 2, P1),
       999_999,
     ]);
     const forged = envelope(`${payload}.${fnv1a(payload)}`);
@@ -480,15 +619,15 @@ describe("cursor — autenticado, opaco e vinculado", () => {
     // Prova que a validação de campos não depende do MAC: mesmo quem detém a
     // chave não consegue injetar uma tupla impossível.
     for (const payload of [
-      [1, "cash", "2026-08", 100, 1, "PLR-123", 0], // pseudônimo malformado
-      [1, "cash", "2026-08", -1, 1, P1, 0],
-      [1, "cash", "2026-08", 100, -1, P1, 0],
-      [1, "cash", "2026-08", 100, 1, P1, -5],
-      [1, "cash", "2026-08", 1.5, 1, P1, 0],
-      [1, "cash", "2026-08", 100, 1, P1, 1.5],
-      [99, "cash", "2026-08", 100, 1, P1, 0], // versão desconhecida
-      [1, "cash", "2026-08", 100, 1, P1], // aridade errada
-      [1, "cash", "2026-08", 100, 1, P1, 0, "extra"],
+      [2, "cash", "2026-08", "nao-e-uma-chave", 0], // chave não canônica
+      [2, "cash", "2026-08", "v1|abc|def|" + P1, 0], // componentes não numéricos
+      [2, "cash", "2026-08", "v0|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + P1, 0], // versão de chave errada
+      [2, "cash", "2026-08", buildRankKey(100, 1, P1), -5], // offset negativo
+      [2, "cash", "2026-08", buildRankKey(100, 1, P1), 1.5], // offset fracionário
+      [2, "cash", "2026-08", 42, 0], // chave não textual
+      [99, "cash", "2026-08", buildRankKey(100, 1, P1), 0], // versão de cursor desconhecida
+      [2, "cash", "2026-08", buildRankKey(100, 1, P1)], // aridade errada
+      [2, "cash", "2026-08", buildRankKey(100, 1, P1), 0, "extra"],
     ]) {
       assertDomain(
         () => decodeCursor(sign(JSON.stringify(payload)), expected, SECRET),
@@ -541,7 +680,7 @@ describe("cursor — autenticado, opaco e vinculado", () => {
 
 describe("projeção pública — allowlist estrita", () => {
   it("publica exatamente os campos aprovados", () => {
-    const row = publicEntry(1, stored(125_000, 3, P1));
+    const row = publicEntry(1, P1, stored(125_000, 3, P1));
 
     assert.deepEqual(Object.keys(row).sort(), [
       "economy",
@@ -562,6 +701,7 @@ describe("projeção pública — allowlist estrita", () => {
   it("um campo extra guardado na entry NÃO vaza", () => {
     const row = publicEntry(
       1,
+      P1,
       stored(100, 1, P1, {
         uid: "conta-secreta",
         user_ref: "users/conta-secreta",
@@ -590,7 +730,7 @@ describe("projeção pública — allowlist estrita", () => {
   });
 
   it("o rótulo nunca revela o identificador completo", () => {
-    const row = publicEntry(1, stored(100, 1, P1));
+    const row = publicEntry(1, P1, stored(100, 1, P1));
     assert.notEqual(row.label, row.publicPlayerId);
     assert.ok(!row.label.includes(P1));
   });
@@ -598,7 +738,7 @@ describe("projeção pública — allowlist estrita", () => {
   it("recusa uma posição inválida", () => {
     for (const bad of [0, -1, 1.5, NaN]) {
       assertDomain(
-        () => publicEntry(bad, stored(100, 1, P1)),
+        () => publicEntry(bad, P1, stored(100, 1, P1)),
         "failed-precondition",
         String(bad)
       );
@@ -607,20 +747,63 @@ describe("projeção pública — allowlist estrita", () => {
 
   it("recusa uma entry estruturalmente inválida", () => {
     const cases: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
-      ["pseudônimo malformado", { publicPlayerId: "PLR-123456" }],
-      ["pontuação negativa", { scoreCentavos: -1 }],
-      ["pontuação fracionária", { scoreCentavos: 1.5 }],
-      ["vitórias zero", { winsCount: 0 }],
+      ["chave ausente", { rankKey: undefined }],
+      ["chave de outro tipo", { rankKey: 42 }],
+      ["chave nula", { rankKey: null }],
+      ["chave malformada", { rankKey: "v1|abc|def|" + P1 }],
+      [
+        "chave de outra versão",
+        { rankKey: "v0|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + P1 },
+      ],
       ["economia inválida", { economy: "gold" }],
       ["temporada ausente", { seasonId: "" }],
     ];
 
     for (const [label, patch] of cases) {
       assertDomain(
-        () => publicEntry(1, { ...stored(100, 1, P1), ...patch }),
+        () => publicEntry(1, P1, { ...stored(100, 1, P1), ...patch }),
         "failed-precondition",
         label
       );
     }
+  });
+
+  it("recusa um document id malformado, mesmo com chave válida", () => {
+    for (const bad of ["", "PLR-1", P1 + "x", "  "]) {
+      assertDomain(
+        () => publicEntry(1, bad, stored(100, 1, P1)),
+        "failed-precondition",
+        bad
+      );
+    }
+  });
+
+  it("RECUSA quando a chave aponta para outra identidade que o document id", () => {
+    // O ataque de identidade: doc `P1` carregando a chave de `P2`.
+    assertDomain(
+      () => publicEntry(1, P1, stored(100, 1, P2)),
+      "failed-precondition",
+      "identidade divergente"
+    );
+  });
+
+  it("os campos redundantes NÃO são fonte de verdade: não movem nada", () => {
+    // Esta é a invariante nova. `scoreCentavos`, `winsCount` e
+    // `publicPlayerId` guardados são cópias de auditoria; a resposta vem da
+    // chave canônica e do document id. Corrompê-los não pode mudar a resposta
+    // — era exatamente por lê-los que as duas superfícies divergiam.
+    const honest = publicEntry(1, P1, stored(125_000, 3, P1));
+
+    const tampered = publicEntry(1, P1, {
+      ...stored(125_000, 3, P1),
+      scoreCentavos: 999_999_999,
+      winsCount: -7,
+      publicPlayerId: P2,
+    });
+
+    assert.deepEqual(tampered, honest, "a resposta veio da chave canônica");
+    assert.equal(tampered.scoreCentavos, 125_000);
+    assert.equal(tampered.winsCount, 3);
+    assert.equal(tampered.publicPlayerId, P1);
   });
 });

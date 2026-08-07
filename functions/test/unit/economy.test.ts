@@ -306,6 +306,11 @@ describe("decideBetaCompletedReplay", () => {
 
 describe("payloads exatos continuam rejeitando economy_type", () => {
   it("startTournament e declareTournamentResult não aceitam economy_type", () => {
+    // A rejeição continua, mas a mensagem virou GENÉRICA: o nome do campo é
+    // texto controlado pelo cliente e não pode ser ecoado na resposta nem no
+    // log (JSON aceita quebras de linha numa chave — ecoá-la permitiria forjar
+    // linhas de log). Isto vale para assertExactPayload; a mensagem fixa de
+    // resolveStoredEconomyType é outra fronteira e permanece como está.
     for (const allowed of [
       ["tournamentid"],
       ["tournamentid", "winneruid"],
@@ -318,7 +323,11 @@ describe("payloads exatos continuam rejeitando economy_type", () => {
           ),
         "invalid-argument"
       );
-      assert.ok(e.message.includes("economy_type"));
+      assert.equal(e.message, "Payload inválido.");
+      assert.ok(
+        !e.message.includes("economy_type"),
+        "o nome do campo do cliente não pode vazar"
+      );
     }
   });
 });

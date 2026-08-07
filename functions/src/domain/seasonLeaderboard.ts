@@ -26,7 +26,7 @@ export const LEADERBOARD_DEFAULT_LIMIT = 50;
 export const LEADERBOARD_MAX_LIMIT = 100;
 
 /** The cursor format version, so a stale client cursor is rejected, not misread. */
-export const LEADERBOARD_CURSOR_VERSION = 1;
+export const LEADERBOARD_CURSOR_VERSION = 2;
 
 // ── Request normalization ───────────────────────────────────────────────────
 
@@ -104,6 +104,159 @@ export function assertSeasonServable(
   }
 }
 
+// ── Canonical ordering key ──────────────────────────────────────────────────
+
+/**
+ * THE CANONICAL SORT KEY — one string field that IS the ordering.
+ *
+ * WHY A SINGLE KEY. Ordering on the three stored fields cannot express
+ * "structurally valid" to Firestore. `orderBy` drops a document only when the
+ * field is ABSENT; a field present with the wrong TYPE still sorts (Firestore
+ * orders across types), so a corrupt entry silently entered the aggregates
+ * while the page that had to render it failed — the two surfaces disagreed.
+ *
+ * `rankKey` closes that by construction:
+ *
+ *   v1|<complement(scoreCentavos)>|<complement(winsCount)>|<publicPlayerId>
+ *
+ * - ONE predictable Firestore type (string), so the half-open range
+ *   [RANK_KEY_MIN, RANK_KEY_MAX) matches strings of THIS version and nothing
+ *   else. Numbers, null, booleans, arrays, maps, bytes and timestamps all fall
+ *   outside it, as does another schema version — verified against the emulator.
+ * - each number is stored as a fixed-width complement, so a single ASCENDING
+ *   string sort reproduces scoreCentavos DESC, winsCount DESC exactly.
+ * - the LAST component is the document id, which is the authoritative
+ *   `publicPlayerId`. Document ids are unique, so the key is unique: the
+ *   comparator identifies exactly one entry and `startAfter` is unambiguous.
+ *
+ * It is produced ONLY by the internal write path, from values the domain has
+ * already normalised — never from client input and never at read time.
+ */
+export const RANK_KEY_VERSION = "v1";
+
+/** Separator. Outside the pseudonym alphabet `[A-Za-z0-9_-]`, so it cannot occur inside a component. */
+const RANK_KEY_SEPARATOR = "|";
+
+/**
+ * The queryable bounds of this version's key space, half-open.
+ *
+ * Both complements are DECIMAL, so a well-formed key is always
+ * `v1|` followed by a digit. Bounding on `0`…`:` (the code point right after
+ * `9`) therefore admits only keys whose first numeric position really is
+ * numeric — a string like `v1|abc|…` sorts above `v1|:` and falls outside, so
+ * the count-based invariant sees it as physically present but not canonical
+ * and the season fails closed. A looser `["v1|", "v1}")` bound would have let
+ * such a key inside the aggregates while the page that had to render it
+ * failed — reintroducing exactly the divergence this key exists to remove.
+ */
+export const RANK_KEY_MIN = `${RANK_KEY_VERSION}${RANK_KEY_SEPARATOR}0`;
+
+/** Exclusive upper bound: ":" is the code point right after "9". */
+export const RANK_KEY_MAX = `${RANK_KEY_VERSION}${RANK_KEY_SEPARATOR}:`;
+
+/**
+ * Complement base. Every count this key orders is a safe integer, so
+ * `MAX_SAFE_INTEGER - value` is itself a non-negative safe integer.
+ */
+const RANK_KEY_COMPLEMENT_BASE = Number.MAX_SAFE_INTEGER;
+
+/** Fixed width, so complements compare digit by digit. */
+const RANK_KEY_NUMBER_WIDTH = String(RANK_KEY_COMPLEMENT_BASE).length;
+
+function isRankableCount(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= RANK_KEY_COMPLEMENT_BASE
+  );
+}
+
+/** `MAX - value`, zero-padded, so ascending string order means descending value. */
+function complement(value: number): string {
+  return String(RANK_KEY_COMPLEMENT_BASE - value).padStart(
+    RANK_KEY_NUMBER_WIDTH,
+    "0"
+  );
+}
+
+/**
+ * Builds the canonical key. WRITE PATH ONLY.
+ *
+ * Fails closed on any input the ordering could not represent faithfully, so a
+ * malformed entry is never given a queryable key in the first place.
+ */
+export function buildRankKey(
+  scoreCentavos: unknown,
+  winsCount: unknown,
+  publicPlayerId: unknown
+): string {
+  if (!isRankableCount(scoreCentavos)) {
+    throw failedPrecondition("Entry com pontuação inválida.");
+  }
+  if (!isRankableCount(winsCount)) {
+    throw failedPrecondition("Entry com vitórias inválidas.");
+  }
+  if (!isPublicPlayerId(publicPlayerId)) {
+    throw failedPrecondition("Entry sem identificador público válido.");
+  }
+
+  return [
+    RANK_KEY_VERSION,
+    complement(scoreCentavos),
+    complement(winsCount),
+    publicPlayerId,
+  ].join(RANK_KEY_SEPARATOR);
+}
+
+/** The values a canonical key carries. The key is the ONLY source of truth for them. */
+export interface RankKeyParts {
+  readonly scoreCentavos: number;
+  readonly winsCount: number;
+  readonly publicPlayerId: string;
+}
+
+/**
+ * Decodes a canonical key, or fails closed.
+ *
+ * READ PATH. Every published score, win count and pseudonym comes from here,
+ * so the redundant `scoreCentavos` / `winsCount` / `publicPlayerId` fields kept
+ * on the document for auditing can never become a second source of truth able
+ * to move a rank, a page or a response.
+ */
+export function decodeRankKey(rankKey: unknown): RankKeyParts {
+  if (typeof rankKey !== "string") {
+    throw failedPrecondition("Entry sem chave canônica.");
+  }
+
+  const parts = rankKey.split(RANK_KEY_SEPARATOR);
+  if (parts.length !== 4 || parts[0] !== RANK_KEY_VERSION) {
+    throw failedPrecondition("Entry sem chave canônica.");
+  }
+
+  const [, rawScore, rawWins, publicPlayerId] = parts;
+  if (
+    rawScore.length !== RANK_KEY_NUMBER_WIDTH ||
+    rawWins.length !== RANK_KEY_NUMBER_WIDTH ||
+    !/^\d+$/.test(rawScore) ||
+    !/^\d+$/.test(rawWins)
+  ) {
+    throw failedPrecondition("Entry sem chave canônica.");
+  }
+
+  const scoreCentavos = RANK_KEY_COMPLEMENT_BASE - Number(rawScore);
+  const winsCount = RANK_KEY_COMPLEMENT_BASE - Number(rawWins);
+  if (
+    !isRankableCount(scoreCentavos) ||
+    !isRankableCount(winsCount) ||
+    !isPublicPlayerId(publicPlayerId)
+  ) {
+    throw failedPrecondition("Entry sem chave canônica.");
+  }
+
+  return { scoreCentavos, winsCount, publicPlayerId };
+}
+
 // ── Canonical order ─────────────────────────────────────────────────────────
 
 /** The three comparator levels, as stored on an entry. */
@@ -158,8 +311,16 @@ export function rankFromAhead(ahead: unknown): number {
 export interface LeaderboardCursor {
   readonly economy: RankingEconomy;
   readonly seasonId: string;
-  /** The ordering tuple of the LAST row of the previous page. */
-  readonly after: OrderKey;
+  /**
+   * The canonical key of the LAST row of the previous page.
+   *
+   * One component, not a three-field tuple: `rankKey` already encodes the whole
+   * ordering AND ends in the unique document id, so `startAfter(rankKey)`
+   * resumes after exactly one entry. The old tuple could repeat when two
+   * documents carried the same stored `publicPlayerId`, which made
+   * `startAfter` ambiguous and could skip or repeat a row.
+   */
+  readonly afterRankKey: string;
   /** How many rows precede the next page, so numbering continues across pages. */
   readonly offset: number;
 }
@@ -212,9 +373,7 @@ function payloadOf(cursor: LeaderboardCursor): string {
     LEADERBOARD_CURSOR_VERSION,
     cursor.economy,
     cursor.seasonId,
-    cursor.after.scoreCentavos,
-    cursor.after.winsCount,
-    cursor.after.publicPlayerId,
+    cursor.afterRankKey,
     cursor.offset,
   ]);
 }
@@ -315,25 +474,30 @@ export function decodeCursor(
     throw invalidArgument("Cursor inválido.");
   }
 
-  if (!Array.isArray(parts) || parts.length !== 7) {
+  if (!Array.isArray(parts) || parts.length !== 5) {
     throw invalidArgument("Cursor inválido.");
   }
 
-  const [version, economy, seasonId, score, wins, publicPlayerId, offset] =
+  const [version, economy, seasonId, afterRankKey, offset] =
     parts as unknown[];
 
   if (version !== LEADERBOARD_CURSOR_VERSION) {
     throw invalidArgument("Cursor inválido.");
   }
   if (
-    !Number.isSafeInteger(score) ||
-    (score as number) < 0 ||
-    !Number.isSafeInteger(wins) ||
-    (wins as number) < 0 ||
     !Number.isSafeInteger(offset) ||
     (offset as number) < 0 ||
-    !isPublicPlayerId(publicPlayerId)
+    typeof afterRankKey !== "string" ||
+    afterRankKey < RANK_KEY_MIN ||
+    afterRankKey >= RANK_KEY_MAX
   ) {
+    throw invalidArgument("Cursor inválido.");
+  }
+  // The key must itself decode: a cursor can only point at a position the
+  // canonical ordering is actually able to express.
+  try {
+    decodeRankKey(afterRankKey);
+  } catch {
     throw invalidArgument("Cursor inválido.");
   }
 
@@ -347,11 +511,7 @@ export function decodeCursor(
   return {
     economy: economy as RankingEconomy,
     seasonId: seasonId as string,
-    after: {
-      scoreCentavos: score as number,
-      winsCount: wins as number,
-      publicPlayerId: publicPlayerId,
-    },
+    afterRankKey,
     offset: offset as number,
   };
 }
@@ -365,6 +525,7 @@ export interface StoredLeaderboardEntry {
   readonly seasonId?: unknown;
   readonly scoreCentavos?: unknown;
   readonly winsCount?: unknown;
+  readonly rankKey?: unknown;
 }
 
 export interface PublicLeaderboardEntry {
@@ -385,33 +546,39 @@ export interface PublicLeaderboardEntry {
  * by accident. The uid is absent because it is not on the entry at all — and
  * `firstPrizeAt`, `lastPrizeAt` and `updatedAt` are audit data that no client
  * needs.
+ *
+ * EVERY ORDERED VALUE COMES FROM THE CANONICAL KEY, and the identity comes from
+ * the DOCUMENT ID. The stored `scoreCentavos` / `winsCount` / `publicPlayerId`
+ * fields are audit copies and are deliberately NOT read here: were they read,
+ * they would be a second source of truth able to disagree with the key that
+ * ordered the row — which is precisely how the leaderboard and the individual
+ * position came to diverge. `documentId` and the key's own id component must
+ * agree, or the entry is corrupt and fails closed.
  */
 export function publicEntry(
   position: number,
+  documentId: string,
   stored: StoredLeaderboardEntry
 ): PublicLeaderboardEntry {
   if (!Number.isSafeInteger(position) || position < 1) {
     throw new DomainError("failed-precondition", "Posição inválida.");
   }
-  if (!isPublicPlayerId(stored.publicPlayerId)) {
+  if (!isPublicPlayerId(documentId)) {
     throw new DomainError(
       "failed-precondition",
       "Entry sem identificador público válido."
     );
   }
-  if (
-    typeof stored.scoreCentavos !== "number" ||
-    !Number.isSafeInteger(stored.scoreCentavos) ||
-    stored.scoreCentavos < 0
-  ) {
-    throw new DomainError("failed-precondition", "Entry com pontuação inválida.");
-  }
-  if (
-    typeof stored.winsCount !== "number" ||
-    !Number.isSafeInteger(stored.winsCount) ||
-    stored.winsCount < 1
-  ) {
-    throw new DomainError("failed-precondition", "Entry com vitórias inválidas.");
+
+  // Throws `failed-precondition` when the key is absent, mistyped, of another
+  // version or structurally invalid.
+  const parts = decodeRankKey(stored.rankKey);
+
+  if (parts.publicPlayerId !== documentId) {
+    throw new DomainError(
+      "failed-precondition",
+      "Entry com identidade divergente."
+    );
   }
   if (
     stored.economy !== ECONOMY_CASH &&
@@ -425,10 +592,10 @@ export function publicEntry(
 
   return {
     position,
-    publicPlayerId: stored.publicPlayerId,
-    label: publicPlayerLabel(stored.publicPlayerId),
-    scoreCentavos: stored.scoreCentavos,
-    winsCount: stored.winsCount,
+    publicPlayerId: documentId,
+    label: publicPlayerLabel(documentId),
+    scoreCentavos: parts.scoreCentavos,
+    winsCount: parts.winsCount,
     economy: stored.economy,
     seasonId: stored.seasonId,
   };

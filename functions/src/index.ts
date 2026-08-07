@@ -124,14 +124,16 @@ import {
 } from "./domain/seasonRanking.js";
 import {
   assertSeasonServable,
+  buildRankKey,
   decodeCursor,
   encodeCursor,
   normalizeEconomy,
   normalizeLimit,
   publicEntry,
+  RANK_KEY_MAX,
+  RANK_KEY_MIN,
   RANKING_CURSOR_SECRET_ENV,
   rankFromAhead,
-  type OrderKey,
 } from "./domain/seasonLeaderboard.js";
 import {
   assertPublicPlayerId,
@@ -2636,11 +2638,23 @@ export const onPrizeTransactionCreatedHandler = async (
     // the same instant.
     const stampedAt = admin.firestore.FieldValue.serverTimestamp();
 
+    // THE CANONICAL KEY IS MINTED HERE AND ONLY HERE — the internal write path,
+    // from values `decideEntry` has already normalised, and from the document
+    // id that IS the pseudonym. `buildRankKey` fails closed on anything the
+    // ordering could not represent, so an entry can never reach the collection
+    // with a key the read path cannot query.
+    const rankKey = buildRankKey(
+      entryPlan.scoreCentavos,
+      entryPlan.winsCount,
+      entryRef.id
+    );
+
     if (entryPlan.kind === "create") {
       transaction.set(entryRef, {
         publicPlayerId,
         economy,
         seasonId,
+        rankKey,
         scoreCentavos: entryPlan.scoreCentavos,
         winsCount: entryPlan.winsCount,
         firstPrizeAt: admin.firestore.Timestamp.fromDate(entryPlan.firstPrizeAt),
@@ -2649,6 +2663,7 @@ export const onPrizeTransactionCreatedHandler = async (
       });
     } else {
       transaction.update(entryRef, {
+        rankKey,
         scoreCentavos: entryPlan.scoreCentavos,
         winsCount: entryPlan.winsCount,
         lastPrizeAt: admin.firestore.Timestamp.fromDate(entryPlan.lastPrizeAt),
@@ -2708,29 +2723,72 @@ function seasonEntriesQuery(
     .collection(SEASON_ENTRIES_SUBCOLLECTION);
 }
 
+/** The canonical, structurally-valid slice of a season's entries. */
+function canonicalEntriesQuery(
+  economy: RankingEconomy,
+  seasonId: string
+): admin.firestore.Query {
+  return seasonEntriesQuery(economy, seasonId)
+    .where("rankKey", ">=", RANK_KEY_MIN)
+    .where("rankKey", "<", RANK_KEY_MAX)
+    .orderBy("rankKey", "asc");
+}
+
+/** What both callables must agree on before publishing anything. */
+interface SeasonIntegrity {
+  readonly playerCount: number;
+}
+
 /**
- * Fails closed when a season parent EXISTS but its stored counter is
- * malformed — absent, non-numeric, negative or fractional.
+ * THE SEASON INVARIANT, proven with aggregates and never a scan.
  *
- * The write path (`decideParent`) never produces such a document, so one is
- * out-of-band corruption; serving a ranking from it would silently endorse a
- * state the domain forbids. The counter's VALUE is deliberately not compared
- * to the eligible count here (the response derives from the aggregate, not
- * from this field), and the malformed value never reaches the public message.
+ * Three numbers must agree: the parent's stored `playerCount`, the PHYSICAL
+ * number of documents in the subcollection, and the number that carry a
+ * canonical key of the current version. Both callables run this same check on
+ * the same snapshot, so neither can publish a season the other would refuse.
+ *
+ * The physical count is what makes corruption detectable without reading a
+ * single document: any entry lacking a key, carrying a key of the wrong TYPE
+ * or of another schema version is counted physically but not canonically, so
+ * the two diverge and the season fails closed. That covers a partial
+ * migration, a residual document, a stale parent, and a parent that is missing
+ * while its subcollection is not empty.
+ *
+ * The message is generic — it names no document, field or value.
  */
-function assertParentCounterShape(parentData: Record<string, unknown>): void {
-  const stored = parentData.playerCount;
+function assertSeasonIntegrity(input: {
+  readonly parentExists: boolean;
+  readonly parentData: Record<string, unknown>;
+  readonly physicalCount: number;
+  readonly canonicalCount: number;
+}): SeasonIntegrity {
+  const inconsistent = (): never => {
+    throw new DomainError(
+      "failed-precondition",
+      "Documento de ranking inconsistente."
+    );
+  };
+
+  if (input.physicalCount !== input.canonicalCount) inconsistent();
+
+  if (!input.parentExists) {
+    // A season with no parent may only be answered when its subcollection is
+    // provably empty; anything else is corruption, not an empty season.
+    if (input.physicalCount !== 0) inconsistent();
+    return { playerCount: 0 };
+  }
+
+  const stored = input.parentData.playerCount;
   if (
     typeof stored !== "number" ||
     !Number.isSafeInteger(stored) ||
     stored < 0
   ) {
-    throw new DomainError(
-      "failed-precondition",
-      "Documento de ranking inconsistente: o contador de jogadores da " +
-        "temporada é inválido."
-    );
+    inconsistent();
   }
+  if ((stored as number) !== input.canonicalCount) inconsistent();
+
+  return { playerCount: input.canonicalCount };
 }
 
 /**
@@ -2809,29 +2867,20 @@ export const getSeasonLeaderboardHandler = async (
         ? null
         : decodeCursor(rawCursor, { economy, seasonId }, cursorSecret);
 
-    // The ELIGIBLE set: the ordered page and the total below share this exact
-    // shape, so the rows served and the playerCount published can never
-    // describe different sets (§8.3) — an entry missing any comparator field
-    // is invisible to both, and both are served by the one declared index.
-    const eligible = seasonEntriesQuery(economy, seasonId)
-      .orderBy("scoreCentavos", "desc")
-      .orderBy("winsCount", "desc")
-      .orderBy("publicPlayerId", "asc");
+    // The CANONICAL set: one string key that is the whole ordering, so the page
+    // and every aggregate below describe provably the same entries.
+    const canonical = canonicalEntriesQuery(economy, seasonId);
+    const physical = seasonEntriesQuery(economy, seasonId);
 
-    let query: admin.firestore.Query = eligible;
-    if (cursor !== null) {
-      query = query.startAfter(
-        cursor.after.scoreCentavos,
-        cursor.after.winsCount,
-        cursor.after.publicPlayerId
-      );
-    }
+    // One component, and it is unique: `rankKey` ends in the document id.
+    const query =
+      cursor === null ? canonical : canonical.startAfter(cursor.afterRankKey);
 
     // ── ONE consistent snapshot ─────────────────────────────────────────────
-    // Parent (structural validation), the page and the eligible total are read
-    // through the SAME read-only transaction: the rows and the playerCount of
-    // one response always belong to one state of the season. `readOnly: true`
-    // makes a write structurally impossible on this path.
+    // Parent, both integrity counts and the page are read through the SAME
+    // read-only transaction, so the rows and the playerCount of one response
+    // always belong to one state of the season. `readOnly: true` makes a write
+    // structurally impossible on this path.
     const snapshot = await db.runTransaction(
       async (transaction) => {
         const parentSnap = await transaction.get(
@@ -2839,21 +2888,23 @@ export const getSeasonLeaderboardHandler = async (
             .collection(SEASON_RANKINGS_COLLECTION)
             .doc(seasonDocumentId(economy, seasonId))
         );
-        if (parentSnap.exists) {
-          assertParentCounterShape(parentSnap.data() ?? {});
-        }
 
         // One extra row decides whether another page exists, without a second
         // query.
-        const [pageSnap, totalSnap] = await Promise.all([
+        const [physicalSnap, canonicalSnap, pageSnap] = await Promise.all([
+          transaction.get(physical.count()),
+          transaction.get(canonical.count()),
           transaction.get(query.limit(limit + 1)),
-          transaction.get(eligible.count()),
         ]);
 
-        return {
-          docs: pageSnap.docs,
-          playerCount: totalSnap.data().count,
-        };
+        const integrity = assertSeasonIntegrity({
+          parentExists: parentSnap.exists,
+          parentData: parentSnap.data() ?? {},
+          physicalCount: physicalSnap.data().count,
+          canonicalCount: canonicalSnap.data().count,
+        });
+
+        return { docs: pageSnap.docs, playerCount: integrity.playerCount };
       },
       { readOnly: true }
     );
@@ -2863,21 +2914,18 @@ export const getSeasonLeaderboardHandler = async (
 
     const startOffset = cursor === null ? 0 : cursor.offset;
     const entries = page.map((doc, index) =>
-      publicEntry(startOffset + index + 1, doc.data() ?? {})
+      publicEntry(startOffset + index + 1, doc.id, doc.data() ?? {})
     );
+    const lastRankKey =
+      page.length > 0 ? String(page[page.length - 1].get("rankKey")) : null;
 
-    const last = entries[entries.length - 1];
     const nextCursor =
-      hasMore && last !== undefined
+      hasMore && lastRankKey !== null
         ? encodeCursor(
             {
               economy,
               seasonId,
-              after: {
-                scoreCentavos: last.scoreCentavos,
-                winsCount: last.winsCount,
-                publicPlayerId: last.publicPlayerId,
-              },
+              afterRankKey: lastRankKey,
               offset: startOffset + entries.length,
             },
             cursorSecret
@@ -2993,27 +3041,16 @@ export const getMySeasonRankingHandler = async (
       .collection(SEASON_RANKINGS_COLLECTION)
       .doc(seasonDocumentId(economy, seasonId));
 
-    // ── ONE consistent snapshot ──────────────────────────────────────────────
-    // Parent, entry and all four aggregates (the three disjoint ahead-counts
-    // and the eligible total that becomes playerCount) are read through the
-    // SAME read-only transaction, so they share one read timestamp. Issuing
-    // them independently let a competitor cross between two of the disjoint
-    // sets mid-read and be counted twice — or missed — producing an ordinal
-    // that matched no state the season was ever actually in.
+    // ── ONE consistent snapshot ────────────────────────────────────
+    // Parent, the entry, both integrity counts and the ahead-count are read
+    // through the SAME read-only transaction, so they share one read
+    // timestamp. Issuing them independently let a competitor cross between
+    // the counted sets mid-read and be counted twice — or missed — producing
+    // an ordinal that matched no state the season was ever actually in.
     //
-    // `readOnly: true` is not decoration: Firestore refuses writes inside it, so
-    // a read path can never acquire one by accident.
-    // THE ELIGIBLE SET. The leaderboard page orders by all three comparator
-    // fields, and Firestore drops a document from an `orderBy` when the field
-    // is missing — so a structurally incomplete entry is invisible to the
-    // leaderboard. Every aggregate below carries the same `orderBy` chain,
-    // which makes the counted set IDENTICAL to the served set: an entry that
-    // cannot appear on any page can never shift a rank or the playerCount
-    // (§8.3 — the two paths cannot disagree). Same declared composite index.
-    const eligible = entries
-      .orderBy("scoreCentavos", "desc")
-      .orderBy("winsCount", "desc")
-      .orderBy("publicPlayerId", "asc");
+    // `readOnly: true` is not decoration: Firestore refuses writes inside it,
+    // so a read path can never acquire one by accident.
+    const canonical = canonicalEntriesQuery(economy, seasonId);
 
     const snapshot = await db.runTransaction(
       async (transaction) => {
@@ -3023,92 +3060,50 @@ export const getMySeasonRankingHandler = async (
           ? await transaction.get(entries.doc(publicPlayerId))
           : null;
 
-        // Test-only seam: lets a concurrency test mutate a competitor AFTER the
-        // snapshot is fixed but BEFORE the counts run. Never reachable from a
-        // client — it is a handler parameter, not a payload field.
+        // Test-only seam: lets a concurrency test mutate a competitor AFTER
+        // the snapshot is fixed but BEFORE the counts run. Never reachable
+        // from a client — a handler parameter, not a payload field.
         if (options.afterFirstRead !== undefined) {
           await options.afterFirstRead();
         }
 
-        // The write path (decideParent) treats an entry without its season
-        // parent as corruption and fails closed rather than repairing it. The
-        // read path answers from the same invariant: publishing a rank next to
-        // `playerCount: 0` would describe a season state that must not exist.
-        if (!parentSnap.exists) {
-          if (entrySnap !== null && entrySnap.exists) {
-            throw new DomainError(
-              "failed-precondition",
-              "Documento de ranking inconsistente: o parent da temporada não " +
-                "existe, mas a entry do jogador já existe."
-            );
-          }
-          return { ranked: false as const, playerCount: 0 };
-        }
+        const [physicalSnap, canonicalSnap] = await Promise.all([
+          transaction.get(entries.count()),
+          transaction.get(canonical.count()),
+        ]);
 
-        // The parent exists: its stored counter must at least be well-formed,
-        // even though the RESPONSE derives from the eligible aggregate.
-        assertParentCounterShape(parentSnap.data() ?? {});
+        // The SAME invariant the leaderboard proves, on the same snapshot, so
+        // neither surface can answer for a season the other would refuse.
+        const integrity = assertSeasonIntegrity({
+          parentExists: parentSnap.exists,
+          parentData: parentSnap.data() ?? {},
+          physicalCount: physicalSnap.data().count,
+          canonicalCount: canonicalSnap.data().count,
+        });
 
         if (entrySnap === null || !entrySnap.exists) {
-          const total = await transaction.get(eligible.count());
-          return {
-            ranked: false as const,
-            playerCount: total.data().count,
-          };
+          return { ranked: false as const, playerCount: integrity.playerCount };
         }
 
-        const mine = publicEntry(1, entrySnap.data() ?? {});
-        const key: OrderKey = {
-          scoreCentavos: mine.scoreCentavos,
-          winsCount: mine.winsCount,
-          publicPlayerId: mine.publicPlayerId,
-        };
+        const mine = publicEntry(1, entrySnap.id, entrySnap.data() ?? {});
 
-        // Three DISJOINT counts covering exactly the ELIGIBLE entries ahead
-        // (§9.2), plus the eligible total — all four read through this
-        // transaction, all four constrained to the same field set the ordered
-        // page requires.
-        const [
-          betterScore,
-          sameScoreMoreWins,
-          sameScoreSameWinsEarlierId,
-          total,
-        ] = await Promise.all([
-          transaction.get(
-            entries
-              .where("scoreCentavos", ">", key.scoreCentavos)
-              .orderBy("scoreCentavos", "desc")
-              .orderBy("winsCount", "desc")
-              .orderBy("publicPlayerId", "asc")
-              .count()
-          ),
-          transaction.get(
-            entries
-              .where("scoreCentavos", "==", key.scoreCentavos)
-              .where("winsCount", ">", key.winsCount)
-              .orderBy("winsCount", "desc")
-              .orderBy("publicPlayerId", "asc")
-              .count()
-          ),
-          transaction.get(
-            entries
-              .where("scoreCentavos", "==", key.scoreCentavos)
-              .where("winsCount", "==", key.winsCount)
-              .where("publicPlayerId", "<", key.publicPlayerId)
-              .orderBy("publicPlayerId", "asc")
-              .count()
-          ),
-          transaction.get(eligible.count()),
-        ]);
+        // ONE count, and it is exactly the entries ahead: `rankKey` IS the
+        // canonical order, so every key strictly below the caller's precedes
+        // them. Disjointness becomes structural instead of argued — there are
+        // no overlapping sets left to reason about — and the caller's own row
+        // is excluded because the upper bound is strict.
+        const ahead = await transaction.get(
+          entries
+            .where("rankKey", ">=", RANK_KEY_MIN)
+            .where("rankKey", "<", String(entrySnap.get("rankKey")))
+            .count()
+        );
 
         return {
           ranked: true as const,
-          playerCount: total.data().count,
+          playerCount: integrity.playerCount,
           mine,
-          ahead:
-            betterScore.data().count +
-            sameScoreMoreWins.data().count +
-            sameScoreSameWinsEarlierId.data().count,
+          ahead: ahead.data().count,
         };
       },
       { readOnly: true }

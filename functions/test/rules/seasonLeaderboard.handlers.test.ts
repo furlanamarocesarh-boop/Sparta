@@ -15,6 +15,7 @@ import {
   SEASON_RANKINGS_COLLECTION,
   seasonDocumentId,
 } from "../../src/domain/seasonRanking.js";
+import { buildRankKey } from "../../src/domain/seasonLeaderboard.js";
 
 /**
  * Behavioral tests for `getSeasonLeaderboard` and `getMySeasonRanking`, run
@@ -143,6 +144,9 @@ async function seedEntry(
       publicPlayerId,
       economy,
       seasonId,
+      // Exactly what the write path mints: the canonical key, built from the
+      // normalised values and the document id.
+      rankKey: buildRankKey(scoreCentavos, winsCount, publicPlayerId),
       scoreCentavos,
       winsCount,
       firstPrizeAt: admin.firestore.Timestamp.fromDate(new Date("2026-08-01")),
@@ -1108,110 +1112,212 @@ describe("getMySeasonRanking — isolamento por aggregate", () => {
 // Reauditoria — conjunto elegível: paridade estrutural com o leaderboard
 // ---------------------------------------------------------------------------
 
-describe("getMySeasonRanking — conjunto elegível", () => {
-  /** Uma entry estruturalmente incompleta, escrita como um write fora de banda. */
-  async function seedMalformedEntry(
+describe("conjunto canônico — corrupção falha fechada nas DUAS callables", () => {
+  /**
+   * Escreve uma entry fora de banda. As fixtures partem SEMPRE de uma entry
+   * completa, idêntica à que o write path produz, e corrompem exatamente um
+   * campo — nunca um documento artificialmente ilegível.
+   */
+  async function corruptEntry(
     id: string,
-    fields: Record<string, unknown>
+    patch: Record<string, unknown>
   ): Promise<void> {
+    const base = {
+      publicPlayerId: id,
+      economy: ECONOMY_CASH,
+      seasonId: SEASON,
+      rankKey: buildRankKey(500, 9, id),
+      scoreCentavos: 500,
+      winsCount: 9,
+      firstPrizeAt: admin.firestore.Timestamp.fromDate(new Date("2026-08-01")),
+      lastPrizeAt: admin.firestore.Timestamp.fromDate(new Date("2026-08-15")),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
     await parentRef(ECONOMY_CASH)
       .collection(SEASON_ENTRIES_SUBCOLLECTION)
       .doc(id)
-      .set(fields);
+      .set({ ...base, ...patch });
   }
 
-  it("entry sem winsCount é invisível para o leaderboard E para o rank", async () => {
-    // O cenário exato do probe da reauditoria: A 300/2, C 200/2 e uma entry
-    // Z com score 500 mas SEM winsCount. O parent declara 3 — o valor
-    // materializado — para provar que playerCount vem do count elegível.
+  /** Both surfaces must reach the SAME public decision on the same season. */
+  async function bothFailClosed(label: string): Promise<void> {
+    const board = await expectFailure(() =>
+      getSeasonLeaderboardHandler(
+        { economy: ECONOMY_CASH, seasonId: SEASON },
+        ctxOf("uid-any")
+      )
+    );
+    const mine = await expectFailure(() =>
+      getMySeasonRankingHandler(
+        { economy: ECONOMY_CASH, seasonId: SEASON },
+        ctxOf("uid-c")
+      )
+    );
+    assert.equal(board, "failed-precondition", `${label}: leaderboard`);
+    assert.equal(mine, "failed-precondition", `${label}: posição individual`);
+  }
+
+  const Z = "Zzzzzzzzzzzzzzzzzzzzzz";
+
+  // O caso original da auditoria, agora com o veredito novo.
+  it("A/C válidos + Z com winsCount inválido + parent 3: AMBAS falham fechadas", async () => {
     await seedEntry(ECONOMY_CASH, IDS[0], 300, 2);
     await seedEntry(ECONOMY_CASH, IDS[2], 200, 2);
     await seedParent(ECONOMY_CASH, 3, 1000);
-    await seedMalformedEntry("Zzzzzzzzzzzzzzzzzzzzzz", {
-      publicPlayerId: "Zzzzzzzzzzzzzzzzzzzzzz",
-      economy: ECONOMY_CASH,
-      seasonId: SEASON,
-      scoreCentavos: 500,
-    });
+    await corruptEntry(Z, { winsCount: null, rankKey: 42 });
     await bindIdentity("uid-c", IDS[2]);
 
-    const board = await getSeasonLeaderboardHandler(
-      { economy: ECONOMY_CASH, seasonId: SEASON },
-      ctxOf("uid-c")
-    );
-    assert.deepEqual(
-      (board.entries as any[]).map((e) => [e.publicPlayerId, e.position]),
-      [
-        [IDS[0], 1],
-        [IDS[2], 2],
-      ],
-      "o leaderboard serve exatamente A e C"
-    );
-    assert.equal(
-      board.playerCount,
-      2,
-      "o playerCount do LEADERBOARD também vem do conjunto elegível — o " +
-        "parent declara 3 e a resposta mesmo assim diz 2"
-    );
-
-    const mine = await getMySeasonRankingHandler(
-      { economy: ECONOMY_CASH, seasonId: SEASON },
-      ctxOf("uid-c")
-    );
-    assert.equal(mine.rank, 2, "o mesmo ordinal que o leaderboard mostra");
-    assert.equal(
-      mine.playerCount,
-      2,
-      "playerCount conta o conjunto ELEGÍVEL, não o materializado"
-    );
+    await bothFailClosed("winsCount inválido");
   });
 
-  for (const [label, fields] of [
-    [
-      "sem winsCount",
-      { publicPlayerId: "Zzzzzzzzzzzzzzzzzzzzzz", scoreCentavos: 999 },
-    ],
-    ["sem publicPlayerId", { scoreCentavos: 999, winsCount: 9 }],
-    [
-      "sem scoreCentavos",
-      { publicPlayerId: "Zzzzzzzzzzzzzzzzzzzzzz", winsCount: 99 },
-    ],
+  // A chave canônica é a ÚNICA fonte de ordenação: corromper as cópias de
+  // auditoria não pode mudar resposta nenhuma, nem derrubar o ranking.
+  for (const [label, patch] of [
+    ["scoreCentavos ausente", { scoreCentavos: admin.firestore.FieldValue.delete() }],
+    ["scoreCentavos null", { scoreCentavos: null }],
+    ["scoreCentavos boolean", { scoreCentavos: true }],
+    ["scoreCentavos string", { scoreCentavos: "500" }],
+    ["scoreCentavos negativo", { scoreCentavos: -1 }],
+    ["scoreCentavos fracionário", { scoreCentavos: 1.5 }],
+    ["scoreCentavos NaN", { scoreCentavos: NaN }],
+    ["winsCount ausente", { winsCount: admin.firestore.FieldValue.delete() }],
+    ["winsCount null", { winsCount: null }],
+    ["winsCount boolean", { winsCount: false }],
+    ["winsCount string", { winsCount: "9" }],
+    ["winsCount negativo", { winsCount: -1 }],
+    ["winsCount fracionário", { winsCount: 2.5 }],
+    ["winsCount NaN", { winsCount: NaN }],
+    ["publicPlayerId ausente", { publicPlayerId: admin.firestore.FieldValue.delete() }],
+    ["publicPlayerId null", { publicPlayerId: null }],
+    ["publicPlayerId número", { publicPlayerId: 42 }],
+    ["publicPlayerId vazio", { publicPlayerId: "" }],
+    ["publicPlayerId malformado", { publicPlayerId: "PLR-1" }],
+    ["publicPlayerId != document id", { publicPlayerId: IDS[0] }],
   ] as const) {
-    it(`entry ${label} não altera rank nem NENHUM dos dois playerCount`, async () => {
+    it(`cópia de auditoria corrompida (${label}) NÃO move nada`, async () => {
       await seedStandardSeason();
-      await seedMalformedEntry("Zzzzzzzzzzzzzzzzzzzzzz", {
-        economy: ECONOMY_CASH,
-        seasonId: SEASON,
-        ...fields,
-      });
-      // O parent declara 6 — o valor materializado, contando a entry
-      // malformada — para provar que AMBAS as respostas usam o count elegível.
-      await seedParent(ECONOMY_CASH, 6, 1100);
-      await bindIdentity("uid-c", IDS[2]); // C: 200/2 -> posição 3
+      await bindIdentity("uid-c", IDS[2]);
+      // A entry de E continua com a chave canônica correta; só a cópia muda.
+      await parentRef(ECONOMY_CASH)
+        .collection(SEASON_ENTRIES_SUBCOLLECTION)
+        .doc(IDS[4])
+        .update(patch as Record<string, unknown>);
 
       const board = await getSeasonLeaderboardHandler(
         { economy: ECONOMY_CASH, seasonId: SEASON },
-        ctxOf("uid-c")
+        ctxOf("uid-any")
       );
-      assert.equal(
-        (board.entries as any[]).length,
-        5,
-        "o leaderboard continua servindo só as 5 entries completas"
-      );
-      assert.equal(
-        board.playerCount,
-        5,
-        "o playerCount do leaderboard vem do conjunto elegível"
+      assert.equal((board.entries as any[]).length, 5, label);
+      assert.equal(board.playerCount, 5, label);
+      assert.deepEqual(
+        (board.entries as any[]).map((e) => e.publicPlayerId),
+        IDS,
+        `${label}: a ordem vem da chave canônica`
       );
 
       const mine = await getMySeasonRankingHandler(
         { economy: ECONOMY_CASH, seasonId: SEASON },
         ctxOf("uid-c")
       );
-      assert.equal(mine.rank, 3, "o rank de C não se move");
-      assert.equal(mine.playerCount, 5, "o playerCount elegível não se move");
+      assert.equal(mine.rank, 3, label);
+      assert.equal(mine.playerCount, 5, label);
     });
   }
+
+  // Corromper a CHAVE, por outro lado, torna a entry não consultável — e isso
+  // as duas callables detectam pelo count físico, sem varredura.
+  for (const [label, patch] of [
+    ["chave ausente", { rankKey: admin.firestore.FieldValue.delete() }],
+    ["chave null", { rankKey: null }],
+    ["chave numérica", { rankKey: 42 }],
+    ["chave boolean", { rankKey: true }],
+    ["chave array", { rankKey: ["v1|x"] }],
+    ["chave mapa", { rankKey: { a: 1 } }],
+    ["chave de outra versão", { rankKey: "v0|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + "Zzzzzzzzzzzzzzzzzzzzzz" }],
+    ["chave de versão futura", { rankKey: "v2|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + "Zzzzzzzzzzzzzzzzzzzzzz" }],
+    ["chave estruturalmente inválida", { rankKey: "v1|abc|def|xyz" }],
+  ] as const) {
+    it(`chave canônica corrompida (${label}): AMBAS falham fechadas`, async () => {
+      await seedStandardSeason();
+      await bindIdentity("uid-c", IDS[2]);
+      await parentRef(ECONOMY_CASH)
+        .collection(SEASON_ENTRIES_SUBCOLLECTION)
+        .doc(IDS[4])
+        .update(patch as Record<string, unknown>);
+
+      await bothFailClosed(label);
+    });
+  }
+
+  it("chave apontando para OUTRA identidade que o document id: falha fechada", async () => {
+    await seedStandardSeason();
+    await bindIdentity("uid-c", IDS[2]);
+    // O documento de E passa a carregar a chave de A: mesma faixa canônica,
+    // então o count não muda — quem barra é a reconciliação id ↔ chave.
+    await parentRef(ECONOMY_CASH)
+      .collection(SEASON_ENTRIES_SUBCOLLECTION)
+      .doc(IDS[4])
+      .update({ rankKey: buildRankKey(100, 1, IDS[0]) });
+
+    assert.equal(
+      await expectFailure(() =>
+        getSeasonLeaderboardHandler(
+          { economy: ECONOMY_CASH, seasonId: SEASON },
+          ctxOf("uid-any")
+        )
+      ),
+      "failed-precondition",
+      "o leaderboard renderiza a linha e detecta a divergência"
+    );
+  });
+
+  it("dois jogadores com MESMO score e wins continuam totalmente ordenados", async () => {
+    // C e D empatam em 200/2; o desempate final é o document id, que é único.
+    await seedStandardSeason();
+    for (let i = 0; i < IDS.length; i += 1) await bindIdentity(`uid-${i}`, IDS[i]);
+
+    const board = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-0")
+    );
+    assert.deepEqual(
+      (board.entries as any[]).map((e) => e.position),
+      [1, 2, 3, 4, 5],
+      "nenhuma posição compartilhada"
+    );
+
+    const ranks: number[] = [];
+    for (let i = 0; i < IDS.length; i += 1) {
+      const mine = await getMySeasonRankingHandler(
+        { economy: ECONOMY_CASH, seasonId: SEASON },
+        ctxOf(`uid-${i}`)
+      );
+      ranks.push(mine.rank as number);
+    }
+    assert.deepEqual(ranks, [1, 2, 3, 4, 5], "rank concorda com o leaderboard");
+  });
+
+  it("um pseudônimo NÃO pode ocupar dois documentos: a chave é única", async () => {
+    // Uma segunda entry tentando representar C. O document id difere, então a
+    // chave difere — e a chave carrega o id, que não bate com o documento.
+    await seedStandardSeason();
+    await bindIdentity("uid-c", IDS[2]);
+    const impostor = "Zzzzzzzzzzzzzzzzzzzzzz";
+    await parentRef(ECONOMY_CASH)
+      .collection(SEASON_ENTRIES_SUBCOLLECTION)
+      .doc(impostor)
+      .set({
+        publicPlayerId: IDS[2],
+        economy: ECONOMY_CASH,
+        seasonId: SEASON,
+        rankKey: buildRankKey(200, 2, IDS[2]),
+        scoreCentavos: 200,
+        winsCount: 2,
+      });
+
+    // O count físico subiu para 6 enquanto o parent declara 5.
+    await bothFailClosed("pseudônimo duplicado");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1395,6 +1501,147 @@ describe("retenção — somente a temporada corrente e as 11 anteriores", () =>
       }
     }
     assert.equal(messages[0], messages[1], "uma única mensagem pública");
+  });
+
+  // ── A fronteira REAL de São Paulo, não a de UTC ──────────────────────────
+  // São Paulo é UTC-3 o ano inteiro (sem horário de verão desde 2019), então a
+  // virada mensal acontece às 03:00Z. Estes casos ficam nos dois lados dessa
+  // virada, onde o mês de São Paulo e o de UTC DIFEREM — trocar o cálculo por
+  // UTC muda o mês corrente e, com ele, a janela de retenção.
+  const SP_AINDA_AGOSTO = new Date("2026-09-01T02:59:00Z"); // 31/08 23:59 -03
+  const SP_JA_SETEMBRO = new Date("2026-09-01T03:01:00Z"); // 01/09 00:01 -03
+
+  it("virada mensal de São Paulo: 02:59Z ainda é agosto para AMBAS as callables", async () => {
+    await seedStandardSeason();
+    await bindIdentity("uid-a", IDS[0]);
+
+    // Agosto/2026 é o mês CORRENTE em São Paulo -> servido.
+    const board = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("u1"),
+      { now: SP_AINDA_AGOSTO }
+    );
+    assert.equal(board.success, true);
+
+    const mine = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-a"),
+      { now: SP_AINDA_AGOSTO }
+    );
+    assert.equal(mine.rank, 1);
+
+    // E setembro ainda é FUTURO nesse instante — em UTC já não seria.
+    for (const call of [
+      () =>
+        getSeasonLeaderboardHandler(
+          { economy: ECONOMY_CASH, seasonId: "2026-09" },
+          ctxOf("u1"),
+          { now: SP_AINDA_AGOSTO }
+        ),
+      () =>
+        getMySeasonRankingHandler(
+          { economy: ECONOMY_CASH, seasonId: "2026-09" },
+          ctxOf("uid-a"),
+          { now: SP_AINDA_AGOSTO }
+        ),
+    ]) {
+      assert.equal(
+        await expectFailure(call),
+        "invalid-argument",
+        "setembro ainda é futuro às 02:59Z em São Paulo"
+      );
+    }
+  });
+
+  it("virada mensal de São Paulo: 03:01Z já é setembro para AMBAS as callables", async () => {
+    await seedStandardSeason();
+    await bindIdentity("uid-a", IDS[0]);
+
+    // Dois minutos depois, setembro passou a ser o mês corrente.
+    const board = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: "2026-09" },
+      ctxOf("u1"),
+      { now: SP_JA_SETEMBRO }
+    );
+    assert.equal(board.success, true);
+    assert.equal((board.entries as any[]).length, 0, "setembro está vazio");
+
+    const mine = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: "2026-09" },
+      ctxOf("uid-a"),
+      { now: SP_JA_SETEMBRO }
+    );
+    assert.equal(mine.isRanked, false);
+
+    // E agosto virou a temporada anterior — continua dentro da janela.
+    const agosto = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("u1"),
+      { now: SP_JA_SETEMBRO }
+    );
+    assert.equal((agosto.entries as any[]).length, 5);
+  });
+
+  it("virada de ANO em São Paulo: 2027-01-01T02:59Z ainda é dezembro/2026", async () => {
+    // Mês corrente em São Paulo = 2026-12. A 11ª anterior é 2026-01 (servida)
+    // e a 12ª é 2025-12 (rejeitada). Em UTC o instante já seria janeiro/2027,
+    // o que deslocaria a janela inteira em um mês e inverteria os dois casos.
+    const virada = new Date("2027-01-01T02:59:00Z"); // 31/12/2026 23:59 -03
+
+    for (const call of [
+      () =>
+        getSeasonLeaderboardHandler(
+          { economy: ECONOMY_CASH, seasonId: "2026-01" },
+          ctxOf("u1"),
+          { now: virada }
+        ),
+      () =>
+        getMySeasonRankingHandler(
+          { economy: ECONOMY_CASH, seasonId: "2026-01" },
+          ctxOf("u1"),
+          { now: virada }
+        ),
+    ]) {
+      const res = await call();
+      assert.equal(res.success, true, "janeiro/2026 é a 11ª anterior");
+    }
+
+    for (const call of [
+      () =>
+        getSeasonLeaderboardHandler(
+          { economy: ECONOMY_CASH, seasonId: "2025-12" },
+          ctxOf("u1"),
+          { now: virada }
+        ),
+      () =>
+        getMySeasonRankingHandler(
+          { economy: ECONOMY_CASH, seasonId: "2025-12" },
+          ctxOf("u1"),
+          { now: virada }
+        ),
+    ]) {
+      assert.equal(
+        await expectFailure(call),
+        "invalid-argument",
+        "dezembro/2025 é a 12ª anterior"
+      );
+    }
+
+    // E o outro lado da virada: 03:01Z já é janeiro/2027, então 2026-01 passa
+    // a ser a 12ª anterior e é rejeitada. Sob UTC nada mudaria entre os dois
+    // instantes — é isto que torna o teste discriminante.
+    const depois = new Date("2027-01-01T03:01:00Z"); // 01/01/2027 00:01 -03
+    assert.equal(
+      await expectFailure(() =>
+        getSeasonLeaderboardHandler(
+          { economy: ECONOMY_CASH, seasonId: "2026-01" },
+          ctxOf("u1"),
+          { now: depois }
+        )
+      ),
+      "invalid-argument",
+      "dois minutos depois, 2026-01 saiu da janela"
+    );
   });
 });
 
@@ -1635,23 +1882,55 @@ describe("parent malformado — falha fechada nas duas callables", () => {
     }
   });
 
-  it("mismatch de um contador VÁLIDO não muda a resposta elegível", async () => {
-    // Contrato deste passo: formato é validado, igualdade NÃO é exigida.
+  it("contador VÁLIDO porém divergente do real: AMBAS falham fechadas", async () => {
+    // Supera explicitamente o contrato anterior, que tolerava o mismatch: um
+    // parent desatualizado descreve uma temporada que não existe.
+    for (const counter of [42, 4, 6, 0]) {
+      await clearAll();
+      await seedStandardSeason(); // 5 entries canônicas
+      await seedParentWithCounter(counter);
+      await bindIdentity("uid-a", IDS[0]);
+
+      assert.equal(
+        await expectFailure(() =>
+          getSeasonLeaderboardHandler(
+            { economy: ECONOMY_CASH, seasonId: SEASON },
+            ctxOf("uid-a")
+          )
+        ),
+        "failed-precondition",
+        `leaderboard com contador ${counter}`
+      );
+      assert.equal(
+        await expectFailure(() =>
+          getMySeasonRankingHandler(
+            { economy: ECONOMY_CASH, seasonId: SEASON },
+            ctxOf("uid-a")
+          )
+        ),
+        "failed-precondition",
+        `posição com contador ${counter}`
+      );
+    }
+  });
+
+  it("contador correto: as duas superfícies respondem normalmente", async () => {
     await seedStandardSeason();
-    await seedParentWithCounter(42); // válido, mas diferente das 5 elegíveis
+    await seedParentWithCounter(5);
     await bindIdentity("uid-a", IDS[0]);
 
     const board = await getSeasonLeaderboardHandler(
       { economy: ECONOMY_CASH, seasonId: SEASON },
       ctxOf("uid-a")
     );
-    assert.equal(board.playerCount, 5, "leaderboard responde o count elegível");
-
     const mine = await getMySeasonRankingHandler(
       { economy: ECONOMY_CASH, seasonId: SEASON },
       ctxOf("uid-a")
     );
+
+    assert.equal(board.playerCount, 5);
     assert.equal(mine.rank, 1);
-    assert.equal(mine.playerCount, 5, "posição responde o count elegível");
+    assert.equal(mine.playerCount, 5);
+    assert.equal(board.playerCount, mine.playerCount, "os dois concordam");
   });
 });

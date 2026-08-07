@@ -58,34 +58,43 @@ export function assertExactPayload(
   data: unknown,
   allowed: readonly string[]
 ): void {
-  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+  const reject = (): never => {
     throw new DomainError("invalid-argument", "Payload inválido.");
-  }
+  };
 
-  const proto = Object.getPrototypeOf(data);
-  if (proto !== Object.prototype && proto !== null) {
-    throw new DomainError("invalid-argument", "Payload inválido.");
-  }
+  if (data === null || typeof data !== "object") reject();
 
-  if (Object.getOwnPropertySymbols(data).length > 0) {
-    throw new DomainError("invalid-argument", "Payload inválido.");
-  }
+  // EVERY reflective step is wrapped: on an exotic object (a Proxy with a
+  // throwing trap, a revoked Proxy) these throw a plain TypeError, which would
+  // otherwise escape the domain and surface as an INTERNAL 500 that looks like
+  // a server fault. A hostile shape is a bad request, so it fails as one — and
+  // the trap's own message is discarded rather than echoed.
+  try {
+    if (Array.isArray(data)) reject();
 
-  for (const key of Object.getOwnPropertyNames(data)) {
-    if (!allowed.includes(key)) {
-      throw new DomainError(
-        "invalid-argument",
-        `Campo não permitido: ${key}.`
-      );
+    const proto = Object.getPrototypeOf(data);
+    if (proto !== Object.prototype && proto !== null) reject();
+
+    if (Object.getOwnPropertySymbols(data).length > 0) reject();
+
+    for (const key of Object.getOwnPropertyNames(data)) {
+      // The key NAME is never echoed. It is attacker-chosen text that would
+      // otherwise reach both the client and the log stream verbatim — and JSON
+      // permits newlines in a key, so echoing it lets a caller forge log lines.
+      if (!allowed.includes(key)) reject();
+
+      const descriptor = Object.getOwnPropertyDescriptor(data, key);
+      if (
+        descriptor === undefined ||
+        descriptor.get !== undefined ||
+        descriptor.set !== undefined
+      ) {
+        reject();
+      }
     }
-    const descriptor = Object.getOwnPropertyDescriptor(data, key);
-    if (
-      descriptor === undefined ||
-      descriptor.get !== undefined ||
-      descriptor.set !== undefined
-    ) {
-      throw new DomainError("invalid-argument", "Payload inválido.");
-    }
+  } catch (error) {
+    if (error instanceof DomainError) throw error;
+    throw new DomainError("invalid-argument", "Payload inválido.");
   }
 }
 

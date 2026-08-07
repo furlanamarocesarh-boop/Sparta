@@ -438,6 +438,35 @@ merit, tenure or activity, so no player can seek or be disadvantaged by it in an
 Amounts are compared in centavos because reais are IEEE-754 doubles; comparing reais would make the
 order depend on representation noise. `inspectReais` supplies the exact centavos at ingest.
 
+### 4.5 Canonical key `rankKey` — amended
+
+**FROZEN, added by the canonical-entry-invariants correction.** The order of section 4.3 is not
+expressed to Firestore as three separate fields. Each entry stores one string that *is* the order:
+
+```
+rankKey = "v1|" + complement(scoreCentavos) + "|" + complement(winsCount) + "|" + <document id>
+complement(n) = String(MAX_SAFE_INTEGER - n).padStart(16, "0")
+```
+
+* **One predictable type.** Ordering on the three raw fields could not express structural validity:
+  Firestore drops a document from an `orderBy` only when the field is **absent**, while a field
+  present with the **wrong type** still sorts. A corrupt entry therefore entered the aggregates
+  while the page that had to render it failed — the two surfaces disagreed. A query over the
+  half-open range `["v1|0", "v1|:")` admits only strings of this version whose first numeric
+  position is numeric; every other type and version falls outside.
+* **The ordering is preserved exactly.** A single ASCENDING sort of `rankKey` reproduces
+  `scoreCentavos DESC, winsCount DESC, publicPlayerId ASC`, proven against the comparator over a
+  generated set.
+* **Identity is the document id.** The last component is the entry's document id, which is the
+  authoritative `publicPlayerId`. Document ids are unique, so `rankKey` is unique: the final
+  comparator identifies exactly one entry and `startAfter` is never ambiguous.
+* **Minted only by the write path**, from values `decideEntry` has already normalised. It is never
+  derived from client input and never computed at read time.
+* **Single source of truth.** `scoreCentavos`, `winsCount` and `publicPlayerId` remain on the
+  document as audit copies and are **not read** by either callable: every published value is
+  decoded from `rankKey`, and the key's id component must equal the document id or the entry fails
+  closed. They can no longer move a rank, a page or a response.
+
 ### 4.4 Position
 
 * Positions are **exact ordinals**: 1, 2, 3, 4 …
@@ -929,10 +958,20 @@ Frozen rules:
 Each entry carries **only** the allowlisted public projection above: position, `publicPlayerId`,
 pseudonymous label, `scoreCentavos`, `winsCount`, economy, season.
 
-The cursor encodes the ordering tuple `(scoreCentavos, winsCount, publicPlayerId)` plus the absolute
+The cursor (**version 2**) encodes the canonical key `rankKey` of the last row plus the absolute
 offset of the next row, so page 2 continues page 1's numbering without recomputation. Since
-`publicPlayerId` is already the entry's document id and carries no UID, the cursor cannot leak
-identity.
+`rankKey` ends in the entry's document id, which is the `publicPlayerId` and carries no UID, the
+cursor cannot leak identity.
+
+**Amended — canonical entry invariants.** The cursor previously carried the tuple
+`(scoreCentavos, winsCount, publicPlayerId)`. That tuple was **not unique**: two documents could
+carry the same stored `publicPlayerId`, which made `startAfter` ambiguous and could skip or repeat a
+row across pages. It now carries the single `rankKey` (section 4.5), which ends in the document id
+and is therefore unique by construction, so `startAfter(rankKey)` resumes after exactly one entry.
+The HMAC, the season/economy binding, the visual-only role of the absolute offset, the generic
+public messages and the absence of any snapshot guarantee between pages are all unchanged. No
+version-1 cursor exists in production — the feature is not deployed — so no compatibility window is
+owed.
 
 ### 9.2 `getMySeasonRanking`
 
@@ -991,6 +1030,43 @@ The three counts are disjoint and together cover exactly the entries that preced
 section 4.3, so `rank` is the exact ordinal — never an estimate and never a shared position. Each
 count is an aggregation query over the season's `entries` subcollection; the conceptual indexes are
 recorded in section 13.2. **`firestore.indexes.json` is not modified in this phase.**
+
+**Amended — canonical entry invariants.** With the canonical key of section 4.5 the ordering is a
+single totally-ordered string, so the three counts collapse into one range whose meaning is
+identical and whose disjointness is structural rather than argued:
+
+```text
+ahead = count(entries where rankKey >= RANK_KEY_MIN and rankKey < myRankKey)
+rank  = ahead + 1
+```
+
+`rankKey` is the canonical order, so every key strictly below the caller's precedes them, and the
+caller's own row is excluded because the upper bound is strict. The formula `rank = ahead + 1` and
+the exact-ordinal guarantee are unchanged; only the decomposition is simpler.
+
+**Season integrity, proven with aggregates and never a scan.** Before either callable publishes
+anything, three numbers read in the **same read-only transaction** must agree:
+
+```text
+parent.playerCount  ==  count(all entries)  ==  count(canonical entries)
+```
+
+The physical count is what makes corruption detectable without reading documents: an entry with no
+key, a key of the wrong type, or a key of another version is counted physically but not
+canonically, so the two diverge. That single invariant covers a partial migration, a residual
+document, a stale parent, a duplicated pseudonym, and a parent that is missing while its
+subcollection is not empty. On any mismatch **both** callables fail closed with
+`failed-precondition` and one generic public message that names no document, field or value.
+This **supersedes** the earlier allowance that a stored `playerCount` could differ from the real
+count and still be served.
+
+| Parent | Physical / canonical entries | Both callables |
+| --- | --- | --- |
+| absent | 0 / 0 | empty leaderboard, unranked, `playerCount: 0` |
+| absent | any positive | fail closed |
+| valid | counts equal | normal response |
+| valid | counts differ | fail closed |
+| malformed `playerCount` | any | fail closed |
 
 ### 9.3 Shared conventions
 
@@ -1499,6 +1575,14 @@ touching `firestore.indexes.json` here):
 
 // exact-position counting for getMySeasonRanking (9.2) is served by the same
 // index: each of the three disjoint counts is a prefix range over this tuple.
+//
+// AMENDED — canonical entry invariants. With the canonical key of 4.5 every
+// leaderboard and ranking query is a range plus an orderBy on the SINGLE field
+// `rankKey`, which Firestore serves from the automatic single-field index. No
+// composite index is required by the corrected implementation, and none was
+// added. The `entries` composite above is retained as declared — it is
+// harmless, still asserted by firestoreIndexes.test.ts, and not yet deployed —
+// but it is no longer what serves the queries.
 
 // ledger verification for the read-only reconciler (14.2)
 { "collectionGroup": "transactions", "queryScope": "COLLECTION",
