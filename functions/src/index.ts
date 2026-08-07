@@ -2914,7 +2914,13 @@ export const getSeasonLeaderboardHandler = async (
 
     const startOffset = cursor === null ? 0 : cursor.offset;
     const entries = page.map((doc, index) =>
-      publicEntry(startOffset + index + 1, doc.id, doc.data() ?? {})
+      publicEntry(
+        startOffset + index + 1,
+        doc.id,
+        doc.data() ?? {},
+        economy,
+        seasonId
+      )
     );
     const lastRankKey =
       page.length > 0 ? String(page[page.length - 1].get("rankKey")) : null;
@@ -3023,18 +3029,10 @@ export const getMySeasonRankingHandler = async (
 
     const uid = normalizeIdentityUid(callerAuth.uid);
 
-    // Resolved BEFORE the snapshot: the pseudonym is immutable once assigned,
-    // so it cannot drift under us, and this read is not part of the ordinal.
-    // Read-only in the strict sense — an identity is MINTED by settlement,
-    // never by a leaderboard read, so a player never paid stays unregistered.
-    const mapSnap = await db
-      .collection(PUBLIC_PLAYER_ID_COLLECTION)
-      .doc(uid)
-      .get();
-
-    const publicPlayerId = mapSnap.exists
-      ? (mapSnap.data() ?? {}).publicPlayerId
-      : null;
+    // Read INSIDE the snapshot below, like everything else this answer rests
+    // on. An identity is MINTED by settlement, never by a leaderboard read, so
+    // a player who never won stays unregistered.
+    const identityRef = db.collection(PUBLIC_PLAYER_ID_COLLECTION).doc(uid);
 
     const entries = seasonEntriesQuery(economy, seasonId);
     const parentRef = db
@@ -3055,6 +3053,24 @@ export const getMySeasonRankingHandler = async (
     const snapshot = await db.runTransaction(
       async (transaction) => {
         const parentSnap = await transaction.get(parentRef);
+        const identitySnap = await transaction.get(identityRef);
+
+        // ABSENT identity: the caller simply never won — unranked, per
+        // contract. PRESENT but malformed: the one document that binds an
+        // account to its pseudonym is corrupt, and answering "you are not
+        // ranked" would be indistinguishable from the legitimate case while
+        // silently hiding an entry that may well exist. That fails closed,
+        // with a message that names no uid, path or value.
+        const publicPlayerId = identitySnap.exists
+          ? (identitySnap.data() ?? {}).publicPlayerId
+          : null;
+
+        if (identitySnap.exists && !isPublicPlayerId(publicPlayerId)) {
+          throw new DomainError(
+            "failed-precondition",
+            "Documento de ranking inconsistente."
+          );
+        }
 
         const entrySnap = isPublicPlayerId(publicPlayerId)
           ? await transaction.get(entries.doc(publicPlayerId))
@@ -3085,7 +3101,13 @@ export const getMySeasonRankingHandler = async (
           return { ranked: false as const, playerCount: integrity.playerCount };
         }
 
-        const mine = publicEntry(1, entrySnap.id, entrySnap.data() ?? {});
+        const mine = publicEntry(
+          1,
+          entrySnap.id,
+          entrySnap.data() ?? {},
+          economy,
+          seasonId
+        );
 
         // ONE count, and it is exactly the entries ahead: `rankKey` IS the
         // canonical order, so every key strictly below the caller's precedes

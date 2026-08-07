@@ -31,12 +31,15 @@ export const LEADERBOARD_CURSOR_VERSION = 2;
 // ── Request normalization ───────────────────────────────────────────────────
 
 /**
- * The requested page size, clamped server-side.
+ * The requested page size, CLAMPED server-side (design sections 9.1, 12.2 and
+ * the frozen matrix 16.4: "`limit` 1000 → Clamped to 100").
  *
- * Absent means the default. Anything present must be a real integer in range —
- * a float, a string or a number outside `[1, LEADERBOARD_MAX_LIMIT]` is the
- * caller's mistake and is rejected rather than silently clamped, so a client
- * asking for 1000 learns that it cannot have it.
+ * Absent means the default. A positive integer above the ceiling is the one
+ * case the contract says to satisfy rather than refuse: the caller gets the
+ * maximum page, never more. Everything the contract does NOT call a page size
+ * — a non-number, a float, `NaN`, zero or a negative — remains a rejection,
+ * because clamping those would be inventing a value the caller never asked
+ * for.
  */
 export function normalizeLimit(raw: unknown): number {
   if (raw === undefined || raw === null) return LEADERBOARD_DEFAULT_LIMIT;
@@ -44,12 +47,12 @@ export function normalizeLimit(raw: unknown): number {
   if (typeof raw !== "number" || !Number.isInteger(raw)) {
     throw invalidArgument("O limite precisa ser um número inteiro.");
   }
-  if (raw < 1 || raw > LEADERBOARD_MAX_LIMIT) {
+  if (raw < 1) {
     throw invalidArgument(
       `O limite precisa estar entre 1 e ${LEADERBOARD_MAX_LIMIT}.`
     );
   }
-  return raw;
+  return Math.min(raw, LEADERBOARD_MAX_LIMIT);
 }
 
 /** The requested economy. Only the two frozen values exist. */
@@ -547,18 +550,29 @@ export interface PublicLeaderboardEntry {
  * `firstPrizeAt`, `lastPrizeAt` and `updatedAt` are audit data that no client
  * needs.
  *
- * EVERY ORDERED VALUE COMES FROM THE CANONICAL KEY, and the identity comes from
- * the DOCUMENT ID. The stored `scoreCentavos` / `winsCount` / `publicPlayerId`
- * fields are audit copies and are deliberately NOT read here: were they read,
- * they would be a second source of truth able to disagree with the key that
- * ordered the row — which is precisely how the leaderboard and the individual
- * position came to diverge. `documentId` and the key's own id component must
- * agree, or the entry is corrupt and fails closed.
+ * NOTHING STORED ON THE DOCUMENT IS A SOURCE OF TRUTH EXCEPT THE CANONICAL KEY.
+ *
+ * - the ordered values come from `rankKey`;
+ * - the identity comes from the DOCUMENT ID, which must equal the key's own id
+ *   component or the entry is corrupt and fails closed;
+ * - `economy` and `seasonId` come from the CALLER'S VALIDATED REQUEST, because
+ *   they are structural properties of the document PATH
+ *   (`season_rankings/{economy}_{seasonId}/entries/{publicPlayerId}`) — a row
+ *   reached through the cash/2026-08 path IS cash/2026-08, whatever its own
+ *   fields happen to say.
+ *
+ * The stored `scoreCentavos`, `winsCount`, `publicPlayerId`, `economy` and
+ * `seasonId` are audit copies and are deliberately NOT read. Reading them made
+ * them a second source of truth able to disagree with the path and the key —
+ * which is exactly how the leaderboard and the individual position came to
+ * diverge, one throwing while the other answered.
  */
 export function publicEntry(
   position: number,
   documentId: string,
-  stored: StoredLeaderboardEntry
+  stored: StoredLeaderboardEntry,
+  economy: RankingEconomy,
+  seasonId: string
 ): PublicLeaderboardEntry {
   if (!Number.isSafeInteger(position) || position < 1) {
     throw new DomainError("failed-precondition", "Posição inválida.");
@@ -580,15 +594,6 @@ export function publicEntry(
       "Entry com identidade divergente."
     );
   }
-  if (
-    stored.economy !== ECONOMY_CASH &&
-    stored.economy !== ECONOMY_BETA_CREDIT
-  ) {
-    throw new DomainError("failed-precondition", "Entry com economia inválida.");
-  }
-  if (typeof stored.seasonId !== "string" || stored.seasonId.length === 0) {
-    throw new DomainError("failed-precondition", "Entry sem temporada.");
-  }
 
   return {
     position,
@@ -596,7 +601,7 @@ export function publicEntry(
     label: publicPlayerLabel(documentId),
     scoreCentavos: parts.scoreCentavos,
     winsCount: parts.winsCount,
-    economy: stored.economy,
-    seasonId: stored.seasonId,
+    economy,
+    seasonId,
   };
 }

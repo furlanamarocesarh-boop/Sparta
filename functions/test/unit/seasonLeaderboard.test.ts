@@ -335,13 +335,19 @@ describe("limite da página", () => {
     assert.equal(normalizeLimit(LEADERBOARD_MAX_LIMIT), 100);
   });
 
-  it("recusa acima do teto em vez de truncar em silêncio", () => {
-    assertDomain(() => normalizeLimit(101), "invalid-argument", "101");
-    assertDomain(() => normalizeLimit(1000), "invalid-argument", "1000");
+  it("CLAMPA um inteiro positivo acima do teto (contrato 9.1 / 16.4)", () => {
+    // O contrato congelado manda servir o teto, não recusar: "limit 1000 ->
+    // Clamped to 100". Recusar era desvio da matriz 16.4.
+    assert.equal(normalizeLimit(101), LEADERBOARD_MAX_LIMIT);
+    assert.equal(normalizeLimit(1000), LEADERBOARD_MAX_LIMIT);
+    assert.equal(normalizeLimit(Number.MAX_SAFE_INTEGER), LEADERBOARD_MAX_LIMIT);
+    // E o teto exato continua sendo ele mesmo.
+    assert.equal(normalizeLimit(LEADERBOARD_MAX_LIMIT), LEADERBOARD_MAX_LIMIT);
   });
 
-  it("recusa zero, negativo, fracionário e não numérico", () => {
-    for (const bad of [0, -1, 1.5, "50", true, {}, []]) {
+  it("recusa zero, negativo, fracionário e não numérico — nunca clampa esses", () => {
+    // Clampar um tipo inválido inventaria um valor que o cliente não pediu.
+    for (const bad of [0, -1, -1000, 1.5, 99.9, "50", "100", true, {}, [], NaN, Infinity, -Infinity]) {
       assertDomain(() => normalizeLimit(bad), "invalid-argument", String(bad));
     }
   });
@@ -680,7 +686,7 @@ describe("cursor — autenticado, opaco e vinculado", () => {
 
 describe("projeção pública — allowlist estrita", () => {
   it("publica exatamente os campos aprovados", () => {
-    const row = publicEntry(1, P1, stored(125_000, 3, P1));
+    const row = publicEntry(1, P1, stored(125_000, 3, P1), ECONOMY_CASH, "2026-08");
 
     assert.deepEqual(Object.keys(row).sort(), [
       "economy",
@@ -702,6 +708,7 @@ describe("projeção pública — allowlist estrita", () => {
     const row = publicEntry(
       1,
       P1,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       stored(100, 1, P1, {
         uid: "conta-secreta",
         user_ref: "users/conta-secreta",
@@ -709,7 +716,9 @@ describe("projeção pública — allowlist estrita", () => {
         firstPrizeAt: new Date(),
         lastPrizeAt: new Date(),
         updatedAt: new Date(),
-      })
+      }),
+      ECONOMY_CASH,
+      "2026-08"
     ) as unknown as Record<string, unknown>;
 
     for (const leaked of [
@@ -730,7 +739,7 @@ describe("projeção pública — allowlist estrita", () => {
   });
 
   it("o rótulo nunca revela o identificador completo", () => {
-    const row = publicEntry(1, P1, stored(100, 1, P1));
+    const row = publicEntry(1, P1, stored(100, 1, P1), ECONOMY_CASH, "2026-08");
     assert.notEqual(row.label, row.publicPlayerId);
     assert.ok(!row.label.includes(P1));
   });
@@ -738,7 +747,7 @@ describe("projeção pública — allowlist estrita", () => {
   it("recusa uma posição inválida", () => {
     for (const bad of [0, -1, 1.5, NaN]) {
       assertDomain(
-        () => publicEntry(bad, P1, stored(100, 1, P1)),
+        () => publicEntry(bad, P1, stored(100, 1, P1), ECONOMY_CASH, "2026-08"),
         "failed-precondition",
         String(bad)
       );
@@ -755,13 +764,11 @@ describe("projeção pública — allowlist estrita", () => {
         "chave de outra versão",
         { rankKey: "v0|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + P1 },
       ],
-      ["economia inválida", { economy: "gold" }],
-      ["temporada ausente", { seasonId: "" }],
     ];
 
     for (const [label, patch] of cases) {
       assertDomain(
-        () => publicEntry(1, P1, { ...stored(100, 1, P1), ...patch }),
+        () => publicEntry(1, P1, { ...stored(100, 1, P1), ...patch }, ECONOMY_CASH, "2026-08"),
         "failed-precondition",
         label
       );
@@ -771,7 +778,7 @@ describe("projeção pública — allowlist estrita", () => {
   it("recusa um document id malformado, mesmo com chave válida", () => {
     for (const bad of ["", "PLR-1", P1 + "x", "  "]) {
       assertDomain(
-        () => publicEntry(1, bad, stored(100, 1, P1)),
+        () => publicEntry(1, bad, stored(100, 1, P1), ECONOMY_CASH, "2026-08"),
         "failed-precondition",
         bad
       );
@@ -781,10 +788,40 @@ describe("projeção pública — allowlist estrita", () => {
   it("RECUSA quando a chave aponta para outra identidade que o document id", () => {
     // O ataque de identidade: doc `P1` carregando a chave de `P2`.
     assertDomain(
-      () => publicEntry(1, P1, stored(100, 1, P2)),
+      () => publicEntry(1, P1, stored(100, 1, P2), ECONOMY_CASH, "2026-08"),
       "failed-precondition",
       "identidade divergente"
     );
+  });
+
+  it("economy e seasonId vêm da REQUISIÇÃO, nunca do documento", () => {
+    // Ambas são propriedades estruturais do PATH
+    // (season_rankings/{economy}_{seasonId}/entries/{id}): uma linha alcançada
+    // pelo caminho cash/2026-08 É cash/2026-08, digam o que disserem os campos.
+    for (const hostile of [
+      { economy: ECONOMY_BETA_CREDIT },
+      { economy: "gold" },
+      { economy: undefined },
+      { economy: null },
+      { seasonId: "2026-07" },
+      { seasonId: undefined },
+      { seasonId: null },
+      { seasonId: "" },
+      { economy: 42, seasonId: {} },
+    ]) {
+      const row = publicEntry(
+        1,
+        P1,
+        { ...stored(125_000, 3, P1), ...hostile },
+        ECONOMY_CASH,
+        "2026-08"
+      );
+      assert.equal(row.economy, ECONOMY_CASH, JSON.stringify(hostile));
+      assert.equal(row.seasonId, "2026-08", JSON.stringify(hostile));
+      // E nada disso derruba a projeção.
+      assert.equal(row.scoreCentavos, 125_000);
+      assert.equal(row.publicPlayerId, P1);
+    }
   });
 
   it("os campos redundantes NÃO são fonte de verdade: não movem nada", () => {
@@ -792,14 +829,22 @@ describe("projeção pública — allowlist estrita", () => {
     // `publicPlayerId` guardados são cópias de auditoria; a resposta vem da
     // chave canônica e do document id. Corrompê-los não pode mudar a resposta
     // — era exatamente por lê-los que as duas superfícies divergiam.
-    const honest = publicEntry(1, P1, stored(125_000, 3, P1));
+    const honest = publicEntry(1, P1, stored(125_000, 3, P1), ECONOMY_CASH, "2026-08");
 
-    const tampered = publicEntry(1, P1, {
-      ...stored(125_000, 3, P1),
-      scoreCentavos: 999_999_999,
-      winsCount: -7,
-      publicPlayerId: P2,
-    });
+    const tampered = publicEntry(
+      1,
+      P1,
+      {
+        ...stored(125_000, 3, P1),
+        scoreCentavos: 999_999_999,
+        winsCount: -7,
+        publicPlayerId: P2,
+        economy: "gold",
+        seasonId: "1999-01",
+      },
+      ECONOMY_CASH,
+      "2026-08"
+    );
 
     assert.deepEqual(tampered, honest, "a resposta veio da chave canônica");
     assert.equal(tampered.scoreCentavos, 125_000);

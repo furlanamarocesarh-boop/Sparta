@@ -112,6 +112,13 @@ async function clearCollection(path: string): Promise<void> {
 }
 
 async function clearAll(): Promise<void> {
+  // ORPHANS FIRST, by collection group. Walking parents only would miss an
+  // entry whose season parent does not exist — precisely the state several
+  // tests here create on purpose — and that survivor would leak into every
+  // later test, making its assertions depend on declaration order.
+  const orphans = await db.collectionGroup(SEASON_ENTRIES_SUBCOLLECTION).get();
+  await Promise.all(orphans.docs.map((d) => d.ref.delete()));
+
   for (const col of [
     SEASON_RANKINGS_COLLECTION,
     RANKING_EVENTS_COLLECTION,
@@ -250,16 +257,32 @@ describe("getSeasonLeaderboard — autenticação e payload", () => {
     }
   });
 
-  it("limite acima do teto é rejeitado, não truncado em silêncio", async () => {
-    assert.equal(
-      await expectFailure(() =>
-        getSeasonLeaderboardHandler(
-          { economy: ECONOMY_CASH, seasonId: SEASON, limit: 1000 },
-          ctxOf("u1")
-        )
-      ),
-      "invalid-argument"
+  it("limite acima do teto é CLAMPADO ao teto, não rejeitado", async () => {
+    // Contrato congelado 9.1 / 16.4: "limit 1000 -> Clamped to 100". A
+    // rejeição anterior era desvio da matriz. O tamanho efetivo da página é
+    // provado na suíte de clamping, com uma temporada maior que o teto.
+    await seedStandardSeason();
+    const res = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON, limit: 1000 },
+      ctxOf("u1")
     );
+    assert.equal(res.success, true);
+    assert.equal((res.entries as any[]).length, 5, "serve o que existe");
+  });
+
+  it("limite que não é um tamanho de página continua rejeitado", async () => {
+    for (const bad of [0, -1, 1.5, "100", true]) {
+      assert.equal(
+        await expectFailure(() =>
+          getSeasonLeaderboardHandler(
+            { economy: ECONOMY_CASH, seasonId: SEASON, limit: bad },
+            ctxOf("u1")
+          )
+        ),
+        "invalid-argument",
+        String(bad)
+      );
+    }
   });
 });
 
@@ -936,38 +959,87 @@ describe("getMySeasonRanking — snapshot único e consistente", () => {
     await seedStandardSeason();
     await bindIdentity("uid-a", IDS[0]);
 
+    const Z = "Zzzzzzzzzzzzzzzzzzzzzz";
+    let fired = 0;
     const res = await getMySeasonRankingHandler(
       { economy: ECONOMY_CASH, seasonId: SEASON },
       ctxOf("uid-a"),
       {
         afterFirstRead: async () => {
-          await seedParent(ECONOMY_CASH, 99, 999_999);
-          await seedEntry(ECONOMY_CASH, "Zzzzzzzzzzzzzzzzzzzzzz", 500, 5);
+          fired += 1;
+          // Um concorrente que ULTRAPASSA A, mantendo o invariante coerente
+          // (6 entries, parent 6) para que o estado posterior seja servível e
+          // OBSERVAVELMENTE diferente.
+          await seedEntry(ECONOMY_CASH, Z, 500, 5);
+          await seedParent(ECONOMY_CASH, 6, 1600);
         },
       }
     );
 
+    // 1. a seam rodou exatamente uma vez
+    assert.equal(fired, 1, "a seam precisa disparar exatamente uma vez");
+
+    // 2. a escrita concorrente REALMENTE aconteceu e persistiu
+    const zSnap = await parentRef(ECONOMY_CASH)
+      .collection(SEASON_ENTRIES_SUBCOLLECTION)
+      .doc(Z)
+      .get();
+    assert.equal(zSnap.exists, true, "a entry concorrente foi persistida");
+    assert.equal(
+      (await parentRef(ECONOMY_CASH).get()).data()?.playerCount,
+      6,
+      "o parent concorrente foi persistido"
+    );
+
+    // 3. a resposta permaneceu INTEGRALMENTE no snapshot anterior
     assert.equal(res.rank, 1, "A continua líder no snapshot");
     assert.equal(res.playerCount, 5, "playerCount é do mesmo snapshot do rank");
+
+    // 4. e o estado posterior é de fato diferente — é isto que torna os
+    //    valores acima discriminantes em vez de coincidentes com o repouso.
+    const depois = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-a")
+    );
+    assert.equal(depois.rank, 2, "fora da transação, Z está à frente de A");
+    assert.equal(depois.playerCount, 6);
   });
 
   it("o não-ranqueado também responde a partir de um snapshot", async () => {
     await seedStandardSeason();
     await bindIdentity("uid-x", "Xxxxxxxxxxxxxxxxxxxxxx"); // sem entry
 
+    const Z = "Zzzzzzzzzzzzzzzzzzzzzz";
+    let fired = 0;
     const res = await getMySeasonRankingHandler(
       { economy: ECONOMY_CASH, seasonId: SEASON },
       ctxOf("uid-x"),
       {
         afterFirstRead: async () => {
-          await seedParent(ECONOMY_CASH, 42, 4200);
+          fired += 1;
+          await seedEntry(ECONOMY_CASH, Z, 500, 5);
+          await seedParent(ECONOMY_CASH, 6, 1600);
         },
       }
+    );
+
+    assert.equal(fired, 1, "a seam precisa disparar exatamente uma vez");
+    assert.equal(
+      (await parentRef(ECONOMY_CASH).get()).data()?.playerCount,
+      6,
+      "a escrita concorrente foi persistida"
     );
 
     assert.equal(res.isRanked, false);
     assert.equal(res.rank, null);
     assert.equal(res.playerCount, 5, "o parent lido é o do snapshot");
+
+    const depois = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-x")
+    );
+    assert.equal(depois.isRanked, false);
+    assert.equal(depois.playerCount, 6, "depois, o estado novo vale");
   });
 
   it("os três desempates continuam exatos dentro da transação", async () => {
@@ -1933,4 +2005,285 @@ describe("parent malformado — falha fechada nas duas callables", () => {
     assert.equal(mine.playerCount, 5);
     assert.equal(board.playerCount, mine.playerCount, "os dois concordam");
   });
+});
+
+// ---------------------------------------------------------------------------
+// S1 — economy/seasonId vêm da REQUISIÇÃO, nunca do documento
+// ---------------------------------------------------------------------------
+
+describe("cópias de auditoria economy/seasonId não decidem nada", () => {
+  for (const [label, patch] of [
+    ['economy = "beta_credit"', { economy: ECONOMY_BETA_CREDIT }],
+    ['economy = "gold"', { economy: "gold" }],
+    ["economy ausente", { economy: admin.firestore.FieldValue.delete() }],
+    ["economy = null", { economy: null }],
+    ['seasonId = "2026-07"', { seasonId: "2026-07" }],
+    ["seasonId ausente", { seasonId: admin.firestore.FieldValue.delete() }],
+    ["seasonId = null", { seasonId: null }],
+  ] as const) {
+    it(`${label}: leaderboard e posição continuam canônicos`, async () => {
+      await seedStandardSeason();
+      await bindIdentity("uid-c", IDS[2]);
+      // Corrompe a cópia de E, mantendo rankKey, parent e counts válidos.
+      await parentRef(ECONOMY_CASH)
+        .collection(SEASON_ENTRIES_SUBCOLLECTION)
+        .doc(IDS[4])
+        .update(patch as Record<string, unknown>);
+
+      const board = await getSeasonLeaderboardHandler(
+        { economy: ECONOMY_CASH, seasonId: SEASON },
+        ctxOf("uid-any")
+      );
+      assert.equal((board.entries as any[]).length, 5, `${label}: sem falha`);
+      assert.equal(board.playerCount, 5, label);
+      for (const row of board.entries as any[]) {
+        assert.equal(row.economy, ECONOMY_CASH, `${label}: economy da requisição`);
+        assert.equal(row.seasonId, SEASON, `${label}: seasonId da requisição`);
+      }
+
+      const mine = await getMySeasonRankingHandler(
+        { economy: ECONOMY_CASH, seasonId: SEASON },
+        ctxOf("uid-c")
+      );
+      assert.equal(mine.rank, 3, `${label}: rank canônico`);
+      assert.equal(mine.playerCount, board.playerCount, `${label}: os dois concordam`);
+      assert.equal((mine.entry as any).publicPlayerId, IDS[2]);
+    });
+  }
+
+  it("com a cópia corrompida, o cursor e a paginação seguem corretos", async () => {
+    await seedStandardSeason();
+    await parentRef(ECONOMY_CASH)
+      .collection(SEASON_ENTRIES_SUBCOLLECTION)
+      .doc(IDS[4])
+      .update({ economy: "gold", seasonId: "1999-01" });
+
+    const seen: string[] = [];
+    let cursor: unknown = undefined;
+    for (let page = 0; page < 5; page += 1) {
+      const res: Record<string, unknown> = await getSeasonLeaderboardHandler(
+        { economy: ECONOMY_CASH, seasonId: SEASON, limit: 2, cursor },
+        ctxOf("u1")
+      );
+      for (const row of res.entries as any[]) {
+        assert.equal(row.economy, ECONOMY_CASH);
+        assert.equal(row.seasonId, SEASON);
+        seen.push(row.publicPlayerId);
+      }
+      cursor = res.nextCursor;
+      if (cursor === null) break;
+    }
+    assert.deepEqual(seen, IDS, "paginação cobre o conjunto na ordem canônica");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S2 — limit é CLAMPADO ao teto, não recusado
+// ---------------------------------------------------------------------------
+
+describe("limit — clamping contratado (9.1 / 16.4)", () => {
+  /** 101 entries: o suficiente para provar o teto E a existência de outra página. */
+  async function seedOversizedSeason(): Promise<number> {
+    const total = 101;
+    const batchIds: string[] = [];
+    for (let i = 0; i < total; i += 1) {
+      // Ids determinísticos de 22 chars, distintos e ordenáveis.
+      const id = `P${String(i).padStart(3, "0")}` + "x".repeat(18);
+      batchIds.push(id);
+      await seedEntry(ECONOMY_CASH, id, 1000 - i, 1);
+    }
+    await seedParent(ECONOMY_CASH, total, 1000);
+    return total;
+  }
+
+  it("limit ausente usa o default contratado", async () => {
+    await seedStandardSeason();
+    const res = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("u1")
+    );
+    assert.equal((res.entries as any[]).length, 5, "menos que o default");
+  });
+
+  it("limit 1000 é CLAMPADO a 100 — página com 100 linhas e outra página adiante", async () => {
+    const total = await seedOversizedSeason();
+
+    const res = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON, limit: 1000 },
+      ctxOf("u1")
+    );
+
+    // A prova forte: o tamanho REAL da página é o teto, não um erro evitado.
+    assert.equal((res.entries as any[]).length, 100, "página = teto");
+    assert.equal(res.playerCount, total);
+    assert.notEqual(res.nextCursor, null, "limit+1 detectou a 101ª entry");
+
+    // Numeração contínua e ordem canônica preservadas sob clamping.
+    assert.deepEqual(
+      (res.entries as any[]).slice(0, 3).map((e) => e.position),
+      [1, 2, 3]
+    );
+    assert.equal((res.entries as any[])[99].position, 100);
+
+    // E o cursor emitido sob clamping continua utilizável.
+    const page2 = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON, limit: 1000, cursor: res.nextCursor },
+      ctxOf("u1")
+    );
+    assert.equal((page2.entries as any[]).length, 1, "sobra exatamente 1");
+    assert.equal((page2.entries as any[])[0].position, 101);
+    assert.equal(page2.nextCursor, null, "fim da paginação");
+  });
+
+  it("limit 101 e limit 100 produzem a MESMA página de 100", async () => {
+    await seedOversizedSeason();
+    const a = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON, limit: 101 },
+      ctxOf("u1")
+    );
+    const b = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON, limit: 100 },
+      ctxOf("u1")
+    );
+    assert.equal((a.entries as any[]).length, 100);
+    assert.deepEqual(
+      (a.entries as any[]).map((e) => e.publicPlayerId),
+      (b.entries as any[]).map((e) => e.publicPlayerId)
+    );
+  });
+
+  it("valores que NÃO são um tamanho de página continuam recusados", async () => {
+    await seedStandardSeason();
+    for (const bad of [0, -1, 1.5, "100", true, {}, [], null === null ? Number.NaN : 0]) {
+      assert.equal(
+        await expectFailure(() =>
+          getSeasonLeaderboardHandler(
+            { economy: ECONOMY_CASH, seasonId: SEASON, limit: bad },
+            ctxOf("u1")
+          )
+        ),
+        "invalid-argument",
+        String(bad)
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S3 — o cleanup remove entries órfãs
+// ---------------------------------------------------------------------------
+
+describe("infraestrutura de teste — cleanup de entries órfãs", () => {
+  it("apaga entry cujo parent não existe, e é idempotente", async () => {
+    // Órfã deliberada: entry sem nenhum parent.
+    const orfa = "Oooooooooooooooooooooo";
+    await parentRef(ECONOMY_CASH)
+      .collection(SEASON_ENTRIES_SUBCOLLECTION)
+      .doc(orfa)
+      .set({
+        publicPlayerId: orfa,
+        economy: ECONOMY_CASH,
+        seasonId: SEASON,
+        rankKey: buildRankKey(1, 1, orfa),
+        scoreCentavos: 1,
+        winsCount: 1,
+      });
+    assert.equal(
+      (await db.collectionGroup(SEASON_ENTRIES_SUBCOLLECTION).get()).size,
+      1,
+      "a órfã existe antes do cleanup"
+    );
+
+    await clearAll();
+    assert.equal(
+      (await db.collectionGroup(SEASON_ENTRIES_SUBCOLLECTION).get()).size,
+      0,
+      "a órfã desapareceu"
+    );
+
+    // Idempotência: rodar de novo num estado já vazio não falha nem recria.
+    await clearAll();
+    assert.equal(
+      (await db.collectionGroup(SEASON_ENTRIES_SUBCOLLECTION).get()).size,
+      0
+    );
+    assert.equal(
+      (await db.collection(SEASON_RANKINGS_COLLECTION).get()).size,
+      0
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S5 — identity map: ausente, válido, corrompido
+// ---------------------------------------------------------------------------
+
+describe("identity map — ausente, válido e corrompido", () => {
+  it("AUSENTE: jogador simplesmente não ranqueado", async () => {
+    await seedStandardSeason();
+    const res = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-sem-identidade")
+    );
+    assert.equal(res.isRanked, false);
+    assert.equal(res.rank, null);
+    assert.equal(res.entry, null);
+    assert.equal(res.playerCount, 5);
+  });
+
+  it("VÁLIDO: consulta normal da entry", async () => {
+    await seedStandardSeason();
+    await bindIdentity("uid-c", IDS[2]);
+    const res = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-c")
+    );
+    assert.equal(res.isRanked, true);
+    assert.equal(res.rank, 3);
+  });
+
+  for (const [label, value] of [
+    ["campo ausente", undefined],
+    ["null", null],
+    ["número", 42],
+    ["boolean", true],
+    ["string vazia", ""],
+    ["formato inválido", "PLR-123"],
+    ["curto demais", "Aaa"],
+    ["longo demais", "A".repeat(23)],
+    ["objeto", { a: 1 }],
+    ["array", ["Aaaaaaaaaaaaaaaaaaaaaa"]],
+  ] as const) {
+    it(`CORROMPIDO (${label}): falha fechada e genérica`, async () => {
+      await seedStandardSeason();
+      const doc: Record<string, unknown> = {
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+      if (value !== undefined) doc.publicPlayerId = value;
+      await db.collection(PUBLIC_PLAYER_ID_COLLECTION).doc("uid-corrompido").set(doc);
+
+      let message = "";
+      try {
+        await getMySeasonRankingHandler(
+          { economy: ECONOMY_CASH, seasonId: SEASON },
+          ctxOf("uid-corrompido")
+        );
+        assert.fail(`${label}: deveria falhar fechado`);
+      } catch (error) {
+        assert.equal((error as { code?: string }).code, "failed-precondition", label);
+        message = String((error as Error).message);
+      }
+
+      // Mensagem genérica: nem uid, nem valor, nem path.
+      assert.equal(message, "Documento de ranking inconsistente.", label);
+      assert.ok(!message.includes("uid-corrompido"), label);
+      assert.ok(!message.includes(PUBLIC_PLAYER_ID_COLLECTION), label);
+      // (uma string vazia é subcadeia de tudo, então só vale checar valores
+      // que realmente carregam conteúdo)
+      const canary = String(value);
+      if (canary.length > 2) {
+        assert.ok(!message.includes(canary), label);
+      }
+    });
+  }
 });

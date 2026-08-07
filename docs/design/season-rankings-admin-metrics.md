@@ -466,6 +466,14 @@ complement(n) = String(MAX_SAFE_INTEGER - n).padStart(16, "0")
   document as audit copies and are **not read** by either callable: every published value is
   decoded from `rankKey`, and the key's id component must equal the document id or the entry fails
   closed. They can no longer move a rank, a page or a response.
+* **`economy` and `seasonId` are equally non-authoritative.** They are structural properties of the
+  document **path** — `season_rankings/{economy}_{seasonId}/entries/{publicPlayerId}` — so the
+  published values are taken from the caller's **validated request**, never from the stored copies.
+  A row reached through the `cash` / `2026-08` path *is* cash / 2026-08 whatever its own fields say.
+  Reading them made a corrupt copy able to throw in `getSeasonLeaderboard` while
+  `getMySeasonRanking` answered normally — a divergence of exactly the class section 8.3 forbids.
+  Absent, `null`, mistyped or simply wrong copies now change nothing: not the row, not eligibility,
+  not the rank, not either `playerCount`, not the cursor.
 
 ### 4.4 Position
 
@@ -946,7 +954,13 @@ Frozen rules:
 * `economy` and `seasonId` are **validated**; an unknown economy or malformed `seasonId` is
   `invalid-argument`, never a silent empty page.
 * Default page **50**, maximum **100**, clamped server-side regardless of what the client sends.
-  There is no "return everything" mode.
+  There is no "return everything" mode. **Clamping means clamping**: a positive integer above the
+  ceiling yields a page of 100 (`effectiveLimit = min(requested, 100)`), matching the frozen matrix
+  row in 16.4 ("`limit` 1000 | Clamped to 100"). Only values that are not a page size at all — a
+  non-number, a float, `NaN`, zero or a negative — are rejected with `invalid-argument`, because
+  clamping those would invent a value the caller never asked for. An earlier implementation
+  rejected `limit > 100` outright; that was a deviation from this section and from 16.4, and it has
+  been corrected rather than legitimised.
 * **Cursor pagination only. Offset is never used** — offset paging renumbers rows when a concurrent
   write lands mid-page.
 * The cursor is **opaque and server-produced**, and is **bound to the season, the economy and the
