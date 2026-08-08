@@ -116,10 +116,27 @@ import {
   SEASON_ENTRIES_SUBCOLLECTION,
   SEASON_RANKINGS_COLLECTION,
   seasonDocumentId,
+  seasonIdFromInstant,
   seasonWindow,
   toUsableDate,
   type PrizeRankingEvent,
+  type RankingEconomy,
 } from "./domain/seasonRanking.js";
+import {
+  assertSeasonServable,
+  decodeCursor,
+  decodeRankScalar,
+  encodeCursor,
+  encodeRankScalar,
+  MAX_RANK_SCALAR,
+  MIN_RANK_SCALAR,
+  normalizeEconomy,
+  normalizeLimit,
+  publicEntry,
+  RANKING_CURSOR_SECRET_ENV,
+  rankFromAhead,
+  type RankScalar,
+} from "./domain/seasonLeaderboard.js";
 import {
   assertPublicPlayerId,
   decidePublicPlayerIdReservation,
@@ -2607,9 +2624,23 @@ export const onPrizeTransactionCreatedHandler = async (
     const entrySnap = await transaction.get(entryRef);
     const parentSnap = await transaction.get(parentRef);
 
+    // THE TRANSITION READS THE CANONICAL TUPLE, NOT THE AUDIT COPIES. The
+    // persisted scalars are decoded on the microsecond scale and fed to
+    // `decideEntry` in place of the stored numbers, so a corrupted
+    // `scoreCentavos`/`winsCount` copy can never influence a settlement. A
+    // scalar that does not decode fails closed here, exactly as the read path
+    // would treat it.
+    const storedEntry = entrySnap.exists ? (entrySnap.data() ?? {}) : null;
     const entryPlan = decideEntry({
       event,
-      stored: entrySnap.exists ? (entrySnap.data() ?? {}) : null,
+      stored:
+        storedEntry === null
+          ? null
+          : {
+              ...storedEntry,
+              scoreCentavos: decodeRankScalar(storedEntry.scoreOrder),
+              winsCount: decodeRankScalar(storedEntry.winsOrder),
+            },
     });
 
     const parentPlan = decideParent({
@@ -2623,8 +2654,18 @@ export const onPrizeTransactionCreatedHandler = async (
     // the same instant.
     const stampedAt = admin.firestore.FieldValue.serverTimestamp();
 
+    // THE ORDERING SCALARS ARE MINTED HERE AND ONLY HERE — the internal write
+    // path, from values `decideEntry` has already normalised. `encodeRankScalar`
+    // fails closed on anything the ordering could not represent faithfully, so
+    // an entry can never reach the collection outside the canonical domain.
+    // These Timestamps are ORDINAL SCALARS, never dates.
+    const scoreOrder = rankTimestamp(encodeRankScalar(entryPlan.scoreCentavos));
+    const winsOrder = rankTimestamp(encodeRankScalar(entryPlan.winsCount));
+
     if (entryPlan.kind === "create") {
       transaction.set(entryRef, {
+        scoreOrder,
+        winsOrder,
         publicPlayerId,
         economy,
         seasonId,
@@ -2636,6 +2677,8 @@ export const onPrizeTransactionCreatedHandler = async (
       });
     } else {
       transaction.update(entryRef, {
+        scoreOrder,
+        winsOrder,
         scoreCentavos: entryPlan.scoreCentavos,
         winsCount: entryPlan.winsCount,
         lastPrizeAt: admin.firestore.Timestamp.fromDate(entryPlan.lastPrizeAt),
@@ -2683,6 +2726,540 @@ export const onPrizeTransactionCreated = central.firestore
   .onCreate(async (snapshot) => {
     await onPrizeTransactionCreatedHandler(snapshot);
   });
+
+/** The entries subcollection of one season, ordered canonically. */
+function seasonEntriesQuery(
+  economy: RankingEconomy,
+  seasonId: string
+): admin.firestore.CollectionReference {
+  return db
+    .collection(SEASON_RANKINGS_COLLECTION)
+    .doc(seasonDocumentId(economy, seasonId))
+    .collection(SEASON_ENTRIES_SUBCOLLECTION);
+}
+
+/** A domain ordering scalar, as the Firestore value the queries compare. */
+function rankTimestamp(scalar: RankScalar): admin.firestore.Timestamp {
+  return new admin.firestore.Timestamp(scalar.seconds, scalar.nanoseconds);
+}
+
+const MIN_RANK_TS = rankTimestamp(MIN_RANK_SCALAR);
+const MAX_RANK_TS = rankTimestamp(MAX_RANK_SCALAR);
+
+/**
+ * The canonical, structurally-valid slice of a season's entries.
+ *
+ * INCLUSIVE bounds on BOTH ordering scalars. Validity is expressed by the
+ * TYPE plus these bounds, so an entry whose `scoreOrder`/`winsOrder` is absent,
+ * of another type, or outside the domain simply is not in this set — while it
+ * remains in the physical count, which is what makes the divergence detectable
+ * globally, before any page is built. There is no later structural check to
+ * reach: that asymmetry was findings B1/B1b.
+ *
+ * The three orderBy clauses ARE the canonical order of §4.3, and the final
+ * component is the document id, which is unique.
+ */
+function canonicalEntriesQuery(
+  economy: RankingEconomy,
+  seasonId: string
+): admin.firestore.Query {
+  return seasonEntriesQuery(economy, seasonId)
+    .where("scoreOrder", ">=", MIN_RANK_TS)
+    .where("scoreOrder", "<=", MAX_RANK_TS)
+    .where("winsOrder", ">=", MIN_RANK_TS)
+    .where("winsOrder", "<=", MAX_RANK_TS)
+    .orderBy("scoreOrder", "desc")
+    .orderBy("winsOrder", "desc")
+    .orderBy(admin.firestore.FieldPath.documentId(), "asc");
+}
+
+/** What both callables must agree on before publishing anything. */
+interface SeasonIntegrity {
+  readonly playerCount: number;
+}
+
+/**
+ * THE SEASON INVARIANT, proven with aggregates and never a scan.
+ *
+ * Three numbers must agree: the parent's stored `playerCount`, the PHYSICAL
+ * number of documents in the subcollection, and the number that carry a
+ * canonical key of the current version. Both callables run this same check on
+ * the same snapshot, so neither can publish a season the other would refuse.
+ *
+ * The physical count is what makes corruption detectable without reading a
+ * single document: any entry lacking a key, carrying a key of the wrong TYPE
+ * or of another schema version is counted physically but not canonically, so
+ * the two diverge and the season fails closed. That covers a partial
+ * migration, a residual document, a stale parent, and a parent that is missing
+ * while its subcollection is not empty.
+ *
+ * The message is generic — it names no document, field or value.
+ */
+function assertSeasonIntegrity(input: {
+  readonly parentExists: boolean;
+  readonly parentData: Record<string, unknown>;
+  readonly physicalCount: number;
+  readonly canonicalCount: number;
+}): SeasonIntegrity {
+  const inconsistent = (): never => {
+    throw new DomainError(
+      "failed-precondition",
+      "Documento de ranking inconsistente."
+    );
+  };
+
+  if (input.physicalCount !== input.canonicalCount) inconsistent();
+
+  if (!input.parentExists) {
+    // A season with no parent may only be answered when its subcollection is
+    // provably empty; anything else is corruption, not an empty season.
+    if (input.physicalCount !== 0) inconsistent();
+    return { playerCount: 0 };
+  }
+
+  const stored = input.parentData.playerCount;
+  if (
+    typeof stored !== "number" ||
+    !Number.isSafeInteger(stored) ||
+    stored < 0
+  ) {
+    inconsistent();
+  }
+  if ((stored as number) !== input.canonicalCount) inconsistent();
+
+  return { playerCount: input.canonicalCount };
+}
+
+/**
+ * One page of a monthly season leaderboard.
+ *
+ * ORDER AND POSITION COME FROM ONE PLACE. The query orders by the canonical
+ * comparator of design section 4.3 and the position is the cursor's
+ * `absoluteOffset` plus the row's index — so page 2 continues page 1's
+ * numbering without recomputing anything, and no `position` field is ever
+ * stored (section 8.3).
+ *
+ * PAGING IS CURSOR-ONLY, and the cursor is opaque, server-produced (HMAC) and
+ * bound to this season and economy — one minted elsewhere is rejected rather
+ * than silently restarted. `startAfter` on the full ordering tuple resumes
+ * after a stable KEY instead of a row number, so a page never re-serves the
+ * rows the cursor already covered. It does NOT freeze the season: there is no
+ * snapshot between pages, and the carried `absoluteOffset` is only the visual
+ * numbering continuation. A concurrent prize can still move an entry across
+ * the cursor tuple between requests — a row that moved ahead of it is omitted
+ * from the rest of the run, one that moved behind it would repeat (out-of-band
+ * writes only, since a prize never lowers a key), and visual numbers on later
+ * pages can lag the live ordinals `getMySeasonRanking` reports.
+ *
+ * The response carries only the allowlisted projection: no uid, in any field,
+ * and none in the cursor either, because the entry is keyed by `publicPlayerId`.
+ */
+export interface SeasonLeaderboardOptions {
+  /**
+   * Cursor signing key, injected only by tests so a signature can be exercised
+   * without any real secret existing. Production never passes it and reads
+   * `RANKING_CURSOR_HMAC_SECRET` from the environment instead.
+   *
+   * NOT a payload field: a client can neither supply nor influence it.
+   */
+  readonly cursorSecret?: string;
+  /**
+   * Clock override, injected only by tests so the retention window can be
+   * exercised deterministically. Production never passes it.
+   *
+   * NOT a payload field: a client can neither supply nor influence it.
+   */
+  readonly now?: Date;
+}
+
+export const getSeasonLeaderboardHandler = async (
+  data: any,
+  context: any,
+  options: SeasonLeaderboardOptions = {}
+): Promise<Record<string, unknown>> => {
+  try {
+    assertSignedIn(
+      context,
+      "Você precisa estar logado para ver o ranking."
+    );
+
+    assertExactPayload(data ?? {}, ["economy", "seasonId", "limit", "cursor"]);
+
+    const economy = normalizeEconomy((data ?? {}).economy);
+    const seasonId = normalizeMonth((data ?? {}).seasonId).key;
+    const limit = normalizeLimit((data ?? {}).limit);
+
+    // Retention (§8.4): only the current business month and the 11 before it
+    // are served. Checked BEFORE any read, cursor work or signing.
+    assertSeasonServable(
+      seasonId,
+      seasonIdFromInstant(options.now ?? new Date())
+    );
+
+    // Environment only. Absent, empty or under 32 bytes fails closed inside the
+    // domain — there is no unsigned fallback and no derived default.
+    const cursorSecret =
+      options.cursorSecret ?? process.env[RANKING_CURSOR_SECRET_ENV];
+
+    const rawCursor = (data ?? {}).cursor;
+    const cursor =
+      rawCursor === undefined || rawCursor === null
+        ? null
+        : decodeCursor(rawCursor, { economy, seasonId }, cursorSecret);
+
+    // The CANONICAL set: the typed ordering tuple, so the page and every
+    // aggregate below describe provably the same entries.
+    const canonical = canonicalEntriesQuery(economy, seasonId);
+    const physical = seasonEntriesQuery(economy, seasonId);
+
+    // The cursor carried plain integers; they become ordering scalars only now,
+    // after the MAC and every field check have passed. The final component is
+    // the document id, which is unique, so `startAfter` resumes after exactly
+    // one entry and can neither skip nor repeat a row.
+    const query =
+      cursor === null
+        ? canonical
+        : canonical.startAfter(
+            rankTimestamp(encodeRankScalar(cursor.afterScoreCentavos)),
+            rankTimestamp(encodeRankScalar(cursor.afterWinsCount)),
+            cursor.afterDocumentId
+          );
+
+    // ── ONE consistent snapshot ─────────────────────────────────────────────
+    // Parent, both integrity counts and the page are read through the SAME
+    // read-only transaction, so the rows and the playerCount of one response
+    // always belong to one state of the season. `readOnly: true` makes a write
+    // structurally impossible on this path.
+    const snapshot = await db.runTransaction(
+      async (transaction) => {
+        const parentSnap = await transaction.get(
+          db
+            .collection(SEASON_RANKINGS_COLLECTION)
+            .doc(seasonDocumentId(economy, seasonId))
+        );
+
+        // One extra row decides whether another page exists, without a second
+        // query.
+        const [physicalSnap, canonicalSnap, pageSnap] = await Promise.all([
+          transaction.get(physical.count()),
+          transaction.get(canonical.count()),
+          transaction.get(query.limit(limit + 1)),
+        ]);
+
+        const integrity = assertSeasonIntegrity({
+          parentExists: parentSnap.exists,
+          parentData: parentSnap.data() ?? {},
+          physicalCount: physicalSnap.data().count,
+          canonicalCount: canonicalSnap.data().count,
+        });
+
+        return { docs: pageSnap.docs, playerCount: integrity.playerCount };
+      },
+      { readOnly: true }
+    );
+
+    const page = snapshot.docs.slice(0, limit);
+    const hasMore = snapshot.docs.length > limit;
+
+    const startOffset = cursor === null ? 0 : cursor.absoluteOffset;
+    const entries = page.map((doc, index) =>
+      publicEntry(
+        startOffset + index + 1,
+        doc.id,
+        doc.data() ?? {},
+        economy,
+        seasonId
+      )
+    );
+    // Built from the PUBLISHED row, which was itself decoded from the canonical
+    // scalars — so the cursor can only ever point at a position the ordering
+    // actually expresses.
+    const last = entries[entries.length - 1];
+
+    const nextCursor =
+      hasMore && last !== undefined
+        ? encodeCursor(
+            {
+              economy,
+              seasonId,
+              afterScoreCentavos: last.scoreCentavos,
+              afterWinsCount: last.winsCount,
+              afterDocumentId: last.publicPlayerId,
+              absoluteOffset: startOffset + entries.length,
+            },
+            cursorSecret
+          )
+        : null;
+
+    return {
+      success: true,
+      timezone: RANKING_TIMEZONE,
+      amountUnit: "centavos",
+      economy,
+      seasonId,
+      playerCount: snapshot.playerCount,
+      entries,
+      nextCursor,
+    };
+  } catch (error) {
+    console.error("getSeasonLeaderboard error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+/**
+ * DEDICATED builder, never `central`: `FunctionBuilder.prototype.runWith()`
+ * MUTATES the builder it is called on and returns `this`, so running it on the
+ * shared `central` would silently attach the cursor secret to EVERY export
+ * declared after this line (it did — that was the re-audit's HIGH finding).
+ * The module-level `region()` factory returns a fresh builder per call, which
+ * confines the secret to exactly this one callable. `functionRegions.test.ts`
+ * asserts the resulting per-export secret sets on the built artifact.
+ */
+export const getSeasonLeaderboard = region(REGION_CALLABLES)
+  .runWith({ secrets: [RANKING_CURSOR_SECRET_ENV] })
+  .https.onCall(getSeasonLeaderboardHandler);
+
+/**
+ * The caller's own placement in a monthly season.
+ *
+ * THE CALLER IS THE TOKEN. There is no uid in the payload — a player can only
+ * ever ask about themselves — and the uid is never echoed back: it is resolved
+ * to the pseudonym through the server-only identity map, and only the pseudonym
+ * appears in the response.
+ *
+ * THE ORDINAL IS EXACT, not a page scan. Three disjoint counts cover precisely
+ * the entries ahead under section 4.3 — a strictly better score, or the same
+ * score with more wins, or both equal with a lower `publicPlayerId` — so the
+ * answer is identical to the position the paged leaderboard would show, at any
+ * season size.
+ *
+ * A player with no qualifying prize is NOT ranked: `isRanked: false` and
+ * `rank: null`, with no document created and no synthetic zero-score row.
+ */
+export interface MySeasonRankingOptions {
+  /**
+   * Test-only synchronisation point, awaited after the first transactional
+   * read. It exists solely so a concurrency test can mutate a competitor once
+   * the snapshot is already fixed, proving the later counts still observe the
+   * state the transaction started from.
+   *
+   * NOT a payload field and not client-reachable.
+   */
+  readonly afterFirstRead?: () => Promise<void>;
+  /**
+   * Clock override, injected only by tests so the retention window can be
+   * exercised deterministically. Production never passes it.
+   *
+   * NOT a payload field: a client can neither supply nor influence it.
+   */
+  readonly now?: Date;
+}
+
+export const getMySeasonRankingHandler = async (
+  data: any,
+  context: any,
+  options: MySeasonRankingOptions = {}
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertSignedIn(
+      context,
+      "Você precisa estar logado para ver sua posição."
+    );
+
+    // `uid` is deliberately NOT an accepted key.
+    assertExactPayload(data ?? {}, ["economy", "seasonId"]);
+
+    const economy = normalizeEconomy((data ?? {}).economy);
+    const seasonId = normalizeMonth((data ?? {}).seasonId).key;
+
+    // Retention (§8.4): only the current business month and the 11 before it
+    // are served. Checked BEFORE any read.
+    assertSeasonServable(
+      seasonId,
+      seasonIdFromInstant(options.now ?? new Date())
+    );
+
+    const uid = normalizeIdentityUid(callerAuth.uid);
+
+    // Read INSIDE the snapshot below, like everything else this answer rests
+    // on. An identity is MINTED by settlement, never by a leaderboard read, so
+    // a player who never won stays unregistered.
+    const identityRef = db.collection(PUBLIC_PLAYER_ID_COLLECTION).doc(uid);
+
+    const entries = seasonEntriesQuery(economy, seasonId);
+    const parentRef = db
+      .collection(SEASON_RANKINGS_COLLECTION)
+      .doc(seasonDocumentId(economy, seasonId));
+
+    // ── ONE consistent snapshot ────────────────────────────────────
+    // Parent, the entry, both integrity counts and the ahead-count are read
+    // through the SAME read-only transaction, so they share one read
+    // timestamp. Issuing them independently let a competitor cross between
+    // the counted sets mid-read and be counted twice — or missed — producing
+    // an ordinal that matched no state the season was ever actually in.
+    //
+    // `readOnly: true` is not decoration: Firestore refuses writes inside it,
+    // so a read path can never acquire one by accident.
+    const canonical = canonicalEntriesQuery(economy, seasonId);
+
+    const snapshot = await db.runTransaction(
+      async (transaction) => {
+        const parentSnap = await transaction.get(parentRef);
+        const identitySnap = await transaction.get(identityRef);
+
+        // ABSENT identity: the caller simply never won — unranked, per
+        // contract. PRESENT but malformed: the one document that binds an
+        // account to its pseudonym is corrupt, and answering "you are not
+        // ranked" would be indistinguishable from the legitimate case while
+        // silently hiding an entry that may well exist. That fails closed,
+        // with a message that names no uid, path or value.
+        const publicPlayerId = identitySnap.exists
+          ? (identitySnap.data() ?? {}).publicPlayerId
+          : null;
+
+        if (identitySnap.exists && !isPublicPlayerId(publicPlayerId)) {
+          throw new DomainError(
+            "failed-precondition",
+            "Documento de ranking inconsistente."
+          );
+        }
+
+        const entrySnap = isPublicPlayerId(publicPlayerId)
+          ? await transaction.get(entries.doc(publicPlayerId))
+          : null;
+
+        // Test-only seam: lets a concurrency test mutate a competitor AFTER
+        // the snapshot is fixed but BEFORE the counts run. Never reachable
+        // from a client — a handler parameter, not a payload field.
+        if (options.afterFirstRead !== undefined) {
+          await options.afterFirstRead();
+        }
+
+        const [physicalSnap, canonicalSnap] = await Promise.all([
+          transaction.get(entries.count()),
+          transaction.get(canonical.count()),
+        ]);
+
+        // The SAME invariant the leaderboard proves, on the same snapshot, so
+        // neither surface can answer for a season the other would refuse.
+        const integrity = assertSeasonIntegrity({
+          parentExists: parentSnap.exists,
+          parentData: parentSnap.data() ?? {},
+          physicalCount: physicalSnap.data().count,
+          canonicalCount: canonicalSnap.data().count,
+        });
+
+        if (entrySnap === null || !entrySnap.exists) {
+          return { ranked: false as const, playerCount: integrity.playerCount };
+        }
+
+        const mine = publicEntry(
+          1,
+          entrySnap.id,
+          entrySnap.data() ?? {},
+          economy,
+          seasonId
+        );
+
+        // THREE DISJOINT COUNTS over the same typed domain, all in this
+        // transaction: a strictly better score, or the same score with more
+        // wins, or both equal with a lower document id. Together they cover
+        // exactly the entries ahead under §4.3, and the caller's own row is in
+        // none of them because every third-level bound is strict.
+        const myScore = rankTimestamp(encodeRankScalar(mine.scoreCentavos));
+        const myWins = rankTimestamp(encodeRankScalar(mine.winsCount));
+
+        const [betterScore, sameScoreMoreWins, sameTupleEarlierId] =
+          await Promise.all([
+            transaction.get(
+              entries
+                .where("scoreOrder", ">", myScore)
+                .where("scoreOrder", "<=", MAX_RANK_TS)
+                .where("winsOrder", ">=", MIN_RANK_TS)
+                .where("winsOrder", "<=", MAX_RANK_TS)
+                .orderBy("scoreOrder", "desc")
+                .orderBy("winsOrder", "desc")
+                .orderBy(admin.firestore.FieldPath.documentId(), "asc")
+                .count()
+            ),
+            transaction.get(
+              entries
+                .where("scoreOrder", "==", myScore)
+                .where("winsOrder", ">", myWins)
+                .where("winsOrder", "<=", MAX_RANK_TS)
+                .orderBy("winsOrder", "desc")
+                .orderBy(admin.firestore.FieldPath.documentId(), "asc")
+                .count()
+            ),
+            transaction.get(
+              entries
+                .where("scoreOrder", "==", myScore)
+                .where("winsOrder", "==", myWins)
+                .where(
+                  admin.firestore.FieldPath.documentId(),
+                  "<",
+                  entrySnap.id
+                )
+                .orderBy(admin.firestore.FieldPath.documentId(), "asc")
+                .count()
+            ),
+          ]);
+
+        const ahead =
+          betterScore.data().count +
+          sameScoreMoreWins.data().count +
+          sameTupleEarlierId.data().count;
+
+        return {
+          ranked: true as const,
+          playerCount: integrity.playerCount,
+          mine,
+          ahead,
+        };
+      },
+      { readOnly: true }
+    );
+
+    if (!snapshot.ranked) {
+      return {
+        success: true,
+        timezone: RANKING_TIMEZONE,
+        amountUnit: "centavos",
+        economy,
+        seasonId,
+        isRanked: false,
+        rank: null,
+        entry: null,
+        playerCount: snapshot.playerCount,
+      };
+    }
+
+    return {
+      success: true,
+      timezone: RANKING_TIMEZONE,
+      amountUnit: "centavos",
+      economy,
+      seasonId,
+      isRanked: true,
+      rank: rankFromAhead(snapshot.ahead),
+      entry: {
+        publicPlayerId: snapshot.mine.publicPlayerId,
+        label: snapshot.mine.label,
+        scoreCentavos: snapshot.mine.scoreCentavos,
+        winsCount: snapshot.mine.winsCount,
+      },
+      playerCount: snapshot.playerCount,
+    };
+  } catch (error) {
+    console.error("getMySeasonRanking error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const getMySeasonRanking = central.https.onCall(
+  getMySeasonRankingHandler
+);
 
 /**
  * A Firestore Timestamp (production), a Date (tests), or null for anything

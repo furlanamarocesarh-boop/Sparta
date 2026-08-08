@@ -37,21 +37,64 @@ export type Check = { readonly ok: true } | { readonly ok: false; readonly messa
  * exact allowlist. This is what makes `amount`, `externalid`, `transactionid`,
  * `prize`, `status`, and any stray reference an `invalid-argument` rather than a
  * silently ignored field.
+ *
+ * THE SHAPE IS VALIDATED, NOT JUST THE KEYS. `Object.keys` alone is bypassable:
+ * a JSON body with a `__proto__` member reaches the handler (through the SDK's
+ * `obj[k] = v` decode loop) as an object whose PROTOTYPE carries the smuggled
+ * fields — its own key set is empty, yet `(data ?? {}).x` still resolves them
+ * through the chain. So a payload must also:
+ *
+ *   - sit directly on `Object.prototype` (or none at all) — any other
+ *     prototype is client-controlled;
+ *   - carry no symbol keys — JSON cannot produce them;
+ *   - hold every field as an OWN PLAIN DATA property — no accessors, and the
+ *     own-name enumeration (`getOwnPropertyNames`, not `Object.keys`) also
+ *     catches a literal own `__proto__` / non-enumerable smuggling.
+ *
+ * Every structural rejection uses one GENERIC public message: the shape of a
+ * hostile payload is not information we return to its author.
  */
 export function assertExactPayload(
   data: unknown,
   allowed: readonly string[]
 ): void {
-  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+  const reject = (): never => {
     throw new DomainError("invalid-argument", "Payload inválido.");
-  }
-  for (const key of Object.keys(data as Record<string, unknown>)) {
-    if (!allowed.includes(key)) {
-      throw new DomainError(
-        "invalid-argument",
-        `Campo não permitido: ${key}.`
-      );
+  };
+
+  if (data === null || typeof data !== "object") reject();
+
+  // EVERY reflective step is wrapped: on an exotic object (a Proxy with a
+  // throwing trap, a revoked Proxy) these throw a plain TypeError, which would
+  // otherwise escape the domain and surface as an INTERNAL 500 that looks like
+  // a server fault. A hostile shape is a bad request, so it fails as one — and
+  // the trap's own message is discarded rather than echoed.
+  try {
+    if (Array.isArray(data)) reject();
+
+    const proto = Object.getPrototypeOf(data);
+    if (proto !== Object.prototype && proto !== null) reject();
+
+    if (Object.getOwnPropertySymbols(data).length > 0) reject();
+
+    for (const key of Object.getOwnPropertyNames(data)) {
+      // The key NAME is never echoed. It is attacker-chosen text that would
+      // otherwise reach both the client and the log stream verbatim — and JSON
+      // permits newlines in a key, so echoing it lets a caller forge log lines.
+      if (!allowed.includes(key)) reject();
+
+      const descriptor = Object.getOwnPropertyDescriptor(data, key);
+      if (
+        descriptor === undefined ||
+        descriptor.get !== undefined ||
+        descriptor.set !== undefined
+      ) {
+        reject();
+      }
     }
+  } catch (error) {
+    if (error instanceof DomainError) throw error;
+    throw new DomainError("invalid-argument", "Payload inválido.");
   }
 }
 
