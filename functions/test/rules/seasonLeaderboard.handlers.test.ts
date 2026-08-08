@@ -15,7 +15,22 @@ import {
   SEASON_RANKINGS_COLLECTION,
   seasonDocumentId,
 } from "../../src/domain/seasonRanking.js";
-import { buildRankKey } from "../../src/domain/seasonLeaderboard.js";
+import {
+  decodeRankScalar,
+  encodeRankScalar,
+} from "../../src/domain/seasonLeaderboard.js";
+
+/**
+ * A canonical ordering scalar exactly as the write path persists it.
+ *
+ * NOT a date: one second is 1 000 000 ranking units and the nanosecond part is
+ * always a multiple of 1000 — which is what survives Firestore's microsecond
+ * storage precision intact.
+ */
+function rankTs(value: number): admin.firestore.Timestamp {
+  const s = encodeRankScalar(value);
+  return new admin.firestore.Timestamp(s.seconds, s.nanoseconds);
+}
 
 /**
  * Behavioral tests for `getSeasonLeaderboard` and `getMySeasonRanking`, run
@@ -153,7 +168,8 @@ async function seedEntry(
       seasonId,
       // Exactly what the write path mints: the canonical key, built from the
       // normalised values and the document id.
-      rankKey: buildRankKey(scoreCentavos, winsCount, publicPlayerId),
+      scoreOrder: rankTs(scoreCentavos),
+      winsOrder: rankTs(winsCount),
       scoreCentavos,
       winsCount,
       firstPrizeAt: admin.firestore.Timestamp.fromDate(new Date("2026-08-01")),
@@ -813,7 +829,7 @@ describe("getSeasonLeaderboard — cursor autenticado ponta a ponta", () => {
     );
   });
 
-  it("REJEITA um cursor válido com o offset adulterado", async () => {
+  it("REJEITA um cursor válido com o absoluteOffset adulterado", async () => {
     const cursor = await mintCursor();
     const inner = Buffer.from(cursor, "base64url").toString("utf8");
     const split = inner.lastIndexOf(".");
@@ -1198,7 +1214,8 @@ describe("conjunto canônico — corrupção falha fechada nas DUAS callables", 
       publicPlayerId: id,
       economy: ECONOMY_CASH,
       seasonId: SEASON,
-      rankKey: buildRankKey(500, 9, id),
+      scoreOrder: rankTs(500),
+      winsOrder: rankTs(9),
       scoreCentavos: 500,
       winsCount: 9,
       firstPrizeAt: admin.firestore.Timestamp.fromDate(new Date("2026-08-01")),
@@ -1231,19 +1248,115 @@ describe("conjunto canônico — corrupção falha fechada nas DUAS callables", 
 
   const Z = "Zzzzzzzzzzzzzzzzzzzzzz";
 
-  // O caso original da auditoria, agora com o veredito novo.
-  it("A/C válidos + Z com winsCount inválido + parent 3: AMBAS falham fechadas", async () => {
+  // O caso original da auditoria (A 300/2, C 200/2, Z score 500 com winsCount
+  // inválido, parent 3), com o veredito que a arquitetura tipada impõe: o campo
+  // corrompido é uma CÓPIA DE AUDITORIA comprovadamente redundante — a tupla
+  // tipada de Z está íntegra — então nada falha e, o que importa, as duas
+  // superfícies respondem de forma IDÊNTICA sobre o mesmo conjunto. Exclusão
+  // ou inclusão silenciosamente diferente entre elas é o que está proibido.
+  it("A/C válidos + Z com cópia winsCount inválida + parent 3: as duas concordam", async () => {
     await seedEntry(ECONOMY_CASH, IDS[0], 300, 2);
     await seedEntry(ECONOMY_CASH, IDS[2], 200, 2);
     await seedParent(ECONOMY_CASH, 3, 1000);
     await corruptEntry(Z, { winsCount: null, rankKey: 42 });
     await bindIdentity("uid-c", IDS[2]);
 
-    await bothFailClosed("winsCount inválido");
+    const board = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-any")
+    );
+    // Z pontua 500 na tupla tipada, então lidera; C fica em 3º.
+    assert.deepEqual(
+      (board.entries as any[]).map((e) => [e.publicPlayerId, e.position]),
+      [
+        [Z, 1],
+        [IDS[0], 2],
+        [IDS[2], 3],
+      ]
+    );
+    assert.equal(board.playerCount, 3);
+    // O valor público vem do escalar (9), NUNCA da cópia corrompida (null).
+    assert.equal((board.entries as any[])[0].winsCount, 9);
+
+    const mine = await getMySeasonRankingHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-c")
+    );
+    assert.equal(mine.rank, 3, "o mesmo ordinal que o leaderboard publica");
+    assert.equal(mine.playerCount, board.playerCount, "os dois playerCount");
   });
 
   // A chave canônica é a ÚNICA fonte de ordenação: corromper as cópias de
   // auditoria não pode mudar resposta nenhuma, nem derrubar o ranking.
+  // ── B1/B1b: corrupção TIPADA fica fora do conjunto canônico ──────────────
+  // Cada caso mantém o parent coerente com o count canônico, para provar que é
+  // o count FÍSICO que impede o bypass — e não um parent convenientemente
+  // ajustado.
+  for (const [label, patch] of [
+    ["scoreOrder ausente", { scoreOrder: admin.firestore.FieldValue.delete() }],
+    ["scoreOrder null", { scoreOrder: null }],
+    ["scoreOrder string", { scoreOrder: "não é um timestamp" }],
+    ["scoreOrder número", { scoreOrder: 42 }],
+    ["scoreOrder abaixo do mínimo", { scoreOrder: new admin.firestore.Timestamp(-1, 0) }],
+    ["scoreOrder acima do máximo", { scoreOrder: new admin.firestore.Timestamp(9_007_199_255, 0) }],
+    ["winsOrder ausente", { winsOrder: admin.firestore.FieldValue.delete() }],
+    ["winsOrder null", { winsOrder: null }],
+    ["winsOrder string", { winsOrder: "não é um timestamp" }],
+    ["winsOrder número", { winsOrder: 42 }],
+    ["winsOrder abaixo do mínimo", { winsOrder: new admin.firestore.Timestamp(-1, 0) }],
+    ["winsOrder acima do máximo", { winsOrder: new admin.firestore.Timestamp(9_007_199_255, 0) }],
+  ] as const) {
+    // A corrupção é posicionada em CADA lugar relevante da ordenação: antes do
+    // jogador consultado, depois dele, na primeira página e depois dela. O
+    // gate global é o mesmo em todos, então nenhuma página chega a ser servida.
+    for (const [posLabel, victim] of [
+      ["antes do jogador", IDS[0]], // A, posição 1
+      ["depois do jogador", IDS[4]], // E, posição 5
+      ["na primeira página", IDS[1]], // B, posição 2
+      ["depois da segunda página", IDS[4]], // fora de duas páginas de 2
+    ] as const) {
+      it(`${label} (${posLabel}): AMBAS falham fechadas`, async () => {
+        await seedStandardSeason();
+        await bindIdentity("uid-c", IDS[2]);
+        await parentRef(ECONOMY_CASH)
+          .collection(SEASON_ENTRIES_SUBCOLLECTION)
+          .doc(victim)
+          .update(patch as Record<string, unknown>);
+
+        // A primeira página JÁ falha: nenhuma linha é servida antes do colapso.
+        assert.equal(
+          await expectFailure(() =>
+            getSeasonLeaderboardHandler(
+              { economy: ECONOMY_CASH, seasonId: SEASON, limit: 2 },
+              ctxOf("uid-any")
+            )
+          ),
+          "failed-precondition",
+          `${label}/${posLabel}: página 1`
+        );
+        await bothFailClosed(`${label}/${posLabel}`);
+      });
+    }
+  }
+
+  it("parent ajustado ao count canônico NÃO contorna o gate: o físico ainda diverge", async () => {
+    await seedStandardSeason(); // 5 entries, parent 5
+    await bindIdentity("uid-c", IDS[2]);
+    await parentRef(ECONOMY_CASH)
+      .collection(SEASON_ENTRIES_SUBCOLLECTION)
+      .doc(IDS[4])
+      .update({ scoreOrder: "não é um timestamp" });
+    // O atacante "conserta" o parent para o count canônico (4).
+    await seedParent(ECONOMY_CASH, 4, 1100);
+
+    await bothFailClosed("parent alinhado ao canônico");
+  });
+
+  // Corromper a CHAVE, por outro lado, torna a entry não consultável — e isso
+  // as duas callables detectam pelo count físico, sem varredura.
+  // ── §16: as cópias de auditoria não decidem NADA ─────────────────────────
+  // Cada caso mantém scoreOrder/winsOrder corretos e corrompe apenas uma cópia.
+  // Nenhuma delas pode mover row, ordem, rank, playerCount, cursor ou erro.
   for (const [label, patch] of [
     ["scoreCentavos ausente", { scoreCentavos: admin.firestore.FieldValue.delete() }],
     ["scoreCentavos null", { scoreCentavos: null }],
@@ -1265,11 +1378,29 @@ describe("conjunto canônico — corrupção falha fechada nas DUAS callables", 
     ["publicPlayerId vazio", { publicPlayerId: "" }],
     ["publicPlayerId malformado", { publicPlayerId: "PLR-1" }],
     ["publicPlayerId != document id", { publicPlayerId: IDS[0] }],
+    ["economy trocada", { economy: ECONOMY_BETA_CREDIT }],
+    ["economy inválida", { economy: "gold" }],
+    ["economy ausente", { economy: admin.firestore.FieldValue.delete() }],
+    ["seasonId de outra temporada", { seasonId: "2026-07" }],
+    ["seasonId ausente", { seasonId: admin.firestore.FieldValue.delete() }],
+    // rankKey é AGORA apenas uma cópia legada: todas as formas hostis do
+    // finding B1 entram aqui e precisam ser simplesmente ignoradas.
+    ["rankKey legado truncado", { rankKey: "v1|0" }],
+    ["rankKey legado numérico curto", { rankKey: "v1|000|" + "0".repeat(16) + "|" + IDS[0] }],
+    ["rankKey legado numérico longo", { rankKey: "v1|" + "0".repeat(17) + "|" + "0".repeat(16) + "|" + IDS[0] }],
+    ["rankKey legado não numérico", { rankKey: "v1|00000000000000ab|" + "0".repeat(16) + "|" + IDS[0] }],
+    ["rankKey legado sem separador", { rankKey: "v1|" + "0".repeat(32) + "|" + IDS[0] }],
+    ["rankKey legado com separador extra", { rankKey: "v1|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + IDS[0] + "|x" }],
+    ["rankKey legado sem document id", { rankKey: "v1|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" }],
+    ["rankKey legado com sufixo", { rankKey: "v1|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + IDS[0] + "xx" }],
+    ["rankKey legado de outro documento", { rankKey: "v1|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + IDS[0] }],
+    ["rankKey legado ausente", { rankKey: admin.firestore.FieldValue.delete() }],
+    ["rankKey legado numérico", { rankKey: 42 }],
   ] as const) {
     it(`cópia de auditoria corrompida (${label}) NÃO move nada`, async () => {
       await seedStandardSeason();
       await bindIdentity("uid-c", IDS[2]);
-      // A entry de E continua com a chave canônica correta; só a cópia muda.
+      // A entry de E mantém a tupla tipada correta; só a cópia muda.
       await parentRef(ECONOMY_CASH)
         .collection(SEASON_ENTRIES_SUBCOLLECTION)
         .doc(IDS[4])
@@ -1284,8 +1415,16 @@ describe("conjunto canônico — corrupção falha fechada nas DUAS callables", 
       assert.deepEqual(
         (board.entries as any[]).map((e) => e.publicPlayerId),
         IDS,
-        `${label}: a ordem vem da chave canônica`
+        `${label}: a ordem vem da tupla tipada`
       );
+      // economy/seasonId vêm da REQUISIÇÃO, nunca do documento.
+      for (const row of board.entries as any[]) {
+        assert.equal(row.economy, ECONOMY_CASH, label);
+        assert.equal(row.seasonId, SEASON, label);
+      }
+      // E os valores públicos vêm dos escalares, não das cópias numéricas.
+      assert.equal((board.entries as any[])[4].scoreCentavos, 100, label);
+      assert.equal((board.entries as any[])[4].winsCount, 1, label);
 
       const mine = await getMySeasonRankingHandler(
         { economy: ECONOMY_CASH, seasonId: SEASON },
@@ -1296,51 +1435,23 @@ describe("conjunto canônico — corrupção falha fechada nas DUAS callables", 
     });
   }
 
-  // Corromper a CHAVE, por outro lado, torna a entry não consultável — e isso
-  // as duas callables detectam pelo count físico, sem varredura.
-  for (const [label, patch] of [
-    ["chave ausente", { rankKey: admin.firestore.FieldValue.delete() }],
-    ["chave null", { rankKey: null }],
-    ["chave numérica", { rankKey: 42 }],
-    ["chave boolean", { rankKey: true }],
-    ["chave array", { rankKey: ["v1|x"] }],
-    ["chave mapa", { rankKey: { a: 1 } }],
-    ["chave de outra versão", { rankKey: "v0|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + "Zzzzzzzzzzzzzzzzzzzzzz" }],
-    ["chave de versão futura", { rankKey: "v2|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + "Zzzzzzzzzzzzzzzzzzzzzz" }],
-    ["chave estruturalmente inválida", { rankKey: "v1|abc|def|xyz" }],
-  ] as const) {
-    it(`chave canônica corrompida (${label}): AMBAS falham fechadas`, async () => {
-      await seedStandardSeason();
-      await bindIdentity("uid-c", IDS[2]);
-      await parentRef(ECONOMY_CASH)
-        .collection(SEASON_ENTRIES_SUBCOLLECTION)
-        .doc(IDS[4])
-        .update(patch as Record<string, unknown>);
-
-      await bothFailClosed(label);
-    });
-  }
-
-  it("chave apontando para OUTRA identidade que o document id: falha fechada", async () => {
+  it("a identidade É o document id: nenhuma cópia pode reivindicar outro jogador", async () => {
     await seedStandardSeason();
     await bindIdentity("uid-c", IDS[2]);
-    // O documento de E passa a carregar a chave de A: mesma faixa canônica,
-    // então o count não muda — quem barra é a reconciliação id ↔ chave.
+    // E passa a alegar ser A. Sem identidade armazenada no caminho decisório,
+    // isso é apenas ruído de auditoria.
     await parentRef(ECONOMY_CASH)
       .collection(SEASON_ENTRIES_SUBCOLLECTION)
       .doc(IDS[4])
-      .update({ rankKey: buildRankKey(100, 1, IDS[0]) });
+      .update({ publicPlayerId: IDS[0], rankKey: "v1|qualquer-coisa" });
 
-    assert.equal(
-      await expectFailure(() =>
-        getSeasonLeaderboardHandler(
-          { economy: ECONOMY_CASH, seasonId: SEASON },
-          ctxOf("uid-any")
-        )
-      ),
-      "failed-precondition",
-      "o leaderboard renderiza a linha e detecta a divergência"
+    const board = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON },
+      ctxOf("uid-any")
     );
+    const ids = (board.entries as any[]).map((e) => e.publicPlayerId);
+    assert.deepEqual(ids, IDS, "cada linha é o seu próprio document id");
+    assert.equal(new Set(ids).size, 5, "nenhum pseudônimo duplicado");
   });
 
   it("dois jogadores com MESMO score e wins continuam totalmente ordenados", async () => {
@@ -1382,7 +1493,8 @@ describe("conjunto canônico — corrupção falha fechada nas DUAS callables", 
         publicPlayerId: IDS[2],
         economy: ECONOMY_CASH,
         seasonId: SEASON,
-        rankKey: buildRankKey(200, 2, IDS[2]),
+        scoreOrder: rankTs(200),
+        winsOrder: rankTs(2),
         scoreCentavos: 200,
         winsCount: 2,
       });
@@ -2184,7 +2296,8 @@ describe("infraestrutura de teste — cleanup de entries órfãs", () => {
         publicPlayerId: orfa,
         economy: ECONOMY_CASH,
         seasonId: SEASON,
-        rankKey: buildRankKey(1, 1, orfa),
+        scoreOrder: rankTs(1),
+        winsOrder: rankTs(1),
         scoreCentavos: 1,
         winsCount: 1,
       });
@@ -2284,6 +2397,169 @@ describe("identity map — ausente, válido e corrompido", () => {
       if (canary.length > 2) {
         assert.ok(!message.includes(canary), label);
       }
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// §4 — round-trip PERSISTIDO: memória não basta, o Firestore precisa devolver
+//      exatamente o que foi escrito.
+// ---------------------------------------------------------------------------
+
+describe("escalares canônicos — persistência exata no Firestore", () => {
+  const BOUNDARY = [
+    0,
+    1,
+    200,
+    300,
+    999,
+    1_000,
+    1_001,
+    999_999,
+    999_999_999,
+    1_000_000_000,
+    123_456_789_012_345,
+    Number.MAX_SAFE_INTEGER,
+  ];
+
+  const probe = () => db.collection("rank_scalar_probe");
+
+  it("escreve, persiste, lê e decodifica cada valor de fronteira sem perda", async () => {
+    for (const v of BOUNDARY) {
+      await probe().doc(`v${v}`).set({ s: rankTs(v) });
+    }
+    for (const v of BOUNDARY) {
+      const back = (await probe().doc(`v${v}`).get()).get("s");
+      assert.equal(
+        decodeRankScalar(back),
+        v,
+        `${v} não sobreviveu à persistência`
+      );
+      assert.equal(
+        back.nanoseconds % 1_000,
+        0,
+        `${v}: nanoseconds precisa continuar múltiplo de 1000`
+      );
+    }
+    for (const d of (await probe().get()).docs) await d.ref.delete();
+  });
+
+  it("valores que a base 1e9 colapsava permanecem DISTINTOS e ORDENADOS", async () => {
+    // Sob a codificação rejeitada, 200 e 300 persistiam ambos como
+    // Timestamp(0,0). Este é o teste discriminante contra essa restauração.
+    for (const v of [200, 300, 999, 1_000, 1_001]) {
+      await probe().doc(`c${v}`).set({ s: rankTs(v) });
+    }
+    const read = async (v: number) => (await probe().doc(`c${v}`).get()).get("s");
+
+    const t200 = await read(200);
+    const t300 = await read(300);
+    assert.equal(decodeRankScalar(t200), 200);
+    assert.equal(decodeRankScalar(t300), 300);
+    assert.equal(t200.isEqual(t300), false, "200 e 300 não podem colidir");
+    assert.equal(t200.valueOf() < t300.valueOf(), true, "200 precede 300");
+
+    assert.equal(
+      (await read(999)).isEqual(await read(1_000)),
+      false,
+      "999 e 1000 não podem colidir"
+    );
+    assert.equal(
+      (await read(1_000)).isEqual(await read(1_001)),
+      false,
+      "1000 e 1001 não podem colidir"
+    );
+
+    // E a ordenação persistida é a numérica.
+    const ordered = await probe().orderBy("s", "asc").get();
+    assert.deepEqual(
+      ordered.docs.map((d) => decodeRankScalar(d.get("s"))),
+      [200, 300, 999, 1_000, 1_001]
+    );
+    for (const d of (await probe().get()).docs) await d.ref.delete();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §12 — clamping efetivo, provado com mais de 100 entries
+// ---------------------------------------------------------------------------
+
+describe("limite efetivo — clamp em 100 com mais de 100 entries", () => {
+  /** 105 entries com scores decrescentes, todas canônicas. */
+  async function seedManyEntries(): Promise<string[]> {
+    const ids: string[] = [];
+    const batchIds = Array.from({ length: 105 }, (_, i) =>
+      // ids de 22 chars, únicos e ordenáveis
+      `P${String(i).padStart(3, "0")}aaaaaaaaaaaaaaaaaa`
+    );
+    for (let i = 0; i < batchIds.length; i += 1) {
+      const id = batchIds[i];
+      ids.push(id);
+      await parentRef(ECONOMY_CASH)
+        .collection(SEASON_ENTRIES_SUBCOLLECTION)
+        .doc(id)
+        .set({
+          scoreOrder: rankTs(100_000 - i * 10),
+          winsOrder: rankTs(1),
+          publicPlayerId: id,
+          economy: ECONOMY_CASH,
+          seasonId: SEASON,
+        });
+    }
+    await seedParent(ECONOMY_CASH, batchIds.length, 1_000_000);
+    return ids;
+  }
+
+  it("limit 1000 serve exatamente 100 linhas e um cursor utilizável", async () => {
+    const ids = await seedManyEntries();
+
+    const page1 = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON, limit: 1000 },
+      ctxOf("u1")
+    );
+    assert.equal(
+      (page1.entries as any[]).length,
+      100,
+      "o teto efetivo é 100, não 1000 e não um erro"
+    );
+    assert.equal((page1.entries as any[])[0].position, 1);
+    assert.equal((page1.entries as any[])[99].position, 100);
+    assert.equal(page1.playerCount, 105);
+    assert.ok(page1.nextCursor, "há mais páginas");
+
+    // O cursor obtido DEPOIS do clamping continua utilizável e a numeração
+    // prossegue sem lacuna nem repetição.
+    const page2 = await getSeasonLeaderboardHandler(
+      { economy: ECONOMY_CASH, seasonId: SEASON, limit: 1000, cursor: page1.nextCursor },
+      ctxOf("u1")
+    );
+    assert.equal((page2.entries as any[]).length, 5);
+    assert.deepEqual(
+      (page2.entries as any[]).map((e) => e.position),
+      [101, 102, 103, 104, 105]
+    );
+    assert.equal(page2.nextCursor, null, "última página");
+
+    const seen = [
+      ...(page1.entries as any[]).map((e) => e.publicPlayerId),
+      ...(page2.entries as any[]).map((e) => e.publicPlayerId),
+    ];
+    assert.equal(new Set(seen).size, 105, "nenhuma repetição");
+    assert.deepEqual(seen, ids, "nenhuma omissão e a ordem canônica");
+  });
+
+  for (const [label, limit, expected] of [
+    ["100 permanece 100", 100, 100],
+    ["101 vira 100", 101, 100],
+    ["1000 vira 100", 1000, 100],
+  ] as const) {
+    it(`clamp: ${label}`, async () => {
+      await seedManyEntries();
+      const res = await getSeasonLeaderboardHandler(
+        { economy: ECONOMY_CASH, seasonId: SEASON, limit },
+        ctxOf("u1")
+      );
+      assert.equal((res.entries as any[]).length, expected);
     });
   }
 });

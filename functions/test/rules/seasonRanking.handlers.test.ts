@@ -4,6 +4,7 @@ import { before, beforeEach, describe, it } from "node:test";
 import * as admin from "firebase-admin";
 
 import { MAX_AGGREGATE_CENTAVOS } from "../../src/domain/aggregateMoney.js";
+import { encodeRankScalar } from "../../src/domain/seasonLeaderboard.js";
 import {
   BETA_PRIZE_CATEGORY,
   ECONOMY_BETA_CREDIT,
@@ -814,19 +815,41 @@ describe("idempotência", () => {
 // ---------------------------------------------------------------------------
 
 describe("overflow aborta tudo", () => {
+  /** O escalar canônico exatamente como o write path o persiste. NÃO é uma data. */
+  const rankTs = (value: number): admin.firestore.Timestamp => {
+    const s = encodeRankScalar(value);
+    return new admin.firestore.Timestamp(s.seconds, s.nanoseconds);
+  };
+
+  /** A entry desta temporada, para o jogador que os fixtures premiam. */
+  const entryRefOf = (publicPlayerId: string) =>
+    db
+      .doc(parentPath(ECONOMY_CASH))
+      .collection(SEASON_ENTRIES_SUBCOLLECTION)
+      .doc(publicPlayerId);
+
   it("não escreve entry, parent nem guard quando o agregado estoura", async () => {
     // Primeiro prêmio, aplicado normalmente.
     await onPrizeTransactionCreatedHandler(await seedPrize(), ACTIVE);
     const entryBefore = await onlyEntry(ECONOMY_CASH);
 
-    // Empurra a entry para o teto exato.
-    const entryRef = db
-      .doc(parentPath(ECONOMY_CASH))
-      .collection(SEASON_ENTRIES_SUBCOLLECTION)
-      .doc(entryBefore.publicPlayerId as string);
-    await entryRef.update({ scoreCentavos: MAX_AGGREGATE_CENTAVOS });
+    // Empurra a entry para o teto exato NO CAMPO AUTORITATIVO.
+    //
+    // A transição lê `scoreOrder` — nunca a cópia de auditoria `scoreCentavos`
+    // —, então saturar o escalar tipado é a ÚNICA forma de alcançar o teto.
+    // `scoreCentavos` é deixada deliberadamente no valor antigo (50 000) para
+    // que a proteção de overflow só possa ter vindo de `scoreOrder`.
+    // `winsOrder` permanece válido, como todo campo tipado exigido.
+    const entryRef = entryRefOf(entryBefore.publicPlayerId as string);
+    await entryRef.update({ scoreOrder: rankTs(MAX_AGGREGATE_CENTAVOS) });
     const saturated = (await entryRef.get()).data() ?? {};
     const parentBefore = await readDoc(parentPath(ECONOMY_CASH));
+
+    assert.equal(
+      saturated.scoreCentavos,
+      50_000,
+      "a cópia de auditoria continua defasada: o teto veio do campo tipado"
+    );
 
     // Qualquer centavo adicional estoura.
     const second = await seedPrize({ amount: 0.01 }, "prize_t2");
@@ -854,6 +877,86 @@ describe("overflow aborta tudo", () => {
       "o guard do evento que estourou não pode existir"
     );
     assert.equal((await countAll()).guards, 1);
+  });
+
+  it("REAPLICAR o mesmo evento após o overflow continua não escrevendo nada", async () => {
+    // Idempotência preservada: o evento que estourou não deixou guard, então a
+    // retentativa reexecuta o mesmo caminho e falha de novo — nunca aplica
+    // parcialmente nem converge para um estado gravado.
+    await onPrizeTransactionCreatedHandler(await seedPrize(), ACTIVE);
+    const entryBefore = await onlyEntry(ECONOMY_CASH);
+    const entryRef = entryRefOf(entryBefore.publicPlayerId as string);
+    await entryRef.update({ scoreOrder: rankTs(MAX_AGGREGATE_CENTAVOS) });
+
+    const saturated = (await entryRef.get()).data() ?? {};
+    const parentBefore = await readDoc(parentPath(ECONOMY_CASH));
+    const second = await seedPrize({ amount: 0.01 }, "prize_t2");
+
+    for (const attempt of [1, 2, 3]) {
+      assert.equal(
+        await expectFailure(() =>
+          onPrizeTransactionCreatedHandler(second, ACTIVE)
+        ),
+        "failed-precondition",
+        `tentativa ${attempt}`
+      );
+      assert.deepEqual(
+        (await entryRef.get()).data(),
+        saturated,
+        `tentativa ${attempt}: a entry não pode mudar`
+      );
+      assert.deepEqual(
+        await readDoc(parentPath(ECONOMY_CASH)),
+        parentBefore,
+        `tentativa ${attempt}: o parent não pode mudar`
+      );
+      assert.equal(
+        await readDoc(`${RANKING_EVENTS_COLLECTION}/prize_t2`),
+        null,
+        `tentativa ${attempt}: o guard não pode existir`
+      );
+      assert.equal((await countAll()).guards, 1, `tentativa ${attempt}`);
+    }
+  });
+
+  it("saturar SOMENTE a cópia de auditoria scoreCentavos não decide nada", async () => {
+    // O contra-teste do anterior, e a prova direta de que `scoreCentavos` é
+    // não-decisória: com a cópia no teto e `scoreOrder` intacto, o mesmo prêmio
+    // que estouraria APLICA normalmente. A cópia não provoca overflow, não o
+    // suprime, não altera a transição e não muda a decisão de erro.
+    await onPrizeTransactionCreatedHandler(await seedPrize(), ACTIVE);
+    const entryBefore = await onlyEntry(ECONOMY_CASH);
+    const entryRef = entryRefOf(entryBefore.publicPlayerId as string);
+
+    const orderBefore = (await entryRef.get()).get("scoreOrder");
+    await entryRef.update({ scoreCentavos: MAX_AGGREGATE_CENTAVOS });
+
+    const second = await seedPrize({ amount: 0.01 }, "prize_t2");
+    const result = await onPrizeTransactionCreatedHandler(second, ACTIVE);
+    assert.equal(result.applied, true, "a cópia adulterada não bloqueia nada");
+
+    // A transição partiu de scoreOrder (50 000), não da cópia saturada.
+    const after = (await entryRef.get()).data() ?? {};
+    assert.equal(after.scoreCentavos, 50_001, "50 000 + 1 centavo");
+    assert.equal(after.winsCount, 2);
+    assert.equal(
+      (after.scoreOrder as admin.firestore.Timestamp).isEqual(
+        rankTs(50_001)
+      ),
+      true,
+      "o escalar canônico avançou exatamente um centavo"
+    );
+    assert.equal(
+      (orderBefore as admin.firestore.Timestamp).isEqual(rankTs(50_000)),
+      true,
+      "o escalar de origem era 50 000, não o teto"
+    );
+
+    // O parent acompanha a transição real, não a cópia.
+    const parent = await readDoc(parentPath(ECONOMY_CASH));
+    assert.equal(parent!.totalScoreCentavos, 50_001);
+    assert.equal(parent!.playerCount, 1);
+    assert.equal((await countAll()).guards, 2, "o evento foi aplicado uma vez");
   });
 });
 

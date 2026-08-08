@@ -438,34 +438,61 @@ merit, tenure or activity, so no player can seek or be disadvantaged by it in an
 Amounts are compared in centavos because reais are IEEE-754 doubles; comparing reais would make the
 order depend on representation noise. `inspectReais` supplies the exact centavos at ingest.
 
-### 4.5 Canonical key `rankKey` — amended
+### 4.5 Canonical order tuple — amended (supersedes the `rankKey` string)
 
-**FROZEN, added by the canonical-entry-invariants correction.** The order of section 4.3 is not
-expressed to Firestore as three separate fields. Each entry stores one string that *is* the order:
+**FROZEN, replacing the textual `rankKey`.** The order of section 4.3 is expressed to Firestore as a
+**typed tuple**, not a string:
 
 ```
-rankKey = "v1|" + complement(scoreCentavos) + "|" + complement(winsCount) + "|" + <document id>
-complement(n) = String(MAX_SAFE_INTEGER - n).padStart(16, "0")
+scoreOrder DESC, winsOrder DESC, FieldPath.documentId() ASC
 ```
 
-* **One predictable type.** Ordering on the three raw fields could not express structural validity:
-  Firestore drops a document from an `orderBy` only when the field is **absent**, while a field
-  present with the **wrong type** still sorts. A corrupt entry therefore entered the aggregates
-  while the page that had to render it failed — the two surfaces disagreed. A query over the
-  half-open range `["v1|0", "v1|:")` admits only strings of this version whose first numeric
-  position is numeric; every other type and version falls outside.
-* **The ordering is preserved exactly.** A single ASCENDING sort of `rankKey` reproduces
-  `scoreCentavos DESC, winsCount DESC, publicPlayerId ASC`, proven against the comparator over a
-  generated set.
-* **Identity is the document id.** The last component is the entry's document id, which is the
-  authoritative `publicPlayerId`. Document ids are unique, so `rankKey` is unique: the final
-  comparator identifies exactly one entry and `startAfter` is never ambiguous.
-* **Minted only by the write path**, from values `decideEntry` has already normalised. It is never
-  derived from client input and never computed at read time.
-* **Single source of truth.** `scoreCentavos`, `winsCount` and `publicPlayerId` remain on the
-  document as audit copies and are **not read** by either callable: every published value is
-  decoded from `rankKey`, and the key's id component must equal the document id or the entry fails
-  closed. They can no longer move a rank, a page or a response.
+where each ordering field is a **Timestamp used as an ordinal scalar**:
+
+```
+seconds     = floor(value / 1_000_000)
+nanoseconds = (value % 1_000_000) * 1_000
+value       = seconds * 1_000_000 + nanoseconds / 1_000
+```
+
+**THESE TIMESTAMPS ARE NOT DATES.** One second represents **1 000 000 ranking units**, and
+`nanoseconds` is **always a multiple of 1 000**. They must never pass through `Date`, a timezone, an
+ISO string or any temporal formatting.
+
+* **Why the string key was withdrawn.** A textual key can only be bounded by a lexicographic range,
+  and a range bounds a **prefix** — never the interior of the string. A hostile value that respected
+  the prefix (`v1|0…`) stayed inside the queried range, so the aggregates counted it while the page
+  that had to parse it failed: the leaderboard went down for the whole season while the individual
+  position answered with a silently inflated ordinal, and a corruption sitting past page 1 let two
+  full pages be served before the collapse. Findings **B1/B1b**.
+* **Why microseconds, not nanoseconds.** Firestore **persists** a Timestamp with microsecond
+  precision, truncating nanoseconds to a multiple of 1 000. A `value % 1_000_000_000` encoding is
+  therefore not injective through storage: `scoreCentavos` 200 and 300 both persist as
+  `Timestamp(0, 0)` and become indistinguishable, destroying the order. Measured against the
+  emulator: 9 of 12 boundary values lost data. The microsecond scale round-trips all of them, with a
+  maximum of 9 007 199 254 seconds — far inside the Timestamp range.
+* **Validity is a property of the type and the bounds.** The SDK enforces integral `seconds` and
+  `0 <= nanoseconds < 1e9`, and the canonical query bounds both fields inclusively between
+  `encode(0)` and `encode(MAX_SAFE_INTEGER)`. There is no "inside the range but structurally
+  malformed" state left to detect later, so an out-of-domain entry is excluded from the **canonical**
+  count while remaining in the **physical** count — and the season fails closed before any page is
+  built, wherever the corruption sits.
+* **Bijection and order preservation.** For every safe integer `v >= 0`, `decode(encode(v)) === v`;
+  and `a < b` iff `encode(a)` sorts before `encode(b)` under Firestore's Timestamp ordering, which is
+  exactly the numeric order of the scalar. Both proven in unit tests and against persisted documents.
+* **Identity is the document id**, via `FieldPath.documentId()`. There is no stored identity in the
+  decisive path at all, so two documents can never claim the same player and the final comparator
+  identifies exactly one entry: `startAfter` is never ambiguous.
+* **Minted only by the write path**, from values `decideEntry` has already normalised. The
+  incremental update decodes the **persisted tuple** — never the numeric copies — applies the
+  transition and re-encodes.
+* **Single source of truth.** `scoreCentavos`, `winsCount`, `publicPlayerId` and any legacy `rankKey`
+  remain only as audit copies and are **not read** by either callable. They can no longer move a
+  rank, a row, a page, a cursor, a `playerCount` or an error decision.
+* **What the gate does NOT prove.** It proves the structural validity of the state as represented.
+  It does **not** prove historical authenticity against a privileged writer able to replace one
+  valid state with another equally valid state; that would require an authenticated log or a Merkle
+  structure, and is not claimed here.
 * **`economy` and `seasonId` are equally non-authoritative.** They are structural properties of the
   document **path** — `season_rankings/{economy}_{seasonId}/entries/{publicPlayerId}` — so the
   published values are taken from the caller's **validated request**, never from the stored copies.
@@ -859,7 +886,7 @@ the totals it is supposed to describe, which section 4.4's exact-ordinal require
 
 Position is derived at read time from the canonical order of section 4.3:
 
-* `getSeasonLeaderboard` numbers entries from the cursor's absolute offset as it walks the canonical
+* `getSeasonLeaderboard` numbers entries from the cursor's `absoluteOffset` as it walks the canonical
   order, so page 2 continues the numbering of page 1 without recomputation;
 * `getMySeasonRanking` computes the exact ordinal by counting entries ahead (section 9.2).
 
@@ -972,20 +999,41 @@ Frozen rules:
 Each entry carries **only** the allowlisted public projection above: position, `publicPlayerId`,
 pseudonymous label, `scoreCentavos`, `winsCount`, economy, season.
 
-The cursor (**version 2**) encodes the canonical key `rankKey` of the last row plus the absolute
-offset of the next row, so page 2 continues page 1's numbering without recomputation. Since
-`rankKey` ends in the entry's document id, which is the `publicPlayerId` and carries no UID, the
+The cursor (**version 3**) encodes the ordering tuple of the last row as PLAIN SCALARS — score, wins
+and document id — plus the absolute offset of the next row, so page 2 continues page 1's numbering
+without recomputation. The two integers are re-encoded into ordering Timestamps only AFTER the MAC
+and every field check have passed. Since the document id is the pseudonym and carries no UID, the
 cursor cannot leak identity.
+
+The v3 contract is exactly these seven properties, all primitive:
+
+| Property | Type | Role |
+| --- | --- | --- |
+| `version` | number | Exactly `3`. A v2 or unknown version is rejected. |
+| `economy` | string | Binding, checked against the request AFTER the MAC. |
+| `seasonId` | string | Binding, checked against the request AFTER the MAC. |
+| `afterScoreCentavos` | number | Last row's score, re-encoded to `scoreOrder` after validation. |
+| `afterWinsCount` | number | Last row's wins, re-encoded to `winsOrder` after validation. |
+| `afterDocumentId` | string | Last row's document id — the unique final component. |
+| `absoluteOffset` | number | Rows already served, so numbering continues. **Visual only**; it never seeks. |
+
+The field is named **`absoluteOffset`** to state that it is global to the run rather than relative to
+a page. The signed wire format is a **positional array** in exactly this order and carries no names,
+so the property name is a decoded-and-documented concern only — the signed bytes are unchanged by
+the rename. There is deliberately **no `offset` alias, no mixed-name payload and no second cursor
+format**: a v3 payload is these seven values in this order, or it is rejected generically.
 
 **Amended — canonical entry invariants.** The cursor previously carried the tuple
 `(scoreCentavos, winsCount, publicPlayerId)`. That tuple was **not unique**: two documents could
 carry the same stored `publicPlayerId`, which made `startAfter` ambiguous and could skip or repeat a
-row across pages. It now carries the single `rankKey` (section 4.5), which ends in the document id
-and is therefore unique by construction, so `startAfter(rankKey)` resumes after exactly one entry.
-The HMAC, the season/economy binding, the visual-only role of the absolute offset, the generic
-public messages and the absence of any snapshot guarantee between pages are all unchanged. No
-version-1 cursor exists in production — the feature is not deployed — so no compatibility window is
-owed.
+row across pages. It now carries the typed tuple of section 4.5, whose final component is the
+document id and is therefore unique by construction, so
+`startAfter(scoreOrder, winsOrder, documentId)` resumes after exactly one entry.
+The HMAC, the season/economy binding, the visual-only role of `absoluteOffset`, the generic
+public messages and the absence of any snapshot guarantee between pages are all unchanged.
+**Version 3 replaces version 2 outright**: the feature is not deployed, so no cursor of any earlier
+version exists in production, no compatibility window is owed, and a v2 cursor is rejected with the
+same generic message as any other malformed one.
 
 ### 9.2 `getMySeasonRanking`
 
@@ -1050,11 +1098,13 @@ single totally-ordered string, so the three counts collapse into one range whose
 identical and whose disjointness is structural rather than argued:
 
 ```text
-ahead = count(entries where rankKey >= RANK_KEY_MIN and rankKey < myRankKey)
+ahead = count(scoreOrder > mine)
+      + count(scoreOrder = mine and winsOrder > mine)
+      + count(scoreOrder = mine and winsOrder = mine and documentId < mine)
 rank  = ahead + 1
 ```
 
-`rankKey` is the canonical order, so every key strictly below the caller's precedes them, and the
+The three sets are disjoint over the same typed domain, and the caller is in none of them because
 caller's own row is excluded because the upper bound is strict. The formula `rank = ahead + 1` and
 the exact-ordinal guarantee are unchanged; only the decomposition is simpler.
 
@@ -1581,22 +1631,22 @@ other field combinations does not break it.** The existing index must be preserv
 touching `firestore.indexes.json` here):
 
 ```jsonc
-// leaderboard ordering within a season — the canonical comparator of 4.3
-{ "collectionGroup": "entries", "queryScope": "COLLECTION",
-  "fields": [ { "fieldPath": "scoreCentavos",  "order": "DESCENDING" },
-              { "fieldPath": "winsCount",      "order": "DESCENDING" },
-              { "fieldPath": "publicPlayerId", "order": "ASCENDING" } ] }
-
-// exact-position counting for getMySeasonRanking (9.2) is served by the same
-// index: each of the three disjoint counts is a prefix range over this tuple.
+// AMENDED — typed order tuple (4.5). This IS applied in firestore.indexes.json.
+// ONE composite serves every ranking query: the leaderboard page (with and
+// without startAfter) and all three disjoint counts of 9.2, because each count
+// is an equality/range prefix of this same tuple.
 //
-// AMENDED — canonical entry invariants. With the canonical key of 4.5 every
-// leaderboard and ranking query is a range plus an orderBy on the SINGLE field
-// `rankKey`, which Firestore serves from the automatic single-field index. No
-// composite index is required by the corrected implementation, and none was
-// added. The `entries` composite above is retained as declared — it is
-// harmless, still asserted by firestoreIndexes.test.ts, and not yet deployed —
-// but it is no longer what serves the queries.
+// `__name__ ASC` is declared EXPLICITLY: Firestore otherwise appends __name__
+// with the direction of the last ordered field (DESCENDING here), which would
+// not serve the ascending document-id tiebreak.
+{ "collectionGroup": "entries", "queryScope": "COLLECTION",
+  "fields": [ { "fieldPath": "scoreOrder", "order": "DESCENDING" },
+              { "fieldPath": "winsOrder",  "order": "DESCENDING" },
+              { "fieldPath": "__name__",   "order": "ASCENDING"  } ] }
+
+// The earlier textual composite (scoreCentavos, winsCount, publicPlayerId) was
+// REMOVED: no query orders by those fields any more, and an index without an
+// identified consumer is not kept "just in case".
 
 // ledger verification for the read-only reconciler (14.2)
 { "collectionGroup": "transactions", "queryScope": "COLLECTION",

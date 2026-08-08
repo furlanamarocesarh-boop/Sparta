@@ -26,7 +26,7 @@ export const LEADERBOARD_DEFAULT_LIMIT = 50;
 export const LEADERBOARD_MAX_LIMIT = 100;
 
 /** The cursor format version, so a stale client cursor is rejected, not misread. */
-export const LEADERBOARD_CURSOR_VERSION = 2;
+export const LEADERBOARD_CURSOR_VERSION = 3;
 
 // ── Request normalization ───────────────────────────────────────────────────
 
@@ -107,157 +107,177 @@ export function assertSeasonServable(
   }
 }
 
-// ── Canonical ordering key ──────────────────────────────────────────────────
+// ── Canonical ordering scalars ──────────────────────────────────────────────
 
 /**
- * THE CANONICAL SORT KEY — one string field that IS the ordering.
+ * THE CANONICAL ORDER — a TYPED tuple, not a string.
  *
- * WHY A SINGLE KEY. Ordering on the three stored fields cannot express
- * "structurally valid" to Firestore. `orderBy` drops a document only when the
- * field is ABSENT; a field present with the wrong TYPE still sorts (Firestore
- * orders across types), so a corrupt entry silently entered the aggregates
- * while the page that had to render it failed — the two surfaces disagreed.
+ *   scoreOrder DESC, winsOrder DESC, FieldPath.documentId() ASC
  *
- * `rankKey` closes that by construction:
+ * WHY NOT A STRING KEY. A textual key could only be bounded by a lexicographic
+ * range, and a range bounds a PREFIX — never the interior of the string. A
+ * hostile value that respected the prefix (`v1|0…`) stayed inside the queried
+ * range, so the aggregates counted it while the page that had to parse it
+ * failed: the leaderboard went down for the whole season while the individual
+ * position answered, with its ordinal silently inflated. Findings B1/B1b.
  *
- *   v1|<complement(scoreCentavos)>|<complement(winsCount)>|<publicPlayerId>
+ * WHY TIMESTAMP. Firestore validates this type natively: seconds and
+ * nanoseconds are integers and `0 <= nanoseconds < 1e9` is enforced by the
+ * SDK. There is therefore no "inside the range but structurally malformed"
+ * state to detect later — validity is a property of the type plus the bounds
+ * of the query itself, so an out-of-domain entry is excluded from the CANONICAL
+ * count while remaining in the PHYSICAL count, and the season fails closed
+ * before any page is served, wherever the corruption sits.
  *
- * - ONE predictable Firestore type (string), so the half-open range
- *   [RANK_KEY_MIN, RANK_KEY_MAX) matches strings of THIS version and nothing
- *   else. Numbers, null, booleans, arrays, maps, bytes and timestamps all fall
- *   outside it, as does another schema version — verified against the emulator.
- * - each number is stored as a fixed-width complement, so a single ASCENDING
- *   string sort reproduces scoreCentavos DESC, winsCount DESC exactly.
- * - the LAST component is the document id, which is the authoritative
- *   `publicPlayerId`. Document ids are unique, so the key is unique: the
- *   comparator identifies exactly one entry and `startAfter` is unambiguous.
- *
- * It is produced ONLY by the internal write path, from values the domain has
- * already normalised — never from client input and never at read time.
+ * THESE TIMESTAMPS ARE NOT DATES. They are ordinal scalars. One second
+ * represents 1 000 000 ranking units. Never pass them through `Date`, a
+ * timezone, an ISO string or any temporal formatting.
  */
-export const RANK_KEY_VERSION = "v1";
-
-/** Separator. Outside the pseudonym alphabet `[A-Za-z0-9_-]`, so it cannot occur inside a component. */
-const RANK_KEY_SEPARATOR = "|";
 
 /**
- * The queryable bounds of this version's key space, half-open.
+ * Ranking units per second.
  *
- * Both complements are DECIMAL, so a well-formed key is always
- * `v1|` followed by a digit. Bounding on `0`…`:` (the code point right after
- * `9`) therefore admits only keys whose first numeric position really is
- * numeric — a string like `v1|abc|…` sorts above `v1|:` and falls outside, so
- * the count-based invariant sees it as physically present but not canonical
- * and the season fails closed. A looser `["v1|", "v1}")` bound would have let
- * such a key inside the aggregates while the page that had to render it
- * failed — reintroducing exactly the divergence this key exists to remove.
+ * MICROSECONDS, not nanoseconds. Firestore PERSISTS a Timestamp with
+ * microsecond precision: it truncates nanoseconds to a multiple of 1000. A
+ * `value % 1_000_000_000` encoding is therefore NOT injective through storage
+ * — scoreCentavos 200 and 300 both persist as `Timestamp(0, 0)` and become
+ * indistinguishable, destroying the order. Proven against the emulator before
+ * this representation was adopted. Keeping nanoseconds a multiple of 1000 by
+ * construction makes the round trip exact.
  */
-export const RANK_KEY_MIN = `${RANK_KEY_VERSION}${RANK_KEY_SEPARATOR}0`;
+const RANK_UNITS_PER_SECOND = 1_000_000;
 
-/** Exclusive upper bound: ":" is the code point right after "9". */
-export const RANK_KEY_MAX = `${RANK_KEY_VERSION}${RANK_KEY_SEPARATOR}:`;
+/** Nanoseconds per ranking unit. Every encoded nanosecond is a multiple of this. */
+const NANOSECONDS_PER_RANK_UNIT = 1_000;
+
+const NANOSECONDS_PER_SECOND = 1_000_000_000;
+
+/** The largest scalar the ordering represents: every count here is a safe integer. */
+export const MAX_RANK_VALUE = Number.MAX_SAFE_INTEGER;
 
 /**
- * Complement base. Every count this key orders is a safe integer, so
- * `MAX_SAFE_INTEGER - value` is itself a non-negative safe integer.
+ * The component bounds of the domain, precomputed so the decoder can reject an
+ * out-of-domain scalar BEFORE multiplying.
+ *
+ * WHY NOT bigint: the deploy build targets ES2017 (`functions/tsconfig.json`),
+ * where bigint literals are unavailable, and the compile target of the deployed
+ * package is out of scope here. Plain integers are used instead, and every
+ * operation is proven exact rather than assumed:
+ *
+ *   encode  seconds = floor(v / 1e6) <= 9_007_199_254        exact
+ *           nanos   = (v % 1e6) * 1e3 < 1e9                  exact
+ *   decode  rejected unless seconds < MAX_RANK_SECONDS, or
+ *           seconds === MAX_RANK_SECONDS and micros <= MAX_RANK_MICROS,
+ *           so seconds * 1e6 + micros <= MAX_SAFE_INTEGER    exact
+ *
+ * Every intermediate therefore stays inside the exactly-representable integer
+ * range; no value is ever multiplied before it is known to be in domain.
  */
-const RANK_KEY_COMPLEMENT_BASE = Number.MAX_SAFE_INTEGER;
+const MAX_RANK_SECONDS = Math.floor(MAX_RANK_VALUE / RANK_UNITS_PER_SECOND);
+const MAX_RANK_MICROS = MAX_RANK_VALUE % RANK_UNITS_PER_SECOND;
 
-/** Fixed width, so complements compare digit by digit. */
-const RANK_KEY_NUMBER_WIDTH = String(RANK_KEY_COMPLEMENT_BASE).length;
+/** A Firestore Timestamp, as the pure domain sees it — no Admin SDK import. */
+export interface RankScalar {
+  readonly seconds: number;
+  readonly nanoseconds: number;
+}
 
 function isRankableCount(value: unknown): value is number {
   return (
     typeof value === "number" &&
     Number.isSafeInteger(value) &&
     value >= 0 &&
-    value <= RANK_KEY_COMPLEMENT_BASE
+    value <= MAX_RANK_VALUE
   );
 }
 
-/** `MAX - value`, zero-padded, so ascending string order means descending value. */
-function complement(value: number): string {
-  return String(RANK_KEY_COMPLEMENT_BASE - value).padStart(
-    RANK_KEY_NUMBER_WIDTH,
-    "0"
-  );
+/** Encodes a ranking scalar. WRITE PATH ONLY. */
+export function encodeRankScalar(value: unknown): RankScalar {
+  if (!isRankableCount(value)) {
+    throw failedPrecondition("Valor de ordenação inválido.");
+  }
+
+  const seconds = Math.floor(value / RANK_UNITS_PER_SECOND);
+  const nanoseconds =
+    (value % RANK_UNITS_PER_SECOND) * NANOSECONDS_PER_RANK_UNIT;
+
+  // Exactness proven, not assumed.
+  if (
+    !Number.isSafeInteger(seconds) ||
+    !Number.isSafeInteger(nanoseconds) ||
+    seconds < 0 ||
+    seconds > MAX_RANK_SECONDS ||
+    nanoseconds < 0 ||
+    nanoseconds >= NANOSECONDS_PER_SECOND ||
+    nanoseconds % NANOSECONDS_PER_RANK_UNIT !== 0
+  ) {
+    throw failedPrecondition("Valor de ordenação inválido.");
+  }
+
+  return { seconds, nanoseconds };
 }
+
+/** The inclusive bounds of the canonical domain. */
+export const MIN_RANK_SCALAR: RankScalar = encodeRankScalar(0);
+export const MAX_RANK_SCALAR: RankScalar = encodeRankScalar(MAX_RANK_VALUE);
 
 /**
- * Builds the canonical key. WRITE PATH ONLY.
+ * Decodes a persisted scalar, or fails closed.
  *
- * Fails closed on any input the ordering could not represent faithfully, so a
- * malformed entry is never given a queryable key in the first place.
+ * Defensive on every component, because a document can carry anything: the
+ * shape, both integralities, the nanosecond range, the microsecond alignment
+ * and the final safe-integer domain are all checked. Accepts any object with
+ * numeric `seconds`/`nanoseconds`, which is exactly what a Firestore
+ * `Timestamp` exposes, so the pure domain needs no Admin SDK import.
  */
-export function buildRankKey(
-  scoreCentavos: unknown,
-  winsCount: unknown,
-  publicPlayerId: unknown
-): string {
-  if (!isRankableCount(scoreCentavos)) {
-    throw failedPrecondition("Entry com pontuação inválida.");
-  }
-  if (!isRankableCount(winsCount)) {
-    throw failedPrecondition("Entry com vitórias inválidas.");
-  }
-  if (!isPublicPlayerId(publicPlayerId)) {
-    throw failedPrecondition("Entry sem identificador público válido.");
+export function decodeRankScalar(raw: unknown): number {
+  if (raw === null || typeof raw !== "object") {
+    throw failedPrecondition("Entry sem ordenação canônica.");
   }
 
-  return [
-    RANK_KEY_VERSION,
-    complement(scoreCentavos),
-    complement(winsCount),
-    publicPlayerId,
-  ].join(RANK_KEY_SEPARATOR);
+  const { seconds, nanoseconds } = raw as {
+    seconds?: unknown;
+    nanoseconds?: unknown;
+  };
+
+  if (
+    typeof seconds !== "number" ||
+    typeof nanoseconds !== "number" ||
+    !Number.isSafeInteger(seconds) ||
+    !Number.isSafeInteger(nanoseconds) ||
+    seconds < 0 ||
+    nanoseconds < 0 ||
+    nanoseconds >= NANOSECONDS_PER_SECOND ||
+    nanoseconds % NANOSECONDS_PER_RANK_UNIT !== 0
+  ) {
+    throw failedPrecondition("Entry sem ordenação canônica.");
+  }
+
+  const micros = nanoseconds / NANOSECONDS_PER_RANK_UNIT;
+
+  // Bounded BEFORE the multiplication, so the sum below is always exact.
+  if (
+    seconds > MAX_RANK_SECONDS ||
+    (seconds === MAX_RANK_SECONDS && micros > MAX_RANK_MICROS)
+  ) {
+    throw failedPrecondition("Entry sem ordenação canônica.");
+  }
+
+  const value = seconds * RANK_UNITS_PER_SECOND + micros;
+  if (!isRankableCount(value)) {
+    throw failedPrecondition("Entry sem ordenação canônica.");
+  }
+
+  return value;
 }
 
-/** The values a canonical key carries. The key is the ONLY source of truth for them. */
-export interface RankKeyParts {
-  readonly scoreCentavos: number;
-  readonly winsCount: number;
-  readonly publicPlayerId: string;
-}
-
-/**
- * Decodes a canonical key, or fails closed.
- *
- * READ PATH. Every published score, win count and pseudonym comes from here,
- * so the redundant `scoreCentavos` / `winsCount` / `publicPlayerId` fields kept
- * on the document for auditing can never become a second source of truth able
- * to move a rank, a page or a response.
- */
-export function decodeRankKey(rankKey: unknown): RankKeyParts {
-  if (typeof rankKey !== "string") {
-    throw failedPrecondition("Entry sem chave canônica.");
+/** Compares two scalars the way Firestore orders Timestamps. */
+export function compareRankScalars(a: RankScalar, b: RankScalar): number {
+  if (a.seconds !== b.seconds) return a.seconds < b.seconds ? -1 : 1;
+  if (a.nanoseconds !== b.nanoseconds) {
+    return a.nanoseconds < b.nanoseconds ? -1 : 1;
   }
-
-  const parts = rankKey.split(RANK_KEY_SEPARATOR);
-  if (parts.length !== 4 || parts[0] !== RANK_KEY_VERSION) {
-    throw failedPrecondition("Entry sem chave canônica.");
-  }
-
-  const [, rawScore, rawWins, publicPlayerId] = parts;
-  if (
-    rawScore.length !== RANK_KEY_NUMBER_WIDTH ||
-    rawWins.length !== RANK_KEY_NUMBER_WIDTH ||
-    !/^\d+$/.test(rawScore) ||
-    !/^\d+$/.test(rawWins)
-  ) {
-    throw failedPrecondition("Entry sem chave canônica.");
-  }
-
-  const scoreCentavos = RANK_KEY_COMPLEMENT_BASE - Number(rawScore);
-  const winsCount = RANK_KEY_COMPLEMENT_BASE - Number(rawWins);
-  if (
-    !isRankableCount(scoreCentavos) ||
-    !isRankableCount(winsCount) ||
-    !isPublicPlayerId(publicPlayerId)
-  ) {
-    throw failedPrecondition("Entry sem chave canônica.");
-  }
-
-  return { scoreCentavos, winsCount, publicPlayerId };
+  return 0;
 }
 
 // ── Canonical order ─────────────────────────────────────────────────────────
@@ -315,17 +335,26 @@ export interface LeaderboardCursor {
   readonly economy: RankingEconomy;
   readonly seasonId: string;
   /**
-   * The canonical key of the LAST row of the previous page.
+   * The canonical tuple of the LAST row of the previous page, carried as PLAIN
+   * SCALARS. The handler re-encodes the two integers into ordering Timestamps
+   * only AFTER the MAC and the field validation have both passed, and resumes
+   * with `startAfter(scoreOrder, winsOrder, documentId)`.
    *
-   * One component, not a three-field tuple: `rankKey` already encodes the whole
-   * ordering AND ends in the unique document id, so `startAfter(rankKey)`
-   * resumes after exactly one entry. The old tuple could repeat when two
-   * documents carried the same stored `publicPlayerId`, which made
-   * `startAfter` ambiguous and could skip or repeat a row.
+   * The document id is the final component and is unique, so the tuple
+   * identifies exactly one entry: `startAfter` can neither skip nor repeat.
    */
-  readonly afterRankKey: string;
-  /** How many rows precede the next page, so numbering continues across pages. */
-  readonly offset: number;
+  readonly afterScoreCentavos: number;
+  readonly afterWinsCount: number;
+  readonly afterDocumentId: string;
+  /**
+   * How many rows precede the next page, so numbering continues across pages.
+   *
+   * GLOBAL, not page-relative: it is the count of rows the run has already
+   * served, so `absoluteOffset + index + 1` is the row's visual position in the
+   * season. Paging itself is driven by the ordering tuple above — this number
+   * never seeks, and is therefore visual only.
+   */
+  readonly absoluteOffset: number;
 }
 
 /** The environment variable holding the cursor signing key in production. */
@@ -370,14 +399,22 @@ function cursorKey(secret: unknown): Buffer {
 /**
  * The canonical payload the MAC covers — every field the cursor carries, in a
  * fixed order, so no component can be swapped without invalidating the tag.
+ *
+ * POSITIONAL, and the order is part of the v3 contract: the wire format carries
+ * no names, so renaming the decoded property to `absoluteOffset` leaves the
+ * signed bytes byte-for-byte identical. There is deliberately no second format
+ * and no alias — a v3 payload is these seven values, in this order, or it is
+ * rejected.
  */
 function payloadOf(cursor: LeaderboardCursor): string {
   return JSON.stringify([
     LEADERBOARD_CURSOR_VERSION,
     cursor.economy,
     cursor.seasonId,
-    cursor.afterRankKey,
-    cursor.offset,
+    cursor.afterScoreCentavos,
+    cursor.afterWinsCount,
+    cursor.afterDocumentId,
+    cursor.absoluteOffset,
   ]);
 }
 
@@ -393,7 +430,7 @@ function macOf(payload: string, key: Buffer): Buffer {
  * and INTEGRITY — without the key a client cannot mint or alter one. That is
  * ALL it guarantees. A legitimately issued cursor can still be REPLAYED, and
  * the MAC says nothing about time: `startAfter` resumes after the encoded
- * ordering tuple against LIVE data, and the carried absolute offset only
+ * ordering tuple against LIVE data, and the carried `absoluteOffset` only
  * continues the visual numbering. There is no snapshot between pages — an
  * entry that moves in the ordering between requests changes which rows the
  * remaining pages return and what their live positions are: one that moved
@@ -417,8 +454,8 @@ export function encodeCursor(
  *
  * THE MAC IS VERIFIED BEFORE ANY FIELD IS READ. Nothing inside the payload is
  * parsed, trusted or acted upon until the tag proves the payload is one this
- * server produced — so a forged offset or ordering tuple never reaches the
- * validation logic, let alone a query.
+ * server produced — so a forged `absoluteOffset` or ordering tuple never
+ * reaches the validation logic, let alone a query.
  *
  * Comparison is constant-time, and the tag length is checked first because
  * `timingSafeEqual` throws on a length mismatch rather than returning false.
@@ -477,29 +514,37 @@ export function decodeCursor(
     throw invalidArgument("Cursor inválido.");
   }
 
-  if (!Array.isArray(parts) || parts.length !== 5) {
+  if (!Array.isArray(parts) || parts.length !== 7) {
     throw invalidArgument("Cursor inválido.");
   }
 
-  const [version, economy, seasonId, afterRankKey, offset] =
-    parts as unknown[];
+  const [
+    version,
+    economy,
+    seasonId,
+    afterScoreCentavos,
+    afterWinsCount,
+    afterDocumentId,
+    absoluteOffset,
+  ] = parts as unknown[];
 
   if (version !== LEADERBOARD_CURSOR_VERSION) {
     throw invalidArgument("Cursor inválido.");
   }
   if (
-    !Number.isSafeInteger(offset) ||
-    (offset as number) < 0 ||
-    typeof afterRankKey !== "string" ||
-    afterRankKey < RANK_KEY_MIN ||
-    afterRankKey >= RANK_KEY_MAX
+    !Number.isSafeInteger(absoluteOffset) ||
+    (absoluteOffset as number) < 0 ||
+    !isRankableCount(afterScoreCentavos) ||
+    !isRankableCount(afterWinsCount) ||
+    !isPublicPlayerId(afterDocumentId)
   ) {
     throw invalidArgument("Cursor inválido.");
   }
-  // The key must itself decode: a cursor can only point at a position the
-  // canonical ordering is actually able to express.
+  // Both scalars must be representable in the canonical ordering: a cursor can
+  // only point at a position the domain is actually able to express.
   try {
-    decodeRankKey(afterRankKey);
+    encodeRankScalar(afterScoreCentavos);
+    encodeRankScalar(afterWinsCount);
   } catch {
     throw invalidArgument("Cursor inválido.");
   }
@@ -514,8 +559,10 @@ export function decodeCursor(
   return {
     economy: economy as RankingEconomy,
     seasonId: seasonId as string,
-    afterRankKey,
-    offset: offset as number,
+    afterScoreCentavos: afterScoreCentavos as number,
+    afterWinsCount: afterWinsCount as number,
+    afterDocumentId: afterDocumentId as string,
+    absoluteOffset: absoluteOffset as number,
   };
 }
 
@@ -523,6 +570,10 @@ export function decodeCursor(
 
 /** A stored entry, read back as plain values. */
 export interface StoredLeaderboardEntry {
+  /** The canonical ordering scalars — the ONLY decisive fields. */
+  readonly scoreOrder?: unknown;
+  readonly winsOrder?: unknown;
+  /** Audit copies. Never read by the read path. */
   readonly publicPlayerId?: unknown;
   readonly economy?: unknown;
   readonly seasonId?: unknown;
@@ -550,22 +601,28 @@ export interface PublicLeaderboardEntry {
  * `firstPrizeAt`, `lastPrizeAt` and `updatedAt` are audit data that no client
  * needs.
  *
- * NOTHING STORED ON THE DOCUMENT IS A SOURCE OF TRUTH EXCEPT THE CANONICAL KEY.
+ * NOTHING STORED IS A SOURCE OF TRUTH EXCEPT THE TWO ORDERING SCALARS.
  *
- * - the ordered values come from `rankKey`;
- * - the identity comes from the DOCUMENT ID, which must equal the key's own id
- *   component or the entry is corrupt and fails closed;
+ * - the ordered values come from `scoreOrder` / `winsOrder`, the same fields
+ *   the queries order and count by — so what is published, what is counted and
+ *   what is paged are one set, never three;
+ * - the identity IS the DOCUMENT ID. There is no stored identity to reconcile
+ *   against, so two documents can never claim the same player;
  * - `economy` and `seasonId` come from the CALLER'S VALIDATED REQUEST, because
  *   they are structural properties of the document PATH
- *   (`season_rankings/{economy}_{seasonId}/entries/{publicPlayerId}`) — a row
+ *   (`season_rankings/{economy}_{seasonId}/entries/{documentId}`) — a row
  *   reached through the cash/2026-08 path IS cash/2026-08, whatever its own
  *   fields happen to say.
  *
- * The stored `scoreCentavos`, `winsCount`, `publicPlayerId`, `economy` and
- * `seasonId` are audit copies and are deliberately NOT read. Reading them made
- * them a second source of truth able to disagree with the path and the key —
- * which is exactly how the leaderboard and the individual position came to
- * diverge, one throwing while the other answered.
+ * The stored `scoreCentavos`, `winsCount`, `publicPlayerId`, `economy`,
+ * `seasonId` and any legacy `rankKey` are audit copies and are deliberately NOT
+ * read. Reading them made them a second source of truth able to disagree with
+ * the path and the ordering — which is exactly how the leaderboard and the
+ * individual position came to diverge, one throwing while the other answered.
+ *
+ * The decode here is a projection, NOT a validity gate: an entry whose scalars
+ * are absent, mistyped or out of bounds has already been excluded from the
+ * canonical count, so the season fails closed before any page is built.
  */
 export function publicEntry(
   position: number,
@@ -584,23 +641,12 @@ export function publicEntry(
     );
   }
 
-  // Throws `failed-precondition` when the key is absent, mistyped, of another
-  // version or structurally invalid.
-  const parts = decodeRankKey(stored.rankKey);
-
-  if (parts.publicPlayerId !== documentId) {
-    throw new DomainError(
-      "failed-precondition",
-      "Entry com identidade divergente."
-    );
-  }
-
   return {
     position,
     publicPlayerId: documentId,
     label: publicPlayerLabel(documentId),
-    scoreCentavos: parts.scoreCentavos,
-    winsCount: parts.winsCount,
+    scoreCentavos: decodeRankScalar(stored.scoreOrder),
+    winsCount: decodeRankScalar(stored.winsOrder),
     economy,
     seasonId,
   };

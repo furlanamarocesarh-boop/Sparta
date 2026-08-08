@@ -8,10 +8,11 @@ import {
 } from "../../src/domain/economy.js";
 import { DomainError } from "../../src/domain/errors.js";
 import {
-  buildRankKey,
   compareEntries,
   decodeCursor,
-  decodeRankKey,
+  compareRankScalars,
+  decodeRankScalar,
+  encodeRankScalar,
   encodeCursor,
   LEADERBOARD_CURSOR_VERSION,
   LEADERBOARD_DEFAULT_LIMIT,
@@ -21,8 +22,9 @@ import {
   normalizeEconomy,
   normalizeLimit,
   publicEntry,
-  RANK_KEY_MAX,
-  RANK_KEY_MIN,
+  MAX_RANK_SCALAR,
+  MAX_RANK_VALUE,
+  MIN_RANK_SCALAR,
   RANKING_CURSOR_SECRET_ENV,
   rankFromAhead,
   type OrderKey,
@@ -59,7 +61,8 @@ const stored = (
   publicPlayerId,
   economy: ECONOMY_CASH,
   seasonId: "2026-08",
-  rankKey: buildRankKey(scoreCentavos, winsCount, publicPlayerId),
+  scoreOrder: encodeRankScalar(scoreCentavos),
+  winsOrder: encodeRankScalar(winsCount),
   scoreCentavos,
   winsCount,
   ...extra,
@@ -69,135 +72,164 @@ const stored = (
 // Chave canônica
 // ---------------------------------------------------------------------------
 
-describe("chave canônica — a ordenação É a chave", () => {
-  it("um sort ASCENDENTE da chave reproduz a ordem canônica exata", () => {
-    // Mesmas linhas do teste do comparador, ordenadas pelos DOIS caminhos.
-    const rows: OrderKey[] = [
-      key(100, 2, P2),
-      key(100, 2, P1),
-      key(200, 1, P3),
-      key(100, 3, P3),
-      key(0, 1, P1),
-    ];
+describe("escalares canônicos — a ordenação É a tupla tipada", () => {
+  // Estes Timestamps NÃO são datas. São escalares ordinais: um segundo vale
+  // 1.000.000 de unidades do ranking, e nanoseconds é sempre múltiplo de 1000.
+  const BOUNDARY = [
+    0,
+    1,
+    200,
+    300,
+    999,
+    1_000,
+    1_001,
+    999_999,
+    1_000_000,
+    999_999_999,
+    1_000_000_000,
+    123_456_789_012_345,
+    MAX_RANK_VALUE,
+  ];
 
-    const byComparator = [...rows].sort(compareEntries);
-    const byRankKey = [...rows].sort((a, b) => {
-      const ka = buildRankKey(a.scoreCentavos, a.winsCount, a.publicPlayerId);
-      const kb = buildRankKey(b.scoreCentavos, b.winsCount, b.publicPlayerId);
-      return ka < kb ? -1 : ka > kb ? 1 : 0;
+  it("a base é MICROSSEGUNDO: nanoseconds é sempre múltiplo de 1000", () => {
+    // O teste discriminante contra a base 1e9 rejeitada: com ela, encode(200)
+    // seria Timestamp(0,200) — nanoseconds NÃO múltiplo de 1000 — e o Firestore
+    // truncaria para (0,0), colidindo com encode(300).
+    for (const v of BOUNDARY) {
+      const s = encodeRankScalar(v);
+      assert.equal(
+        s.nanoseconds % 1_000,
+        0,
+        `encode(${v}) precisa alinhar em microssegundo, veio ${s.nanoseconds}`
+      );
+    }
+    assert.deepEqual(encodeRankScalar(200), { seconds: 0, nanoseconds: 200_000 });
+    assert.deepEqual(encodeRankScalar(300), { seconds: 0, nanoseconds: 300_000 });
+    assert.deepEqual(encodeRankScalar(1_000_000), { seconds: 1, nanoseconds: 0 });
+    assert.deepEqual(encodeRankScalar(MAX_RANK_VALUE), {
+      seconds: 9_007_199_254,
+      nanoseconds: 740_991_000,
     });
-
-    assert.deepEqual(byRankKey, byComparator, "a chave precisa ser a ordenação");
   });
 
-  it("é uma ordem total sobre um conjunto gerado — chave e comparador concordam", () => {
-    const rows: OrderKey[] = [];
-    for (const s of [0, 100, 200]) {
-      for (const w of [0, 1, 2]) {
-        for (const p of [P1, P2, P3]) rows.push(key(s, w, p));
-      }
+  it("é INJETIVA nos valores que a base 1e9 colapsava", () => {
+    // Sob a codificação rejeitada estes três pares eram indistinguíveis depois
+    // da persistência. Aqui precisam ser distintos já na representação.
+    for (const [a, b] of [
+      [200, 300],
+      [999, 1_000],
+      [1_000, 1_001],
+      [0, 1],
+    ] as const) {
+      assert.notDeepEqual(
+        encodeRankScalar(a),
+        encodeRankScalar(b),
+        `encode(${a}) e encode(${b}) não podem coincidir`
+      );
     }
-    for (const a of rows) {
-      for (const b of rows) {
-        const ka = buildRankKey(a.scoreCentavos, a.winsCount, a.publicPlayerId);
-        const kb = buildRankKey(b.scoreCentavos, b.winsCount, b.publicPlayerId);
-        const viaKey = ka < kb ? -1 : ka > kb ? 1 : 0;
+  });
+
+  it("faz round-trip exato em todos os valores de fronteira", () => {
+    for (const v of BOUNDARY) {
+      assert.equal(decodeRankScalar(encodeRankScalar(v)), v, `round-trip ${v}`);
+    }
+  });
+
+  it("preserva a ordem: a < b  <=>  encode(a) < encode(b)", () => {
+    const sorted = [...BOUNDARY].sort((a, b) => a - b);
+    for (let i = 1; i < sorted.length; i += 1) {
+      const cmp = compareRankScalars(
+        encodeRankScalar(sorted[i - 1]),
+        encodeRankScalar(sorted[i])
+      );
+      assert.equal(cmp, -1, `${sorted[i - 1]} deve preceder ${sorted[i]}`);
+    }
+    // E a comparação é uma ordem total consistente com a numérica.
+    for (const a of BOUNDARY) {
+      for (const b of BOUNDARY) {
         assert.equal(
-          viaKey,
-          Math.sign(compareEntries(a, b)),
-          `divergência em ${JSON.stringify([a, b])}`
+          Math.sign(compareRankScalars(encodeRankScalar(a), encodeRankScalar(b))),
+          Math.sign(a - b),
+          `ordem de ${a} vs ${b}`
         );
       }
     }
   });
 
-  it("é ÚNICA: entries distintas nunca compartilham chave", () => {
-    const seen = new Set<string>();
-    for (const s of [0, 1, 100]) {
-      for (const w of [0, 1, 9]) {
-        for (const p of [P1, P2, P3]) {
-          const k = buildRankKey(s, w, p);
-          assert.equal(seen.has(k), false, `chave repetida: ${k}`);
-          seen.add(k);
-        }
-      }
-    }
-    // O último componente é o id, que é o document id — logo duas entries só
-    // colidiriam se compartilhassem o document id, o que é impossível.
-    assert.ok(buildRankKey(100, 1, P1) !== buildRankKey(100, 1, P2));
+  it("os limites do domínio são exatamente encode(0) e encode(MAX)", () => {
+    assert.deepEqual(MIN_RANK_SCALAR, encodeRankScalar(0));
+    assert.deepEqual(MAX_RANK_SCALAR, encodeRankScalar(MAX_RANK_VALUE));
+    assert.equal(decodeRankScalar(MIN_RANK_SCALAR), 0);
+    assert.equal(decodeRankScalar(MAX_RANK_SCALAR), MAX_RANK_VALUE);
   });
 
-  it("cai SEMPRE dentro da faixa consultável da versão", () => {
-    for (const [s, w, p] of [
-      [0, 0, P1],
-      [Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, P3],
-      [123_456, 7, P2],
-    ] as const) {
-      const k = buildRankKey(s, w, p);
-      assert.ok(k >= RANK_KEY_MIN, `${k} abaixo do piso`);
-      assert.ok(k < RANK_KEY_MAX, `${k} acima do teto`);
-    }
-  });
-
-  it("faz round-trip: decodeRankKey devolve exatamente os valores originais", () => {
-    for (const [s, w, p] of [
-      [0, 0, P1],
-      [125_000, 3, P2],
-      [Number.MAX_SAFE_INTEGER, 1, P3],
-    ] as const) {
-      assert.deepEqual(decodeRankKey(buildRankKey(s, w, p)), {
-        scoreCentavos: s,
-        winsCount: w,
-        publicPlayerId: p,
-      });
-    }
-  });
-
-  it("RECUSA construir a chave de uma entry estruturalmente inválida", () => {
-    for (const bad of [null, undefined, "100", true, -1, 1.5, NaN, Infinity]) {
+  it("RECUSA qualquer escalar fora do domínio", () => {
+    for (const bad of [
+      -1,
+      -0.5,
+      1.5,
+      NaN,
+      Infinity,
+      -Infinity,
+      Number.MAX_SAFE_INTEGER + 1,
+      "100",
+      null,
+      undefined,
+      true,
+      {},
+      [],
+    ]) {
       assertDomain(
-        () => buildRankKey(bad, 1, P1),
+        () => encodeRankScalar(bad),
         "failed-precondition",
-        `score ${String(bad)}`
-      );
-      assertDomain(
-        () => buildRankKey(100, bad, P1),
-        "failed-precondition",
-        `wins ${String(bad)}`
-      );
-    }
-    for (const bad of [null, undefined, 42, "", "PLR-1", P1 + "x"]) {
-      assertDomain(
-        () => buildRankKey(100, 1, bad),
-        "failed-precondition",
-        `id ${String(bad)}`
+        `encode ${String(bad)}`
       );
     }
   });
 
-  it("RECUSA decodificar uma chave ausente, de outro tipo ou malformada", () => {
+  it("o decoder RECUSA qualquer forma persistida inválida", () => {
     for (const bad of [
       undefined,
       null,
       42,
+      "x",
       true,
-      {},
       [],
-      "",
-      "v1|",
-      "v0|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + P1, // versão errada
-      "v2|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + P1, // versão futura
-      "v1|abc|def|" + P1, // componentes não numéricos
-      "v1|" + "0".repeat(15) + "|" + "0".repeat(16) + "|" + P1, // largura errada
-      "v1|" + "0".repeat(16) + "|" + "0".repeat(16) + "|PLR-1", // id malformado
-      "v1|" + "9".repeat(16) + "|" + "0".repeat(16) + "|" + P1, // complemento fora da faixa
+      {},
+      { seconds: 0 },
+      { nanoseconds: 0 },
+      { seconds: "0", nanoseconds: 0 },
+      { seconds: 0, nanoseconds: "0" },
+      { seconds: -1, nanoseconds: 0 },
+      { seconds: 0, nanoseconds: -1 },
+      { seconds: 1.5, nanoseconds: 0 },
+      { seconds: 0, nanoseconds: 1.5 },
+      { seconds: 0, nanoseconds: 1_000_000_000 },
+      // desalinhado: só a codificação rejeitada produziria isto
+      { seconds: 0, nanoseconds: 200 },
+      { seconds: 0, nanoseconds: 999_999_999 },
+      // acima do teto do domínio
+      { seconds: 9_007_199_255, nanoseconds: 0 },
+      { seconds: 9_007_199_254, nanoseconds: 741_000_000 },
     ]) {
       assertDomain(
-        () => decodeRankKey(bad),
+        () => decodeRankScalar(bad),
         "failed-precondition",
-        JSON.stringify(bad)
+        JSON.stringify(bad) ?? String(bad)
       );
     }
+  });
+
+  it("aceita exatamente o teto e recusa o microssegundo seguinte", () => {
+    assert.equal(
+      decodeRankScalar({ seconds: 9_007_199_254, nanoseconds: 740_991_000 }),
+      MAX_RANK_VALUE
+    );
+    assertDomain(
+      () => decodeRankScalar({ seconds: 9_007_199_254, nanoseconds: 740_992_000 }),
+      "failed-precondition",
+      "um microssegundo acima do teto"
+    );
   });
 });
 
@@ -380,8 +412,10 @@ describe("cursor — autenticado, opaco e vinculado", () => {
   const base = {
     economy: ECONOMY_CASH,
     seasonId: "2026-08",
-    afterRankKey: buildRankKey(50_000, 2, P1),
-    offset: 50,
+    afterScoreCentavos: 50_000,
+    afterWinsCount: 2,
+    afterDocumentId: P1,
+    absoluteOffset: 50,
   };
   const expected = { economy: ECONOMY_CASH, seasonId: "2026-08" };
 
@@ -415,10 +449,12 @@ describe("cursor — autenticado, opaco e vinculado", () => {
     assert.equal(MIN_CURSOR_SECRET_BYTES, 32);
   });
 
-  it("faz round-trip preservando a tupla e o offset", () => {
+  it("faz round-trip preservando a tupla e o absoluteOffset", () => {
     const decoded = decodeCursor(encodeCursor(base, SECRET), expected, SECRET);
-    assert.equal(decoded.afterRankKey, base.afterRankKey);
-    assert.equal(decoded.offset, 50);
+    assert.equal(decoded.afterScoreCentavos, base.afterScoreCentavos);
+    assert.equal(decoded.afterWinsCount, base.afterWinsCount);
+    assert.equal(decoded.afterDocumentId, base.afterDocumentId);
+    assert.equal(decoded.absoluteOffset, 50);
     assert.equal(decoded.economy, ECONOMY_CASH);
     assert.equal(decoded.seasonId, "2026-08");
   });
@@ -472,7 +508,10 @@ describe("cursor — autenticado, opaco e vinculado", () => {
     );
     // Exatamente 32 bytes já serve.
     const exact = "x".repeat(MIN_CURSOR_SECRET_BYTES);
-    assert.equal(decodeCursor(encodeCursor(base, exact), expected, exact).offset, 50);
+    assert.equal(
+      decodeCursor(encodeCursor(base, exact), expected, exact).absoluteOffset,
+      50
+    );
   });
 
   // ── O MAC é a barreira ────────────────────────────────────────────────────
@@ -488,13 +527,13 @@ describe("cursor — autenticado, opaco e vinculado", () => {
   it("REJEITA adulteração de QUALQUER campo coberto pelo MAC", () => {
     const inner = innerOf(encodeCursor(base, SECRET));
     const mutations: Array<[string, string, string]> = [
-      ["offset", ",50]", ",999999]"],
-      ["rankKey score", "9007199254690991", "9007199254690891"],
-      ["rankKey wins", "9007199254740989", "9007199254740889"],
-      ["publicPlayerId", P1, P2],
+      ["absoluteOffset", ",50]", ",999999]"],
+      ["afterScoreCentavos", "50000", "60000"],
+      ["afterWinsCount", ",2,", ",7,"],
+      ["afterDocumentId", P1, P2],
       ["economy", "cash", "beta_credit"],
       ["seasonId", "2026-08", "2026-09"],
-      ["version", "[2,", "[3,"],
+      ["version", "[3,", "[4,"],
     ];
 
     for (const [label, from, to] of mutations) {
@@ -515,7 +554,9 @@ describe("cursor — autenticado, opaco e vinculado", () => {
       LEADERBOARD_CURSOR_VERSION,
       ECONOMY_CASH,
       "2026-08",
-      buildRankKey(50_000, 2, P1),
+      50_000,
+      2,
+      P1,
       999_999,
     ]);
     const forged = envelope(`${payload}.${fnv1a(payload)}`);
@@ -573,7 +614,7 @@ describe("cursor — autenticado, opaco e vinculado", () => {
 
   it("REJEITA um MAC válido colado em outro payload", () => {
     const a = innerOf(encodeCursor(base, SECRET));
-    const b = innerOf(encodeCursor({ ...base, offset: 999 }, SECRET));
+    const b = innerOf(encodeCursor({ ...base, absoluteOffset: 999 }, SECRET));
     const payloadA = a.slice(0, a.lastIndexOf("."));
     const tagB = b.slice(b.lastIndexOf(".") + 1);
 
@@ -625,15 +666,21 @@ describe("cursor — autenticado, opaco e vinculado", () => {
     // Prova que a validação de campos não depende do MAC: mesmo quem detém a
     // chave não consegue injetar uma tupla impossível.
     for (const payload of [
-      [2, "cash", "2026-08", "nao-e-uma-chave", 0], // chave não canônica
-      [2, "cash", "2026-08", "v1|abc|def|" + P1, 0], // componentes não numéricos
-      [2, "cash", "2026-08", "v0|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + P1, 0], // versão de chave errada
-      [2, "cash", "2026-08", buildRankKey(100, 1, P1), -5], // offset negativo
-      [2, "cash", "2026-08", buildRankKey(100, 1, P1), 1.5], // offset fracionário
-      [2, "cash", "2026-08", 42, 0], // chave não textual
-      [99, "cash", "2026-08", buildRankKey(100, 1, P1), 0], // versão de cursor desconhecida
-      [2, "cash", "2026-08", buildRankKey(100, 1, P1)], // aridade errada
-      [2, "cash", "2026-08", buildRankKey(100, 1, P1), 0, "extra"],
+      [3, "cash", "2026-08", -1, 1, P1, 0], // score negativo
+      [3, "cash", "2026-08", 1.5, 1, P1, 0], // score fracionário
+      [3, "cash", "2026-08", Number.MAX_SAFE_INTEGER + 1, 1, P1, 0], // overflow
+      [3, "cash", "2026-08", "100", 1, P1, 0], // score não numérico
+      [3, "cash", "2026-08", 100, -1, P1, 0], // wins negativo
+      [3, "cash", "2026-08", 100, 1.5, P1, 0], // wins fracionário
+      [3, "cash", "2026-08", 100, null, P1, 0], // wins ausente
+      [3, "cash", "2026-08", 100, 1, "PLR-1", 0], // id malformado
+      [3, "cash", "2026-08", 100, 1, 42, 0], // id não textual
+      [3, "cash", "2026-08", 100, 1, P1, -5], // absoluteOffset negativo
+      [3, "cash", "2026-08", 100, 1, P1, 1.5], // absoluteOffset fracionário
+      [2, "cash", "2026-08", 100, 1, P1, 0], // CURSOR V2: o formato anterior
+      [99, "cash", "2026-08", 100, 1, P1, 0], // versão desconhecida
+      [3, "cash", "2026-08", 100, 1, P1], // aridade errada
+      [3, "cash", "2026-08", 100, 1, P1, 0, "extra"],
     ]) {
       assertDomain(
         () => decodeCursor(sign(JSON.stringify(payload)), expected, SECRET),
@@ -754,16 +801,17 @@ describe("projeção pública — allowlist estrita", () => {
     }
   });
 
-  it("recusa uma entry estruturalmente inválida", () => {
+  it("recusa uma entry cujos escalares canônicos são inválidos", () => {
     const cases: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
-      ["chave ausente", { rankKey: undefined }],
-      ["chave de outro tipo", { rankKey: 42 }],
-      ["chave nula", { rankKey: null }],
-      ["chave malformada", { rankKey: "v1|abc|def|" + P1 }],
-      [
-        "chave de outra versão",
-        { rankKey: "v0|" + "0".repeat(16) + "|" + "0".repeat(16) + "|" + P1 },
-      ],
+      ["scoreOrder ausente", { scoreOrder: undefined }],
+      ["scoreOrder nulo", { scoreOrder: null }],
+      ["scoreOrder de outro tipo", { scoreOrder: 42 }],
+      ["scoreOrder desalinhado", { scoreOrder: { seconds: 0, nanoseconds: 200 } }],
+      ["scoreOrder acima do teto", { scoreOrder: { seconds: 9_007_199_255, nanoseconds: 0 } }],
+      ["winsOrder ausente", { winsOrder: undefined }],
+      ["winsOrder nulo", { winsOrder: null }],
+      ["winsOrder de outro tipo", { winsOrder: "1" }],
+      ["winsOrder negativo", { winsOrder: { seconds: -1, nanoseconds: 0 } }],
     ];
 
     for (const [label, patch] of cases) {
@@ -775,7 +823,7 @@ describe("projeção pública — allowlist estrita", () => {
     }
   });
 
-  it("recusa um document id malformado, mesmo com chave válida", () => {
+  it("recusa um document id malformado, mesmo com escalares válidos", () => {
     for (const bad of ["", "PLR-1", P1 + "x", "  "]) {
       assertDomain(
         () => publicEntry(1, bad, stored(100, 1, P1), ECONOMY_CASH, "2026-08"),
@@ -785,13 +833,20 @@ describe("projeção pública — allowlist estrita", () => {
     }
   });
 
-  it("RECUSA quando a chave aponta para outra identidade que o document id", () => {
-    // O ataque de identidade: doc `P1` carregando a chave de `P2`.
-    assertDomain(
-      () => publicEntry(1, P1, stored(100, 1, P2), ECONOMY_CASH, "2026-08"),
-      "failed-precondition",
-      "identidade divergente"
+  it("a identidade É o document id: a cópia armazenada não é lida", () => {
+    // O doc `P1` carregando `publicPlayerId: P2` na cópia de auditoria. Sem
+    // identidade armazenada no caminho decisório, não há o que divergir: a
+    // linha publicada é sempre a do próprio documento.
+    const row = publicEntry(
+      1,
+      P1,
+      { ...stored(100, 1, P1), publicPlayerId: P2 },
+      ECONOMY_CASH,
+      "2026-08"
     );
+    assert.equal(row.publicPlayerId, P1);
+    assert.equal(row.scoreCentavos, 100);
+    assert.equal(row.winsCount, 1);
   });
 
   it("economy e seasonId vêm da REQUISIÇÃO, nunca do documento", () => {

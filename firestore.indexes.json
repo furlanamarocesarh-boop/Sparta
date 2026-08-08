@@ -43,9 +43,9 @@
       "collectionGroup": "entries",
       "queryScope": "COLLECTION",
       "fields": [
-        { "fieldPath": "scoreCentavos", "order": "DESCENDING" },
-        { "fieldPath": "winsCount", "order": "DESCENDING" },
-        { "fieldPath": "publicPlayerId", "order": "ASCENDING" }
+        { "fieldPath": "scoreOrder", "order": "DESCENDING" },
+        { "fieldPath": "winsOrder", "order": "DESCENDING" },
+        { "fieldPath": "__name__", "order": "ASCENDING" }
       ]
     }
   ],
