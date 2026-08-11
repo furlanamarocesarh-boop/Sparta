@@ -52,18 +52,17 @@ export const RANKING_EVENTS_COLLECTION = "ranking_events";
 export const RANKING_TIMEZONE = ACTIVITY_TIMEZONE;
 
 /**
- * THE FIRST SEASON THE RANKING PROCESSES — deliberately UNSET.
+ * THE FIRST SEASON THE RANKING PROCESSES — explicitly August 2026.
  *
  * Source configuration and nothing else: not Firestore, not `functions.config()`,
  * not an environment variable, not Remote Config, and never an implicit default
- * such as "the current month". Choosing the real month is a separate, explicit
- * decision (design section 3.3), so this file ships inert.
+ * such as "the current month". Events before this fixed milestone remain
+ * permanently out of scope and are never backfilled.
  *
- * While it is `null` the trigger is a total no-op: no identity is minted, no
- * transaction is opened and no document is written. That is the frozen
- * fail-closed behaviour, not a placeholder to be quietly filled in.
+ * `null` remains the fail-closed state: no identity is minted, no transaction
+ * is opened and no document is written.
  */
-export const FIRST_ACTIVE_SEASON_ID: string | null = null;
+export const FIRST_ACTIVE_SEASON_ID: string | null = "2026-08";
 
 // ── Eligibility ─────────────────────────────────────────────────────────────
 
