@@ -298,8 +298,8 @@ describe("identificadores de documento", () => {
 // ---------------------------------------------------------------------------
 
 describe("ativação — firstActiveSeasonId", () => {
-  it("NÃO está configurado nesta implementação", () => {
-    assert.equal(FIRST_ACTIVE_SEASON_ID, null);
+  it("está configurado para a primeira temporada 2026-08", () => {
+    assert.equal(FIRST_ACTIVE_SEASON_ID, "2026-08");
   });
 
   it("configuração ausente deixa o sistema inerte", () => {
