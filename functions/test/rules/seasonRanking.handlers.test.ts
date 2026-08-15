@@ -62,7 +62,15 @@ const SEASON = "2026-08";
 const PRIZE_AT = new Date("2026-08-03T18:22:11.000Z");
 const NEXT_SEASON_PRIZE_AT = new Date("2026-09-04T18:22:11.000Z");
 
-/** Only tests pass this. Production ships with the gate unset. */
+/**
+ * The gate these tests authorize EXPLICITLY, so the suite exercises the active
+ * path without depending on what production currently ships.
+ *
+ * Production ships `FIRST_ACTIVE_SEASON_ID = "2026-09"` (seasonRanking.ts), so
+ * the August fixtures above are deliberately BEFORE the production milestone:
+ * the "produção" tests below assert exactly that, and the "active" tests pass
+ * this option to reach the write path. Neither reading is implicit.
+ */
 const ACTIVE = { firstActiveSeasonId: SEASON };
 
 before(async () => {
@@ -219,18 +227,58 @@ async function expectFailure(fn: () => Promise<unknown>): Promise<string> {
 // O portão de ativação
 // ---------------------------------------------------------------------------
 
-describe("ativação — o caminho de PRODUÇÃO é inerte", () => {
-  it("sem opções, um prêmio válido não cria identidade nem ranking", async () => {
+describe("ativação — agosto/2026 é ANTERIOR ao marco de produção", () => {
+  it("sem opções, um prêmio de agosto não cria identidade nem ranking", async () => {
     const snap = await seedPrize();
 
-    // Nenhuma opção: exatamente o que o export implantável faz.
+    // Nenhuma opção: exatamente o que o export implantável faz, lendo a
+    // constante real de produção (FIRST_ACTIVE_SEASON_ID = "2026-09").
     const outcome = await onPrizeTransactionCreatedHandler(snap);
 
+    // O prêmio é de 2026-08-03; setembro é o primeiro mês completo autorizado,
+    // logo agosto está permanentemente fora de escopo — e NÃO por falta de
+    // configuração. A distinção entre os dois motivos é o contrato aqui.
     assert.equal(outcome.applied, false);
-    assert.equal(outcome.reason, "first-active-season-not-configured");
+    assert.equal(outcome.reason, "before-first-active-season");
 
     const counts = await countAll();
     assert.deepEqual(counts, {
+      parents: 0,
+      entries: 0,
+      guards: 0,
+      identities: 0,
+    });
+  });
+
+  it("sem opções, um prêmio de setembro É processado — produção está ativa", async () => {
+    // A contraprova do teste acima: a produção não está inerte, apenas começa
+    // em setembro. Sem isto, um retorno a `null` passaria despercebido.
+    const snap = await seedPrize({
+      timestamp: admin.firestore.Timestamp.fromDate(NEXT_SEASON_PRIZE_AT),
+    });
+
+    const outcome = await onPrizeTransactionCreatedHandler(snap);
+
+    assert.equal(outcome.applied, true);
+    assert.equal(
+      (outcome as unknown as { seasonId: string }).seasonId,
+      "2026-09",
+      "o marco de produção é setembro/2026"
+    );
+  });
+
+  it("o contrato de desligamento por null continua disponível", async () => {
+    // `null` é o estado fail-closed explícito do contrato congelado
+    // (seasonRanking.ts). Ele permanece alcançável mesmo com produção ativa.
+    const snap = await seedPrize();
+
+    const outcome = await onPrizeTransactionCreatedHandler(snap, {
+      firstActiveSeasonId: null,
+    });
+
+    assert.equal(outcome.applied, false);
+    assert.equal(outcome.reason, "first-active-season-not-configured");
+    assert.deepEqual(await countAll(), {
       parents: 0,
       entries: 0,
       guards: 0,

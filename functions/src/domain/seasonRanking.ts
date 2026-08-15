@@ -52,17 +52,26 @@ export const RANKING_EVENTS_COLLECTION = "ranking_events";
 export const RANKING_TIMEZONE = ACTIVITY_TIMEZONE;
 
 /**
- * THE FIRST SEASON THE RANKING PROCESSES — explicitly August 2026.
+ * THE FIRST SEASON THE RANKING PROCESSES — explicitly September 2026.
  *
  * Source configuration and nothing else: not Firestore, not `functions.config()`,
  * not an environment variable, not Remote Config, and never an implicit default
  * such as "the current month". Events before this fixed milestone remain
  * permanently out of scope and are never backfilled.
  *
+ * WHY SEPTEMBER AND NOT AUGUST. Design section 3.3 requires the first season to
+ * be the first calendar month that begins AFTER activation is decided, and it
+ * forbids a partial season outright. The activation decision was taken during
+ * August 2026, so August is necessarily partial: prizes settled before the
+ * decision would compete against prizes settled after it, over different
+ * fractions of the same month. September 2026 is the first complete month, so
+ * it is the first that can be ranked fairly. August prizes are permanently out
+ * of scope — `before-first-active-season` — and are never backfilled.
+ *
  * `null` remains the fail-closed state: no identity is minted, no transaction
  * is opened and no document is written.
  */
-export const FIRST_ACTIVE_SEASON_ID: string | null = "2026-08";
+export const FIRST_ACTIVE_SEASON_ID: string | null = "2026-09";
 
 // ── Eligibility ─────────────────────────────────────────────────────────────
 

@@ -3,6 +3,8 @@ import { before, describe, it } from "node:test";
 
 import * as admin from "firebase-admin";
 
+import { fetchWithTimeout } from "../support/httpTimeout.js";
+
 /**
  * END-TO-END result flow, run ENTIRELY against the local Firebase Emulator Suite
  * (Auth + Firestore + Functions) under the demo project `demo-sparta-battle`.
@@ -89,7 +91,7 @@ interface CallResult {
 /** Real Auth-emulator sign-in → a real ID token carrying the user's claims. */
 async function signIn(email: string): Promise<string> {
   const url = `http://${AUTH_HOST()}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=demo-key`;
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ email, password: PW, returnSecureToken: true }),
@@ -107,7 +109,7 @@ async function callAs(
   data: Record<string, unknown>
 ): Promise<CallResult> {
   const url = `http://${FUNCTIONS_HOST}/${PROJECT_ID}/${REGION}/${name}`;
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${idToken}` },
     body: JSON.stringify({ data }),
@@ -268,7 +270,7 @@ describe("E2E — tournament result flow (emulator, verified-token hybrid)", () 
 
     // Functions-emulator reachability (fail-closed).
     try {
-      await fetch(`http://${FUNCTIONS_HOST}/`).catch(() => {
+      await fetchWithTimeout(`http://${FUNCTIONS_HOST}/`, {}, 10_000).catch(() => {
         throw new Error("unreachable");
       });
     } catch {

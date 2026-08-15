@@ -298,8 +298,22 @@ describe("identificadores de documento", () => {
 // ---------------------------------------------------------------------------
 
 describe("ativação — firstActiveSeasonId", () => {
-  it("está configurado para a primeira temporada 2026-08", () => {
-    assert.equal(FIRST_ACTIVE_SEASON_ID, "2026-08");
+  it("está configurado para a primeira temporada 2026-09", () => {
+    assert.equal(FIRST_ACTIVE_SEASON_ID, "2026-09");
+  });
+
+  it("agosto/2026 é anterior ao marco de produção — parcial, nunca ranqueado", () => {
+    // A decisão de ativação foi tomada DURANTE agosto/2026, então agosto é um
+    // mês parcial e a seção 3.3 do design o proíbe como primeira temporada.
+    assert.deepEqual(decideActivation(FIRST_ACTIVE_SEASON_ID, "2026-08"), {
+      kind: "before-first-season",
+    });
+  });
+
+  it("setembro/2026 é o primeiro mês completo processado em produção", () => {
+    assert.deepEqual(decideActivation(FIRST_ACTIVE_SEASON_ID, "2026-09"), {
+      kind: "active",
+    });
   });
 
   it("configuração ausente deixa o sistema inerte", () => {

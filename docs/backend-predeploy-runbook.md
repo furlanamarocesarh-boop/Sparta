@@ -145,7 +145,10 @@ Somente as **6 funções alteradas** são deployadas. `onUserCreated` é pulado
 (inalterado + Bloqueador B). A ordem permite que cada smoke test use os dados de
 teste criados pelo passo anterior.
 
-1. **`testdeposit`** — admin-only; credita saldo de teste (habilita os smokes seguintes).
+1. **`testdeposit`** — admin-only **e restrita a projeto `demo-`**. Desde
+   `fix/backend-local-safety-baseline` ela é **inerte em produção** (ver §7,
+   Etapa 1), então **não** habilita mais os smokes seguintes: o saldo de teste
+   em `sparta-battle` precisa vir de outro caminho autorizado.
 2. **`createTournament`** e **`createtournament`** — corrigem o bug dos campos de
    participante (passam a escrever ambos os pares canônicos e iguais).
 3. **`jointournament`** — debita entry fee, cria registration (precisa de saldo + torneio).
@@ -165,9 +168,19 @@ e C não forem tratados, **não iniciar** o deploy.
 ```
 firebase deploy --only functions:testdeposit --project sparta-battle
 ```
-Smoke (contas e dinheiro **exclusivamente de teste**): chamar `testdeposit` com a
-conta admin de teste, valor pequeno; conferir no app/console que o `balance` da
-wallet de teste subiu pelo valor exato. Depois:
+> **MUDANÇA DE COMPORTAMENTO — o smoke abaixo não é mais executável em produção.**
+> `testdeposit` cunha dinheiro sacável, então além da claim `admin: true` ela
+> agora exige que o projeto efetivo comece com `demo-`
+> (`functions/src/domain/demoProject.ts`). Em `sparta-battle` ela recusa com
+> `failed-precondition` **antes de qualquer escrita** — por design, e não por
+> defeito. A função continua deployável: o que muda é que ela não credita mais
+> nada em produção. Valide-a com `npm run test:rules` e `npm run test:e2e`, que
+> rodam sob `demo-sparta-battle`.
+
+Smoke **somente no emulador** (contas e dinheiro **exclusivamente de teste**):
+chamar `testdeposit` com a conta admin de teste, valor pequeno; conferir que o
+`balance` da wallet de teste subiu pelo valor exato. Em produção, seguir direto
+para a auditoria read-only:
 ```
 cd functions && node lib/audit/cli.js --project sparta-battle --confirm-read-only-production-audit
 ```

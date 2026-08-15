@@ -1,9 +1,33 @@
 import { randomBytes } from "node:crypto";
 
 import * as admin from "firebase-admin";
+/**
+ * MODULAR FIRESTORE ENTRYPOINTS — required for the Functions emulator, not a
+ * style preference.
+ *
+ * `firebase-tools` hands the loaded module a compatibility `admin` whose
+ * `admin.firestore` is a BOUND function. Binding produces a fresh function
+ * object and copies none of the original's own properties, so every static
+ * hanging off the namespace — `Timestamp`, `FieldValue`, `FieldPath` — is
+ * silently lost. Reading them yields `undefined`, and `new undefined(...)`
+ * throws "Timestamp is not a constructor".
+ *
+ * These names come straight from the package instead, so they never travel
+ * through that bound namespace and are unaffected by the stub. `admin.firestore()`
+ * itself is still used to obtain the instance — it is the namespace CALL that
+ * works; only its attached statics are missing.
+ */
+import {
+  type CollectionReference,
+  FieldPath,
+  FieldValue,
+  type Query,
+  Timestamp,
+} from "firebase-admin/firestore";
 import { https, region } from "firebase-functions/v1";
 
 import { assertAdmin, assertSignedIn } from "./domain/adminAuth.js";
+import { assertDemoProject } from "./domain/demoProject.js";
 import { DomainError } from "./domain/errors.js";
 import {
   decideRoomAccess,
@@ -276,13 +300,66 @@ export const onUserCreated = east.auth.user().onCreate(async (user) => {
   }
 });
 
-export const testdeposit = central.https.onCall(async (data, context) => {
+/**
+ * The server-side facts about which project this process writes to.
+ *
+ * All three are set by the runtime, never by a caller: the two environment
+ * variables come from the Functions runtime (or from `emulators:exec`), and the
+ * third is what `admin.initializeApp()` actually resolved. NOTHING here derives
+ * from the callable payload — that is the property the gate depends on.
+ *
+ * Undefined entries are dropped downstream; disagreement between the survivors
+ * is a refusal, not a vote.
+ */
+function effectiveProjectCandidates(): unknown[] {
+  return [
+    process.env.GCLOUD_PROJECT,
+    process.env.GOOGLE_CLOUD_PROJECT,
+    admin.app().options.projectId,
+  ];
+}
+
+/**
+ * Test-only seam, following the same options-with-defaults convention as
+ * `onPrizeTransactionCreatedHandler`. It is a TypeScript parameter, never a
+ * payload field, so no client can reach it and no client can choose the project.
+ */
+export interface TestDepositOptions {
+  readonly projectCandidates?: readonly unknown[];
+}
+
+/**
+ * TEST-ONLY FUNDING — mints withdrawable cash, and therefore carries TWO
+ * independent gates.
+ *
+ * 1. WHO: the `admin: true` custom claim, unchanged.
+ * 2. WHERE: the effective project must be a `demo-` project.
+ *
+ * The second gate exists because the first cannot protect the ledger. This
+ * function is an authorized production deploy target, so a single mis-issued
+ * admin claim on `sparta-battle` would otherwise be enough to create real money.
+ * The environment gate runs BEFORE amount validation, before the external id is
+ * derived and before any read or write — a refused call leaves no trace in the
+ * wallet, the ledger or the transaction collection.
+ *
+ * The refusal message is curated and constant (`DEMO_PROJECT_REFUSED_MESSAGE`):
+ * it discloses no project id, no environment variable and no configuration.
+ */
+export const testdepositHandler = async (
+  data: any,
+  context: any,
+  options: TestDepositOptions = {}
+): Promise<Record<string, unknown>> => {
   try {
     const callerAuth = assertAdmin(
       context,
       "Você precisa estar logado para fazer depósito.",
       "Apenas admin pode fazer depósito de teste."
     );
+
+    // WHERE, immediately after WHO and before everything else. The candidates
+    // are read from the runtime here; `options` only ever replaces them in tests.
+    assertDemoProject(options.projectCandidates ?? effectiveProjectCandidates());
 
     const uid = callerAuth.uid;
 
@@ -337,7 +414,7 @@ export const testdeposit = central.https.onCall(async (data, context) => {
         tournament_ref: null,
         previous_balance: centavosToReais(previousBalance),
         balance_after: centavosToReais(newBalance),
-        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        timestamp: FieldValue.serverTimestamp(),
         status: "completed",
         external_id: externalId,
       });
@@ -353,7 +430,11 @@ export const testdeposit = central.https.onCall(async (data, context) => {
     console.error("testdeposit error:", error);
     throw toHttpsError(error);
   }
-});
+};
+
+export const testdeposit = central.https.onCall(
+  async (data: any, context: any) => testdepositHandler(data, context)
+);
 
 export const requestwithdrawal = central.https.onCall(async (data, context) => {
   try {
@@ -434,7 +515,7 @@ export const requestwithdrawal = central.https.onCall(async (data, context) => {
         tournament_ref: null,
         previous_balance: centavosToReais(previousBalance),
         balance_after: centavosToReais(balanceAfter),
-        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        timestamp: FieldValue.serverTimestamp(),
         status: "pending",
         external_id: externalid,
       });
@@ -452,7 +533,7 @@ export const requestwithdrawal = central.https.onCall(async (data, context) => {
         pix_tx_id: null,
         error_message: null,
 
-        requested_at: admin.firestore.FieldValue.serverTimestamp(),
+        requested_at: FieldValue.serverTimestamp(),
         paid_at: null,
         failed_at: null,
       });
@@ -596,7 +677,7 @@ export const jointournament = central.https.onCall(async (data, context) => {
           // which in every cash transaction refer to the real `balance`.
           beta_previous_balance: centavosToReais(previousBeta),
           beta_balance_after: centavosToReais(betaAfter),
-          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          timestamp: FieldValue.serverTimestamp(),
           status: "completed",
           external_id: externalid,
         };
@@ -629,7 +710,7 @@ export const jointournament = central.https.onCall(async (data, context) => {
           tournament_ref: tournamentRef,
           previous_balance: centavosToReais(previousBalance),
           balance_after: centavosToReais(balanceAfter),
-          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+          timestamp: FieldValue.serverTimestamp(),
           status: "completed",
           external_id: externalid,
         };
@@ -654,7 +735,7 @@ export const jointournament = central.https.onCall(async (data, context) => {
         economy_type: economy,
         entry_fee_snapshot: centavosToReais(entryFeeCentavos),
         transaction_ref: transactionRef,
-        created_at: admin.firestore.FieldValue.serverTimestamp(),
+        created_at: FieldValue.serverTimestamp(),
       });
 
       transaction.set(transactionRef, transactionData);
@@ -754,7 +835,7 @@ export const startTournamentHandler = async (
       // created_at and starts_at are deliberately left untouched.
       transaction.update(tournamentRef, {
         status: "in_progress",
-        updated_at: admin.firestore.FieldValue.serverTimestamp(),
+        updated_at: FieldValue.serverTimestamp(),
       });
     });
 
@@ -979,7 +1060,7 @@ export const declareTournamentResultHandler = async (
       const prizeReais = centavosToReais(prizeCentavos);
       // ONE server-timestamp sentinel, reused so every stamp written in this
       // commit resolves to the exact same time.
-      const stampedAt = admin.firestore.FieldValue.serverTimestamp();
+      const stampedAt = FieldValue.serverTimestamp();
 
       if (economy === ECONOMY_BETA_CREDIT) {
         // ── BETA settlement: the prize is Beta Credits, credited EXCLUSIVELY
@@ -1236,8 +1317,8 @@ export const createTournamentHandler = async (
       ...newTournamentParticipantFields(maxPlayers),
 
       starts_at: null,
-      created_at: admin.firestore.FieldValue.serverTimestamp(),
-      updated_at: admin.firestore.FieldValue.serverTimestamp(),
+      created_at: FieldValue.serverTimestamp(),
+      updated_at: FieldValue.serverTimestamp(),
     });
 
     return {
@@ -1312,14 +1393,14 @@ export const setTournamentRoomHandler = async (
       const roomSnap = await transaction.get(roomRef);
       const createdAt =
         (roomSnap.exists && roomSnap.data()?.created_at) ||
-        admin.firestore.FieldValue.serverTimestamp();
+        FieldValue.serverTimestamp();
 
       transaction.set(roomRef, {
         tournament_ref: tournamentRef,
         room_id: roomid,
         room_password: roompassword,
         created_at: createdAt,
-        updated_at: admin.firestore.FieldValue.serverTimestamp(),
+        updated_at: FieldValue.serverTimestamp(),
       });
     });
 
@@ -1784,7 +1865,7 @@ export const cancelTournamentHandler = async (
 
       // ── WRITES — everything is now validated ──
       // ONE server-timestamp sentinel for every stamp in this commit.
-      const stampedAt = admin.firestore.FieldValue.serverTimestamp();
+      const stampedAt = FieldValue.serverTimestamp();
 
       for (let i = 0; i < plan.length; i++) {
         const item = plan[i];
@@ -2001,7 +2082,7 @@ export const grantBetaCreditHandler = async (
 
       // ONE server-timestamp sentinel, reused so every stamp in this commit
       // resolves to the exact same time.
-      const stampedAt = admin.firestore.FieldValue.serverTimestamp();
+      const stampedAt = FieldValue.serverTimestamp();
 
       // The ONLY wallet field this flow may touch is beta_balance.
       transaction.update(walletRef, {
@@ -2139,7 +2220,7 @@ export const recordDailyAppOpenHandler = async (
         return { alreadyRecorded: true };
       }
 
-      const stampedAt = admin.firestore.FieldValue.serverTimestamp();
+      const stampedAt = FieldValue.serverTimestamp();
 
       transaction.set(activityRef, {
         uid: uid,
@@ -2399,7 +2480,7 @@ export const ensurePublicPlayerIdHandler = async (
         return { kind: "collision" as const };
       }
 
-      const stampedAt = admin.firestore.FieldValue.serverTimestamp();
+      const stampedAt = FieldValue.serverTimestamp();
 
       // create() and nothing else: it fails if the document already exists, so
       // neither half of the pair can ever be silently replaced.
@@ -2652,7 +2733,7 @@ export const onPrizeTransactionCreatedHandler = async (
 
     // ONE server-timestamp sentinel, so every stamp in this commit resolves to
     // the same instant.
-    const stampedAt = admin.firestore.FieldValue.serverTimestamp();
+    const stampedAt = FieldValue.serverTimestamp();
 
     // THE ORDERING SCALARS ARE MINTED HERE AND ONLY HERE — the internal write
     // path, from values `decideEntry` has already normalised. `encodeRankScalar`
@@ -2671,8 +2752,8 @@ export const onPrizeTransactionCreatedHandler = async (
         seasonId,
         scoreCentavos: entryPlan.scoreCentavos,
         winsCount: entryPlan.winsCount,
-        firstPrizeAt: admin.firestore.Timestamp.fromDate(entryPlan.firstPrizeAt),
-        lastPrizeAt: admin.firestore.Timestamp.fromDate(entryPlan.lastPrizeAt),
+        firstPrizeAt: Timestamp.fromDate(entryPlan.firstPrizeAt),
+        lastPrizeAt: Timestamp.fromDate(entryPlan.lastPrizeAt),
         updatedAt: stampedAt,
       });
     } else {
@@ -2681,7 +2762,7 @@ export const onPrizeTransactionCreatedHandler = async (
         winsOrder,
         scoreCentavos: entryPlan.scoreCentavos,
         winsCount: entryPlan.winsCount,
-        lastPrizeAt: admin.firestore.Timestamp.fromDate(entryPlan.lastPrizeAt),
+        lastPrizeAt: Timestamp.fromDate(entryPlan.lastPrizeAt),
         updatedAt: stampedAt,
       });
     }
@@ -2693,8 +2774,8 @@ export const onPrizeTransactionCreatedHandler = async (
         timezone: RANKING_TIMEZONE,
         playerCount: parentPlan.playerCount,
         totalScoreCentavos: parentPlan.totalScoreCentavos,
-        windowStart: admin.firestore.Timestamp.fromDate(parentPlan.windowStart),
-        windowEnd: admin.firestore.Timestamp.fromDate(parentPlan.windowEnd),
+        windowStart: Timestamp.fromDate(parentPlan.windowStart),
+        windowEnd: Timestamp.fromDate(parentPlan.windowEnd),
         updatedAt: stampedAt,
       });
     } else {
@@ -2731,7 +2812,7 @@ export const onPrizeTransactionCreated = central.firestore
 function seasonEntriesQuery(
   economy: RankingEconomy,
   seasonId: string
-): admin.firestore.CollectionReference {
+): CollectionReference {
   return db
     .collection(SEASON_RANKINGS_COLLECTION)
     .doc(seasonDocumentId(economy, seasonId))
@@ -2739,8 +2820,8 @@ function seasonEntriesQuery(
 }
 
 /** A domain ordering scalar, as the Firestore value the queries compare. */
-function rankTimestamp(scalar: RankScalar): admin.firestore.Timestamp {
-  return new admin.firestore.Timestamp(scalar.seconds, scalar.nanoseconds);
+function rankTimestamp(scalar: RankScalar): Timestamp {
+  return new Timestamp(scalar.seconds, scalar.nanoseconds);
 }
 
 const MIN_RANK_TS = rankTimestamp(MIN_RANK_SCALAR);
@@ -2762,7 +2843,7 @@ const MAX_RANK_TS = rankTimestamp(MAX_RANK_SCALAR);
 function canonicalEntriesQuery(
   economy: RankingEconomy,
   seasonId: string
-): admin.firestore.Query {
+): Query {
   return seasonEntriesQuery(economy, seasonId)
     .where("scoreOrder", ">=", MIN_RANK_TS)
     .where("scoreOrder", "<=", MAX_RANK_TS)
@@ -2770,7 +2851,7 @@ function canonicalEntriesQuery(
     .where("winsOrder", "<=", MAX_RANK_TS)
     .orderBy("scoreOrder", "desc")
     .orderBy("winsOrder", "desc")
-    .orderBy(admin.firestore.FieldPath.documentId(), "asc");
+    .orderBy(FieldPath.documentId(), "asc");
 }
 
 /** What both callables must agree on before publishing anything. */
@@ -3180,7 +3261,7 @@ export const getMySeasonRankingHandler = async (
                 .where("winsOrder", "<=", MAX_RANK_TS)
                 .orderBy("scoreOrder", "desc")
                 .orderBy("winsOrder", "desc")
-                .orderBy(admin.firestore.FieldPath.documentId(), "asc")
+                .orderBy(FieldPath.documentId(), "asc")
                 .count()
             ),
             transaction.get(
@@ -3189,7 +3270,7 @@ export const getMySeasonRankingHandler = async (
                 .where("winsOrder", ">", myWins)
                 .where("winsOrder", "<=", MAX_RANK_TS)
                 .orderBy("winsOrder", "desc")
-                .orderBy(admin.firestore.FieldPath.documentId(), "asc")
+                .orderBy(FieldPath.documentId(), "asc")
                 .count()
             ),
             transaction.get(
@@ -3197,11 +3278,11 @@ export const getMySeasonRankingHandler = async (
                 .where("scoreOrder", "==", myScore)
                 .where("winsOrder", "==", myWins)
                 .where(
-                  admin.firestore.FieldPath.documentId(),
+                  FieldPath.documentId(),
                   "<",
                   entrySnap.id
                 )
-                .orderBy(admin.firestore.FieldPath.documentId(), "asc")
+                .orderBy(FieldPath.documentId(), "asc")
                 .count()
             ),
           ]);

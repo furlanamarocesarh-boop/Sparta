@@ -4,6 +4,7 @@ import { before, describe, it } from "node:test";
 
 import * as admin from "firebase-admin";
 
+import { fetchWithTimeout } from "../support/httpTimeout.js";
 import {
   reconcileWallet,
   TransactionRecord,
@@ -136,7 +137,7 @@ interface CallResult {
 
 async function signIn(email: string): Promise<string> {
   const url = `http://${AUTH_HOST()}/identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=demo-key`;
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ email, password: PW, returnSecureToken: true }),
@@ -155,7 +156,7 @@ async function callHttp(
 ): Promise<CallResult> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (idToken) headers.Authorization = `Bearer ${idToken}`;
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `http://${FUNCTIONS_HOST}/${PROJECT_ID}/${REGION}/${name}`,
     { method: "POST", headers, body: JSON.stringify({ data }) }
   );
@@ -339,7 +340,7 @@ describe("BETA E2E — grant → join → start → prize; join → cancel → r
     db = admin.firestore();
 
     try {
-      await fetch(`http://${FUNCTIONS_HOST}/`).catch(() => {
+      await fetchWithTimeout(`http://${FUNCTIONS_HOST}/`, {}, 10_000).catch(() => {
         throw new Error("unreachable");
       });
     } catch {
