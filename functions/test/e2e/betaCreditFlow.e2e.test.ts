@@ -4,6 +4,7 @@ import { before, describe, it } from "node:test";
 
 import * as admin from "firebase-admin";
 
+import { assertEmulatorOnly } from "../support/emulatorGuard.js";
 import { fetchWithTimeout } from "../support/httpTimeout.js";
 import {
   reconcileWallet,
@@ -94,34 +95,7 @@ const CASH_FIELDS = [
   "total_withdrawn",
 ] as const;
 
-// ─── Fail-closed guard ───────────────────────────────────────────────────────
-
-function localHost(h: string): boolean {
-  const bare = h.replace(/^https?:\/\//, "");
-  return /^(127\.0\.0\.1|localhost|0\.0\.0\.0|\[?::1\]?)(:|$)/.test(bare);
-}
-
-function assertEmulatorOnly(): void {
-  const fail = (m: string): never => {
-    throw new Error(`FAIL-CLOSED (E2E aborted): ${m}`);
-  };
-  const projectId =
-    process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || PROJECT_ID;
-  if (!projectId.startsWith("demo-")) {
-    fail(`project id "${projectId}" must start with "demo-"`);
-  }
-  const fsHost = process.env.FIRESTORE_EMULATOR_HOST;
-  const authHost = process.env.FIREBASE_AUTH_EMULATOR_HOST;
-  if (!fsHost) fail("FIRESTORE_EMULATOR_HOST is not set");
-  if (!authHost) fail("FIREBASE_AUTH_EMULATOR_HOST is not set");
-  if (!localHost(fsHost!)) fail(`FIRESTORE_EMULATOR_HOST "${fsHost}" is not local`);
-  if (!localHost(authHost!)) {
-    fail(`FIREBASE_AUTH_EMULATOR_HOST "${authHost}" not local`);
-  }
-  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-    fail("GOOGLE_APPLICATION_CREDENTIALS is set — refusing a possible real credential");
-  }
-}
+// ─── Fail-closed guard (shared: test/support/emulatorGuard.ts) ───────────────
 
 const FUNCTIONS_HOST = process.env.FUNCTIONS_EMULATOR_HOST || "127.0.0.1:5001";
 const AUTH_HOST = () => process.env.FIREBASE_AUTH_EMULATOR_HOST!;
@@ -315,7 +289,7 @@ let TC = ""; // cash — isolation control
 
 describe("BETA E2E — grant → join → start → prize; join → cancel → refund; withdrawal blind; reconciliation", () => {
   before(async () => {
-    assertEmulatorOnly();
+    assertEmulatorOnly(PROJECT_ID);
     process.env.GCLOUD_PROJECT = PROJECT_ID;
 
     const mod = (await import("../../src/index.js")) as unknown as {
