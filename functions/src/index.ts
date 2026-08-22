@@ -162,6 +162,10 @@ import {
   type RankScalar,
 } from "./domain/seasonLeaderboard.js";
 import {
+  isValidPublicId,
+  projectPublicPreview,
+} from "./domain/publicTournamentPreview.js";
+import {
   assertPublicPlayerId,
   decidePublicPlayerIdReservation,
   encodePublicPlayerId,
@@ -3361,3 +3365,72 @@ function toDateOrNull(value: unknown): Date | null {
   }
   return null;
 }
+
+/**
+ * PUBLIC, UNAUTHENTICATED tournament preview — the only server surface a
+ * stranger can read, and the only reason the shared link can show anything at
+ * all. `firestore.rules` denies anonymous reads of `tournaments`, deliberately;
+ * this endpoint does not relax that, it replaces it with a curated projection.
+ *
+ * WHAT IT CANNOT REACH. It performs exactly ONE read: the tournament document
+ * itself. It never touches `tournament_rooms` (room id and password),
+ * `registrations`, `wallets`, `transactions`, `users` or `public_player_ids` —
+ * so no credential, no uid, no balance and no entry list can appear here even
+ * by accident. What it does read is then narrowed again by
+ * `projectPublicPreview`, which builds the response key by key.
+ *
+ * THE REFUSAL IS UNIFORM. A malformed id, an id that matches nothing, and a
+ * document that cannot be described faithfully all return the SAME 404. The
+ * endpoint therefore never confirms which tournament ids exist, which is what
+ * keeps an unauthenticated scan from mapping the collection.
+ */
+export const publicTournamentPreviewHandler = async (
+  req: any,
+  res: any
+): Promise<void> => {
+  // Public and read-only: safe to cache, and never worth indexing.
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("X-Robots-Tag", "noindex");
+  res.set("Cache-Control", "public, max-age=60, s-maxage=300");
+
+  if (req.method === "OPTIONS") {
+    res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+    res.status(204).send("");
+    return;
+  }
+
+  if (req.method !== "GET") {
+    res.status(405).json({ error: "method-not-allowed" });
+    return;
+  }
+
+  // An array (`?id=a&id=b`) is not a string, so it is refused here.
+  const id = req.query?.id;
+  if (!isValidPublicId(id)) {
+    res.status(404).json({ error: "not-found" });
+    return;
+  }
+
+  try {
+    const snapshot = await db.collection("tournaments").doc(id).get();
+    const preview = projectPublicPreview(
+      snapshot.exists ? snapshot.data() ?? null : null
+    );
+
+    if (preview === null) {
+      res.status(404).json({ error: "not-found" });
+      return;
+    }
+
+    res.status(200).json(preview);
+  } catch (error) {
+    // The reason never reaches the caller: it would describe internals to an
+    // unauthenticated client.
+    console.error("publicTournamentPreview error:", error);
+    res.status(500).json({ error: "internal" });
+  }
+};
+
+export const publicTournamentPreview = central.https.onRequest(
+  publicTournamentPreviewHandler
+);

@@ -95,6 +95,7 @@ const AUTHORIZED_FUNCTIONS: Readonly<Record<string, string>> = {
   onPrizeTransactionCreated: CENTRAL,
   getSeasonLeaderboard: CENTRAL,
   getMySeasonRanking: CENTRAL,
+  publicTournamentPreview: CENTRAL,
 };
 
 /**
