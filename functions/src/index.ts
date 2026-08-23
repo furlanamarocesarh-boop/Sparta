@@ -3653,11 +3653,15 @@ export const onEntryFeeTransactionCreatedHandler = async (
     typeof userSnap.get("partner_ref") === "string"
       ? (userSnap.get("partner_ref") as string)
       : null;
-  const attributedAtRaw = userSnap.get("attributed_at");
-  const attributedAt =
-    attributedAtRaw && typeof attributedAtRaw.toDate === "function"
-      ? (attributedAtRaw.toDate() as Date)
+  const toDate = (raw: unknown): Date | null =>
+    raw && typeof (raw as { toDate?: unknown }).toDate === "function"
+      ? ((raw as { toDate: () => Date }).toDate() as Date)
       : null;
+
+  const attributedAt = toDate(userSnap.get("attributed_at"));
+  // Read, not recomputed: the stored value carries the terms the attribution
+  // was recorded under, and it must survive a later change to the window.
+  const storedExpiresAt = toDate(userSnap.get("attribution_expires_at"));
 
   let partnerActive = false;
   let partnerOwnerUid: string | null = null;
@@ -3676,6 +3680,7 @@ export const onEntryFeeTransactionCreatedHandler = async (
   const decision: CommissionDecision = decideCommission({
     partnerRef,
     attributedAt,
+    attributionExpiresAt: storedExpiresAt,
     partnerActive,
     partnerOwnerUid,
     payerUid: uid,

@@ -201,6 +201,7 @@ function baseInput(overrides: Partial<CommissionInput> = {}): CommissionInput {
   return {
     partnerRef: "partner-1",
     attributedAt: new Date("2026-01-01T00:00:00.000Z"),
+    attributionExpiresAt: null,
     partnerActive: true,
     partnerOwnerUid: "uid-partner",
     payerUid: "uid-player",
@@ -397,5 +398,57 @@ describe("projeção de ganhos do parceiro", () => {
 
   it("o total do parceiro vive em centavos inteiros", () => {
     assert.equal(PARTNER_TOTAL_FIELD, "total_accrued_centavos");
+  });
+});
+
+describe("a expiração GRAVADA manda, não a constante viva", () => {
+  const attributedAt = new Date("2026-01-01T00:00:00.000Z");
+
+  it("usa a expiração armazenada mesmo quando ela diverge da constante", () => {
+    // Termo mais CURTO do que a janela atual: registrado assim, vale assim.
+    const curta = new Date("2026-03-01T00:00:00.000Z");
+    const depois = decideCommission(
+      baseInput({
+        attributedAt,
+        attributionExpiresAt: curta,
+        now: new Date("2026-06-01T00:00:00.000Z"),
+      })
+    );
+    assert.deepEqual(depois, { accrues: false, reason: "window-expired" });
+
+    const antes = decideCommission(
+      baseInput({
+        attributedAt,
+        attributionExpiresAt: curta,
+        now: new Date("2026-02-01T00:00:00.000Z"),
+      })
+    );
+    assert.equal(antes.accrues, true);
+  });
+
+  it("um termo mais LONGO que a constante também é honrado", () => {
+    // Se a janela for encurtada amanhã, quem foi atribuído sob 24 meses
+    // continua valendo 24 meses. É o defeito que este teste trava.
+    const longa = new Date("2028-01-01T00:00:00.000Z");
+    const decision = decideCommission(
+      baseInput({
+        attributedAt,
+        attributionExpiresAt: longa,
+        // Já passou dos 12 meses recomputados, mas não do termo gravado.
+        now: new Date("2027-06-01T00:00:00.000Z"),
+      })
+    );
+    assert.equal(decision.accrues, true);
+  });
+
+  it("sem valor gravado, recalcula — é o melhor disponível para linha antiga", () => {
+    const decision = decideCommission(
+      baseInput({
+        attributedAt,
+        attributionExpiresAt: null,
+        now: new Date("2027-06-01T00:00:00.000Z"),
+      })
+    );
+    assert.deepEqual(decision, { accrues: false, reason: "window-expired" });
   });
 });

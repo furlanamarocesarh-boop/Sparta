@@ -283,6 +283,19 @@ export interface CommissionInput {
   readonly partnerRef: string | null;
   /** When the attribution was recorded, or null when unattributed. */
   readonly attributedAt: Date | null;
+  /**
+   * The expiry STORED on the user at attribution time.
+   *
+   * This is the authority, not [ATTRIBUTION_WINDOW_MONTHS]. An attribution is a
+   * commercial term agreed when it was recorded: if the window constant is
+   * later shortened, already-recorded attributions must keep the terms they
+   * were recorded under, and recomputing from the live constant would silently
+   * shorten every contract already in force.
+   *
+   * Null only for a row written before the field existed; those fall back to
+   * recomputation, which is the best available answer for them.
+   */
+  readonly attributionExpiresAt: Date | null;
   /** Whether the partner is still accepting accruals. */
   readonly partnerActive: boolean;
   /** The uid that owns the partner, when the partner is also a player. */
@@ -325,7 +338,10 @@ export function decideCommission(input: CommissionInput): CommissionDecision {
   if (!input.partnerActive) {
     return { accrues: false, reason: "partner-inactive" };
   }
-  if (input.now.getTime() >= attributionExpiresAt(attributedAt).getTime()) {
+  // Stored expiry wins. Recomputation is the fallback for legacy rows only.
+  const expiresAt =
+    input.attributionExpiresAt ?? attributionExpiresAt(attributedAt);
+  if (input.now.getTime() >= expiresAt.getTime()) {
     return { accrues: false, reason: "window-expired" };
   }
 
