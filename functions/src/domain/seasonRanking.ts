@@ -32,6 +32,11 @@ export type RankingEconomy = typeof ECONOMY_CASH | typeof ECONOMY_BETA_CREDIT;
  * (`BETA_PRIZE_CATEGORY`), so this closes the asymmetry rather than adding a
  * second source of truth.
  */
+import {
+  BETA_KILL_PRIZE_CATEGORY,
+  KILL_PRIZE_CATEGORY,
+} from "./killPrize.js";
+
 export const CASH_PRIZE_CATEGORY = "prize";
 
 /** The deterministic prefix every settlement prize transaction id carries. */
@@ -103,7 +108,25 @@ export function classifyPrizeCategory(
 ): RankingEconomy | null {
   if (category === CASH_PRIZE_CATEGORY) return ECONOMY_CASH;
   if (category === BETA_PRIZE_CATEGORY) return ECONOMY_BETA_CREDIT;
+  if (category === KILL_PRIZE_CATEGORY) return ECONOMY_CASH;
+  if (category === BETA_KILL_PRIZE_CATEGORY) return ECONOMY_BETA_CREDIT;
   return null;
+}
+
+/**
+ * Whether a ranking-bearing row also counts as a VICTORY.
+ *
+ * Money won and winning are different facts, and only the placement prize is
+ * both. A per-kill payout is real money and belongs in `scoreCentavos`, but
+ * crediting it as a win would record a player who finished thirtieth with two
+ * kills as having won the tournament.
+ *
+ * Separate function rather than a field on the category table: the two
+ * questions have different answers for the same row, and collapsing them into
+ * one lookup is what made this wrong in the first place.
+ */
+export function prizeCountsAsWin(category: unknown): boolean {
+  return category === CASH_PRIZE_CATEGORY || category === BETA_PRIZE_CATEGORY;
 }
 
 /** True when the stored status is exactly the settled status. */
@@ -288,6 +311,11 @@ export interface PrizeRankingEvent {
   readonly seasonId: string;
   readonly dayKey: string;
   readonly prizeAt: Date;
+  /**
+   * Whether this row is a victory as well as money. False for a per-kill
+   * payout: it adds to the score and leaves `winsCount` untouched.
+   */
+  readonly countsAsWin: boolean;
 }
 
 // ── Guard ───────────────────────────────────────────────────────────────────
@@ -409,7 +437,7 @@ export function decideEntry(input: {
     return {
       kind: "create",
       scoreCentavos: event.amountCentavos,
-      winsCount: 1,
+      winsCount: event.countsAsWin ? 1 : 0,
       firstPrizeAt: event.prizeAt,
       lastPrizeAt: event.prizeAt,
     };
@@ -427,7 +455,10 @@ export function decideEntry(input: {
   if (!isStoredCount(stored.scoreCentavos)) {
     throw corrupt("a pontuação da entry é inválida");
   }
-  if (!isStoredCount(stored.winsCount) || stored.winsCount < 1) {
+  // `< 0`, NOT `< 1`. An entry whose only rows are per-kill payouts legitimately
+  // has zero victories, and rejecting it as corrupt would make the first kill
+  // payout poison the entry for every prize that followed.
+  if (!isStoredCount(stored.winsCount) || stored.winsCount < 0) {
     throw corrupt("o número de vitórias da entry é inválido");
   }
   if (toUsableDate(stored.firstPrizeAt) === null) {
@@ -443,7 +474,7 @@ export function decideEntry(input: {
       stored.scoreCentavos,
       event.amountCentavos
     ),
-    winsCount: stored.winsCount + 1,
+    winsCount: stored.winsCount + (event.countsAsWin ? 1 : 0),
     lastPrizeAt: event.prizeAt,
   };
 }

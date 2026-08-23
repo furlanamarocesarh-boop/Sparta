@@ -43,6 +43,9 @@ function eventOf(overrides: Partial<PrizeRankingEvent> = {}): PrizeRankingEvent 
     publicPlayerId: PLAYER,
     economy: ECONOMY_CASH,
     amountCentavos: 50_000,
+    // O prêmio de colocação é o caso padrão e É vitória; o pagamento por
+    // abate sobrescreve isto para false.
+    countsAsWin: true,
     seasonId: "2026-08",
     dayKey: "2026-08-03",
     prizeAt: new Date("2026-08-03T18:22:11.000Z"),
@@ -471,7 +474,10 @@ describe("entry — corrupção estrutural falha fechado", () => {
     ["pontuação NaN", { scoreCentavos: NaN }],
     ["pontuação inteiro inseguro", { scoreCentavos: 2 ** 53 + 2 }],
     ["pontuação não numérica", { scoreCentavos: "100" }],
-    ["vitórias zero", { winsCount: 0 }],
+    // "vitórias zero" saiu desta tabela DE PROPÓSITO: com premiação por abate,
+    // uma entrada cujas únicas linhas são pagamentos por abate legitimamente
+    // tem zero vitórias. Recusá-la faria o primeiro abate envenenar a entrada
+    // para todo prêmio seguinte. O caso virou o teste de aceitação abaixo.
     ["vitórias negativas", { winsCount: -1 }],
     ["vitórias fracionárias", { winsCount: 1.5 }],
     ["firstPrizeAt inutilizável", { firstPrizeAt: "ontem" }],
@@ -487,6 +493,17 @@ describe("entry — corrupção estrutural falha fechado", () => {
       );
     });
   }
+
+  it("ACEITA vitórias zero — é o estado de quem só recebeu por abate", () => {
+    const plan = decideEntry({
+      event: eventOf({ countsAsWin: false }),
+      stored: { ...base, winsCount: 0 },
+    });
+    assert.equal(plan.kind, "update");
+    if (plan.kind !== "update") return;
+    // Continua sem vitória: abate acrescenta dinheiro, nunca vitória.
+    assert.equal(plan.winsCount, 0);
+  });
 });
 
 // ---------------------------------------------------------------------------

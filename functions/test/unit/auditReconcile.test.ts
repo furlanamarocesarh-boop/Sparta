@@ -61,6 +61,11 @@ describe("category → wallet field mapping (confirmed against index.ts)", () =>
       prize: "total_won",
       entry_fee: "total_spent",
       withdrawal: "total_withdrawn",
+      // Premiação por abate alimenta o MESMO total: dinheiro ganho é dinheiro
+      // ganho. A separação entre as duas categorias existe só para o ranking,
+      // que precisa distinguir vitória de valor recebido — a identidade
+      // contábil da carteira não faz essa distinção.
+      kill_prize: "total_won",
     });
   });
 });

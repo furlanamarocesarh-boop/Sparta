@@ -84,6 +84,11 @@ const CATEGORY_TABLE: Readonly<Record<string, CategoryMapping>> = {
   beta_entry_fee: { role: "entry", economy: "beta_credit", sign: -1 },
   beta_prize: { role: "prize", economy: "beta_credit", sign: 1 },
   beta_refund: { role: "refund", economy: "beta_credit", sign: 1 },
+  // Per-kill payouts are prize money for these stats: the role tracks value
+  // won, not victories. The win/not-a-win distinction lives in the season
+  // ranking, which is the only place that counts victories at all.
+  kill_prize: { role: "prize", economy: "cash", sign: 1 },
+  beta_kill_prize: { role: "prize", economy: "beta_credit", sign: 1 },
   deposit: EXCLUDED,
   withdrawal: EXCLUDED,
   beta_grant: EXCLUDED,

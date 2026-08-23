@@ -129,6 +129,7 @@ import {
 import {
   checkExistingGuard,
   classifyPrizeCategory,
+  prizeCountsAsWin,
   decideActivation,
   decideEntry,
   decideParent,
@@ -2676,6 +2677,9 @@ export const onPrizeTransactionCreatedHandler = async (
     seasonId,
     dayKey,
     prizeAt,
+    // Derived from the CATEGORY, never from the caller: a per-kill payout is
+    // money won without being a victory.
+    countsAsWin: prizeCountsAsWin(data.category),
   };
 
   const window = seasonWindow(seasonId);

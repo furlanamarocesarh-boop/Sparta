@@ -1,4 +1,8 @@
 import {
+  BETA_KILL_PRIZE_CATEGORY,
+  KILL_PRIZE_CATEGORY,
+} from "../domain/killPrize.js";
+import {
   BETA_REFUND_CATEGORY,
   ENTRY_REFUND_CATEGORY,
 } from "../domain/cancellation.js";
@@ -52,6 +56,11 @@ export const MONEY_CATEGORIES = [
   "prize",
   "entry_fee",
   "withdrawal",
+  // Per-kill payout. It feeds `total_won` exactly like a placement prize —
+  // money won is money won. The two are separate categories only because the
+  // season ranking must NOT count a kill as a victory; the ledger identity
+  // makes no such distinction.
+  KILL_PRIZE_CATEGORY,
 ] as const;
 
 export type MoneyCategory = (typeof MONEY_CATEGORIES)[number];
@@ -62,10 +71,15 @@ export const CATEGORY_TO_FIELD: Readonly<Record<MoneyCategory, WalletField>> = {
   prize: "total_won",
   entry_fee: "total_spent",
   withdrawal: "total_withdrawn",
+  [KILL_PRIZE_CATEGORY]: "total_won",
 };
 
 /** Categories that ADD to the balance. The other two subtract. */
-const CREDIT_CATEGORIES: ReadonlySet<string> = new Set(["deposit", "prize"]);
+const CREDIT_CATEGORIES: ReadonlySet<string> = new Set([
+  "deposit",
+  "prize",
+  KILL_PRIZE_CATEGORY,
+]);
 
 /**
  * The BETA ledger categories, each REQUIRED to carry
@@ -81,6 +95,7 @@ export const BETA_CATEGORIES = [
   BETA_ENTRY_FEE_CATEGORY,
   BETA_PRIZE_CATEGORY,
   BETA_REFUND_CATEGORY,
+  BETA_KILL_PRIZE_CATEGORY,
 ] as const;
 
 /** Every category the classifier recognizes. Anything else → manual review. */
@@ -382,6 +397,11 @@ export function reconcileWallet(
     }
     if (category === BETA_GRANT_CATEGORY) betaGrants += amount.centavos;
     else if (category === BETA_PRIZE_CATEGORY) betaPrizes += amount.centavos;
+    // EXPLICIT, never the fall-through below: the final `else` means entry
+    // spend, so an unlisted beta credit category would SUBTRACT from the beta
+    // balance instead of adding to it — an inverted sign that reconciles to a
+    // plausible-looking wrong number.
+    else if (category === BETA_KILL_PRIZE_CATEGORY) betaPrizes += amount.centavos;
     else betaEntrySpend += amount.centavos;
   }
 
