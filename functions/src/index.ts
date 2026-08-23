@@ -166,6 +166,22 @@ import {
   projectPublicPreview,
 } from "./domain/publicTournamentPreview.js";
 import {
+  attributionExpiresAt,
+  commissionAccrualId,
+  COMMISSION_ACCRUED_CATEGORY,
+  decideAttribution,
+  decideCommission,
+  normalizeReferralCode,
+  normalizeRecentLimit,
+  PARTNER_TOTAL_FIELD,
+  PARTNERS_COLLECTION,
+  projectPartnerAccrual,
+  REFERRAL_CODES_COLLECTION,
+  type CommissionDecision,
+  type PartnerAccrualView,
+  type PartnerEarningsView,
+} from "./domain/partnerReferral.js";
+import {
   assertPublicPlayerId,
   decidePublicPlayerIdReservation,
   encodePublicPlayerId,
@@ -3433,4 +3449,489 @@ export const publicTournamentPreviewHandler = async (
 
 export const publicTournamentPreview = central.https.onRequest(
   publicTournamentPreviewHandler
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Partner referral: attribution and accrual
+//
+// This section records WHO brought a player and HOW MUCH is owed for it. It
+// never pays anybody, and it never touches a wallet, a prize, a registration or
+// a tournament. See `domain/partnerReferral.ts` for why paying is impossible at
+// this commit and why recording is still urgent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The exact payload of `claimReferral`. Any other key is rejected outright. */
+const CLAIM_REFERRAL_KEYS = ["code"] as const;
+
+/** What the claim did, as data — so the app can explain the outcome. */
+export type ClaimReferralOutcome =
+  | { readonly claimed: true; readonly partnerRef: string }
+  | {
+      readonly claimed: false;
+      readonly reason:
+        | "already-attributed"
+        | "self-referral"
+        | "unknown-code"
+        | "partner-inactive";
+    };
+
+/**
+ * Binds the CALLER to the partner behind a referral code.
+ *
+ * THE CALLER IS THE SUBJECT. There is no uid in the payload — a player can only
+ * ever attribute themselves — so a partner cannot enrol accounts they do not
+ * control, and one player cannot assign another to a partner.
+ *
+ * WHY A CALLABLE AND NOT THE SIGN-UP TRIGGER. `onUserCreated` is an auth
+ * trigger: it receives only the Firebase Auth record, has no channel for a
+ * client payload, and swallows its own transaction failures in a `catch` that
+ * merely logs. An attribution written there could not arrive and, worse, could
+ * fail invisibly. So the app calls this explicitly after sign-in.
+ *
+ * CREATE-ONLY. `partner_ref` is written with a precondition that it does not
+ * already exist; a second claim is reported, never applied.
+ */
+export const claimReferralHandler = async (
+  data: unknown,
+  context: unknown
+): Promise<ClaimReferralOutcome> => {
+  const auth = assertSignedIn(
+    context as any,
+    "Entre na sua conta para usar um código de indicação."
+  );
+  assertExactPayload(data, CLAIM_REFERRAL_KEYS);
+
+  const code = normalizeReferralCode((data as { code?: unknown })?.code);
+  const uid = auth.uid;
+
+  const codeRef = db.collection(REFERRAL_CODES_COLLECTION).doc(code);
+  const userRef = db.collection("users").doc(uid);
+
+  return db.runTransaction(async (transaction) => {
+    // Both reads happen before any write — Firestore requires it, and it also
+    // means the decision below sees one consistent snapshot.
+    const [codeSnap, userSnap] = await Promise.all([
+      transaction.get(codeRef),
+      transaction.get(userRef),
+    ]);
+
+    if (!codeSnap.exists) {
+      return { claimed: false, reason: "unknown-code" } as const;
+    }
+
+    const codeData = codeSnap.data() ?? {};
+    const partnerRef =
+      typeof codeData.partner_ref === "string" ? codeData.partner_ref : null;
+    if (!partnerRef) {
+      // A code row without a partner is corrupt, not a missing code. It is
+      // reported as unknown so a caller learns nothing about internal state.
+      return { claimed: false, reason: "unknown-code" } as const;
+    }
+
+    const partnerSnap = await transaction.get(
+      db.collection(PARTNERS_COLLECTION).doc(partnerRef)
+    );
+    if (!partnerSnap.exists || partnerSnap.get("active") !== true) {
+      return { claimed: false, reason: "partner-inactive" } as const;
+    }
+
+    const decision = decideAttribution({
+      existingPartnerRef:
+        typeof userSnap.get("partner_ref") === "string"
+          ? (userSnap.get("partner_ref") as string)
+          : null,
+      code,
+      partnerOwnerUid:
+        typeof partnerSnap.get("owner_uid") === "string"
+          ? (partnerSnap.get("owner_uid") as string)
+          : null,
+      claimantUid: uid,
+    });
+
+    if (!decision.attributes) {
+      return { claimed: false, reason: decision.reason } as const;
+    }
+
+    const attributedAt = new Date();
+
+    // `merge: true` so the five fields `onUserCreated` owns are untouched. The
+    // expiry is STORED rather than recomputed later: if the window constant
+    // ever changes, already-recorded attributions must keep the terms they were
+    // recorded under.
+    transaction.set(
+      userRef,
+      {
+        partner_ref: partnerRef,
+        referral_code: code,
+        attributed_at: Timestamp.fromDate(attributedAt),
+        attribution_expires_at: Timestamp.fromDate(
+          attributionExpiresAt(attributedAt)
+        ),
+        source: "referral_link",
+      },
+      { merge: true }
+    );
+
+    return { claimed: true, partnerRef } as const;
+  });
+};
+
+export const claimReferral = central.https.onCall(async (data, context) => {
+  try {
+    return await claimReferralHandler(data, context);
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+});
+
+/** Why a ledger row produced no accrual. Returned for tests and logs. */
+export type AccrualOutcome =
+  | { readonly accrued: true; readonly commissionCentavos: number }
+  | { readonly accrued: false; readonly reason: string };
+
+/**
+ * Accrues one partner commission from a settled cash entry fee.
+ *
+ * FINANCIALLY INERT, exactly like `onPrizeTransactionCreated`. The entry fee is
+ * already committed when this runs, so a failure here can never delay, reverse
+ * or duplicate a player's registration. Nothing below reads or writes a wallet,
+ * a registration, a tournament or a result.
+ *
+ * BETA CAN NEVER REACH THE ACCRUAL. A beta entry writes `beta_entry_fee`, a
+ * different category, so it is refused at the front door — before any read —
+ * rather than relying on the economy check further in. Two independent barriers
+ * for the one rule that must not break.
+ *
+ * INELIGIBLE IS A SILENT NO-OP: throwing would make Firestore retry a delivery
+ * that can never succeed.
+ */
+export const onEntryFeeTransactionCreatedHandler = async (
+  snapshot: any
+): Promise<AccrualOutcome> => {
+  const data = snapshot?.data?.();
+  if (!data) return { accrued: false, reason: "no-data" };
+
+  // ── Front door ───────────────────────────────────────────────────────────
+  if (data.category !== "entry_fee") {
+    return { accrued: false, reason: "not-a-cash-entry-fee" };
+  }
+
+  const userPath: string | null =
+    typeof data.user_ref?.path === "string" ? data.user_ref.path : null;
+  const uid = userPath?.startsWith("users/") ? userPath.slice(6) : null;
+  if (!uid) return { accrued: false, reason: "no-user-ref" };
+
+  const tournamentPath: string | null =
+    typeof data.tournament_ref?.path === "string"
+      ? data.tournament_ref.path
+      : null;
+  const tournamentId = tournamentPath?.startsWith("tournaments/")
+    ? tournamentPath.slice(12)
+    : null;
+  if (!tournamentId) return { accrued: false, reason: "no-tournament-ref" };
+
+  // The entry-fee row is stored as a NEGATIVE amount in reais (a debit), so the
+  // magnitude is what the player paid. `allowZero` lets a free tournament reach
+  // `decideCommission`, which classifies it as `free-entry` rather than as a
+  // malformed amount.
+  // O VALOR NÃO É COAGIDO. `Number("100")` e `Number({toString:()=>"100"})`
+  // valem 100, e coagir aqui anularia a checagem de tipo do `inspectReais` —
+  // que existe exatamente para expor dado corrompido em vez de processá-lo.
+  // Só um número tem magnitude; qualquer outra coisa segue adiante como está e
+  // é recusada como `not-a-number`.
+  const rawAmount = data.amount;
+  const inspection = inspectReais(
+    typeof rawAmount === "number" ? Math.abs(rawAmount) : rawAmount,
+    { allowZero: true }
+  );
+  if (!inspection.ok) return { accrued: false, reason: "bad-amount" };
+  const entryCentavos = inspection.centavos;
+
+  // ── Accepted: from here a failure must propagate so the delivery retries ──
+  const userSnap = await db.collection("users").doc(uid).get();
+  const partnerRef =
+    typeof userSnap.get("partner_ref") === "string"
+      ? (userSnap.get("partner_ref") as string)
+      : null;
+  const attributedAtRaw = userSnap.get("attributed_at");
+  const attributedAt =
+    attributedAtRaw && typeof attributedAtRaw.toDate === "function"
+      ? (attributedAtRaw.toDate() as Date)
+      : null;
+
+  let partnerActive = false;
+  let partnerOwnerUid: string | null = null;
+  if (partnerRef) {
+    const partnerSnap = await db
+      .collection(PARTNERS_COLLECTION)
+      .doc(partnerRef)
+      .get();
+    partnerActive = partnerSnap.get("active") === true;
+    partnerOwnerUid =
+      typeof partnerSnap.get("owner_uid") === "string"
+        ? (partnerSnap.get("owner_uid") as string)
+        : null;
+  }
+
+  const decision: CommissionDecision = decideCommission({
+    partnerRef,
+    attributedAt,
+    partnerActive,
+    partnerOwnerUid,
+    payerUid: uid,
+    economy: "cash",
+    entryCentavos,
+    now: new Date(),
+  });
+
+  if (!decision.accrues) {
+    return { accrued: false, reason: decision.reason };
+  }
+
+  /**
+   * Idempotent by construction: the row id is derived from the registration,
+   * and `create` fails if a replay already wrote it. One registration can
+   * accrue at most one commission, whatever Firestore's at-least-once delivery
+   * does.
+   */
+  const registration = registrationId(uid, tournamentId);
+  const accrualRef = db
+    .collection("transactions")
+    .doc(commissionAccrualId(registration));
+
+  /**
+   * The row and the partner's running total move together or not at all.
+   *
+   * `create` inside the transaction is what makes it idempotent: a replay of the
+   * same delivery aborts before the increment, so the total can never drift
+   * above the ledger. Integer centavos increment exactly — the caution about
+   * `FieldValue.increment()` elsewhere in this file is about FLOAT reais.
+   */
+  const accrualRow = {
+    category: COMMISSION_ACCRUED_CATEGORY,
+    status: "accrued",
+    partner_ref: decision.partnerRef,
+    // Integer CENTAVOS, not reais: this row is an accrued liability, never a
+    // wallet movement, so it does not inherit the stored reais representation
+    // the five cash fields use.
+    amount_centavos: decision.commissionCentavos,
+    fee_centavos: decision.feeCentavos,
+    entry_centavos: decision.entryCentavos,
+    amount_unit: "centavos",
+    source_registration_id: registration,
+    tournament_ref: db.collection("tournaments").doc(tournamentId),
+    created_at: FieldValue.serverTimestamp(),
+    // NO user_ref. The partner is owed the money; the player who generated it is
+    // identified only through the registration id, which is server-side. A
+    // user_ref here would make the row readable by that player under the
+    // existing owner-scoped Rules and expose the partner's earnings.
+  };
+
+  try {
+    await db.runTransaction(async (transaction) => {
+      transaction.create(accrualRef, accrualRow);
+      transaction.set(
+        db.collection(PARTNERS_COLLECTION).doc(decision.partnerRef),
+        {
+          [PARTNER_TOTAL_FIELD]: FieldValue.increment(
+            decision.commissionCentavos
+          ),
+        },
+        { merge: true }
+      );
+    });
+  } catch (error: any) {
+    if (error?.code === 6 || error?.code === "already-exists") {
+      return { accrued: false, reason: "already-accrued" };
+    }
+    throw error;
+  }
+
+  return { accrued: true, commissionCentavos: decision.commissionCentavos };
+};
+
+export const onEntryFeeTransactionCreated = central.firestore
+  .document("transactions/{transactionId}")
+  .onCreate(async (snapshot) => {
+    await onEntryFeeTransactionCreatedHandler(snapshot);
+  });
+
+/** The exact payload of `createPartner`. */
+const CREATE_PARTNER_KEYS = ["name", "code", "ownerUid"] as const;
+
+/**
+ * Registers a partner and reserves their referral code, atomically.
+ *
+ * ADMIN ONLY. A partner is a commercial relationship, not a self-service
+ * signup: issuing a code creates a future liability against the platform's own
+ * margin, so it is an act an administrator performs deliberately.
+ *
+ * THE CODE IS THE LOCK. `referral_codes/{code}` is created inside the
+ * transaction, so two admins racing on the same code cannot both win — the
+ * second `create` fails rather than silently reassigning a live code to a
+ * different partner. Same structural trick as `public_player_id_index`.
+ */
+export const createPartnerHandler = async (
+  data: unknown,
+  context: unknown
+): Promise<{ readonly partnerRef: string; readonly code: string }> => {
+  assertAdmin(
+    context as any,
+    "Entre na sua conta de administrador.",
+    "Apenas administradores podem criar parceiros."
+  );
+  assertExactPayload(data, CREATE_PARTNER_KEYS);
+
+  const payload = (data ?? {}) as {
+    name?: unknown;
+    code?: unknown;
+    ownerUid?: unknown;
+  };
+
+  const code = normalizeReferralCode(payload.code);
+
+  const name = typeof payload.name === "string" ? payload.name.trim() : "";
+  if (name.length === 0 || name.length > 120) {
+    throw new DomainError(
+      "invalid-argument",
+      "Informe o nome do parceiro (até 120 caracteres)."
+    );
+  }
+
+  // The owner is optional: a partner may be a company with no player account.
+  // When present it is what makes self-referral detectable later.
+  const ownerUid =
+    payload.ownerUid === undefined || payload.ownerUid === null
+      ? null
+      : typeof payload.ownerUid === "string" && payload.ownerUid.length > 0
+        ? payload.ownerUid
+        : (() => {
+            throw new DomainError("invalid-argument", "ownerUid inválido.");
+          })();
+
+  const partnerRef = db.collection(PARTNERS_COLLECTION).doc();
+  const codeRef = db.collection(REFERRAL_CODES_COLLECTION).doc(code);
+
+  await db.runTransaction(async (transaction) => {
+    const existing = await transaction.get(codeRef);
+    if (existing.exists) {
+      throw new DomainError("already-exists", "Esse código já está em uso.");
+    }
+
+    transaction.create(partnerRef, {
+      name,
+      code,
+      owner_uid: ownerUid,
+      active: true,
+      [PARTNER_TOTAL_FIELD]: 0,
+      created_at: FieldValue.serverTimestamp(),
+    });
+    transaction.create(codeRef, {
+      partner_ref: partnerRef.id,
+      created_at: FieldValue.serverTimestamp(),
+    });
+  });
+
+  return { partnerRef: partnerRef.id, code };
+};
+
+export const createPartner = central.https.onCall(async (data, context) => {
+  try {
+    return await createPartnerHandler(data, context);
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+});
+
+/** The exact payload of `getPartnerEarnings`. */
+const PARTNER_EARNINGS_KEYS = ["limit"] as const;
+
+/**
+ * The caller's own partner earnings.
+ *
+ * THE CALLER IS THE TOKEN. There is no partner id in the payload — a partner
+ * can only ever ask about themselves — and the link is `partners.owner_uid`,
+ * written by an administrator at registration. A player who owns no partner
+ * gets `failed-precondition`, never someone else's numbers.
+ *
+ * NO PLAYER IS IDENTIFIABLE IN THE RESPONSE. The projection is built key by key
+ * and carries amounts and timestamps only. `attributedPlayers` is a COUNT, not
+ * a list — a partner learns how many people they brought, never who.
+ */
+export const getPartnerEarningsHandler = async (
+  data: unknown,
+  context: unknown
+): Promise<PartnerEarningsView> => {
+  const auth = assertSignedIn(
+    context as any,
+    "Entre na sua conta de parceiro."
+  );
+  assertExactPayload(data, PARTNER_EARNINGS_KEYS);
+  const limit = normalizeRecentLimit((data as { limit?: unknown })?.limit);
+
+  const owned = await db
+    .collection(PARTNERS_COLLECTION)
+    .where("owner_uid", "==", auth.uid)
+    .limit(1)
+    .get();
+
+  if (owned.empty) {
+    throw new DomainError(
+      "failed-precondition",
+      "Esta conta não está vinculada a um parceiro."
+    );
+  }
+
+  const partner = owned.docs[0];
+  const partnerId = partner.id;
+
+  const [countSnap, recentSnap] = await Promise.all([
+    db.collection("users").where("partner_ref", "==", partnerId).count().get(),
+    db
+      .collection("transactions")
+      .where("partner_ref", "==", partnerId)
+      .where("category", "==", COMMISSION_ACCRUED_CATEGORY)
+      .orderBy("created_at", "desc")
+      .limit(limit)
+      .get(),
+  ]);
+
+  const recent: PartnerAccrualView[] = [];
+  for (const doc of recentSnap.docs) {
+    const createdAt = doc.get("created_at");
+    const iso =
+      createdAt && typeof createdAt.toDate === "function"
+        ? (createdAt.toDate() as Date).toISOString()
+        : null;
+    const view = projectPartnerAccrual(doc.data(), iso);
+    if (view) recent.push(view);
+  }
+
+  const total = partner.get(PARTNER_TOTAL_FIELD);
+
+  return {
+    name: typeof partner.get("name") === "string" ? partner.get("name") : "",
+    code: typeof partner.get("code") === "string" ? partner.get("code") : "",
+    active: partner.get("active") === true,
+    totalAccruedCentavos:
+      typeof total === "number" && Number.isInteger(total) && total >= 0
+        ? total
+        : 0,
+    attributedPlayers: countSnap.data().count,
+    // Stated by the backend, not assumed by the screen: there is no payout rail
+    // in this codebase, for partners or for players.
+    payoutAvailable: false,
+    amountUnit: "centavos",
+    recent,
+  };
+};
+
+export const getPartnerEarnings = central.https.onCall(
+  async (data, context) => {
+    try {
+      return await getPartnerEarningsHandler(data, context);
+    } catch (error) {
+      throw toHttpsError(error);
+    }
+  }
 );

@@ -198,6 +198,36 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // PARTNER REFERRAL — the partner registry and the referral-code uniqueness
+    // guard. Both are business records written exclusively by Cloud Functions.
+    //
+    // Admin MAY read, unlike the identity map above: these are commercial
+    // records, not the bridge between an account and its pseudonym, and an
+    // admin console has to list partners and their codes to manage them.
+    //
+    // NO player can read either. A partner's code set and status are not the
+    // player's business, and `referral_codes` would otherwise be an enumeration
+    // surface mapping every live code to its partner.
+    //
+    // Partner EARNINGS are protected elsewhere, and structurally: an accrual is
+    // written into `transactions` WITHOUT a `user_ref`, so the rule above
+    // (`isOwnerByUserRef() || isAdmin()`) resolves to admin-only for those rows
+    // — a referred player cannot read what their activity earned the partner.
+    //
+    // What a player CAN see is their own `users/{uid}` document, which now
+    // carries `partner_ref`, `attributed_at` and `attribution_expires_at`. That
+    // is deliberate: the data subject can inspect the attribution recorded
+    // about them.
+    match /partners/{partnerId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    match /referral_codes/{code} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
     // Bloqueia qualquer collection não prevista.
     match /{document=**} {
       allow read, write: if false;
