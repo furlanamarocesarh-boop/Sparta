@@ -1,4 +1,5 @@
 import { DomainError } from "./errors.js";
+import { MAX_CENTAVOS, inspectReais } from "./money.js";
 import { inspectStoredPrize } from "./operations.js";
 import { hasValidPublishedCredentials } from "./room.js";
 
@@ -196,6 +197,14 @@ export function checkStartPreconditions(input: {
   readonly roomPassword: unknown;
   readonly roomTournamentRefPath: string | null;
   readonly prize: unknown;
+  /**
+   * The per-kill amount, when the tournament pays by kills.
+   *
+   * A tournament whose entire prize is per-kill legitimately stores `prize: 0`,
+   * and rejecting zero would let it be CREATED and never STARTED — the
+   * asymmetry that made a pure per-kill format impossible before.
+   */
+  readonly killPrize?: unknown;
 }): Check {
   if (!input.roomExists) {
     return { ok: false, message: "A sala do torneio ainda não foi publicada." };
@@ -209,9 +218,27 @@ export function checkStartPreconditions(input: {
       message: "A sala não corresponde a este torneio.",
     };
   }
+  const killPrize = inspectReais(input.killPrize, {
+    allowZero: true,
+    maxCentavos: MAX_CENTAVOS,
+  });
+  const paysPerKill = killPrize.ok && killPrize.centavos > 0;
+
   const prize = inspectStoredPrize(input.prize);
   if (!prize.ok) {
-    return { ok: false, message: prize.message };
+    /**
+     * A zero placement prize is valid ONLY when kills pay. Every other
+     * complaint about the stored prize — missing, negative, a string, out of
+     * range — still fails: per-kill is a licence for zero, never a licence to
+     * skip validating the placement amount.
+     */
+    const zeroButPaysPerKill =
+      paysPerKill &&
+      inspectReais(input.prize, { allowZero: true, maxCentavos: MAX_CENTAVOS })
+        .ok;
+    if (!zeroButPaysPerKill) {
+      return { ok: false, message: prize.message };
+    }
   }
   return { ok: true };
 }

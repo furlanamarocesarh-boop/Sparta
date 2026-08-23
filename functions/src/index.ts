@@ -853,6 +853,7 @@ export const startTournamentHandler = async (
         roomPassword: roomData.room_password,
         roomTournamentRefPath: documentPath(roomData.tournament_ref),
         prize: tournamentData.prize,
+        killPrize: tournamentData.kill_prize,
       });
       if (!preconditions.ok) {
         throw new DomainError("failed-precondition", preconditions.message);
@@ -1272,6 +1273,35 @@ export const createTournamentHandler = async (
       allowZero: true,
     });
 
+    /**
+     * Per-kill prize. Absent means a placement-only tournament, which is the
+     * shape every existing tournament has — so omitting it changes nothing.
+     *
+     * Zero and absent are the SAME thing here on purpose: `hasKillPrize` reads
+     * "> 0", and a stored zero would otherwise look configured while behaving
+     * as unconfigured, which is exactly the ambiguity that decides WHICH
+     * settlement handler a tournament belongs to.
+     */
+    const killPrizeCentavos =
+      data.kill_prize === undefined || data.kill_prize === null
+        ? 0
+        : toCentavos(data.kill_prize, {
+            field: "valor por abate",
+            allowZero: true,
+          });
+
+    /**
+     * A tournament has to pay something. Placement-only and per-kill-only are
+     * both legitimate; paying nothing at all is not, and would otherwise be
+     * creatable and then impossible to start.
+     */
+    if (prizeCentavos === 0 && killPrizeCentavos === 0) {
+      throw new DomainError(
+        "invalid-argument",
+        "Informe a premiação por colocação, o valor por abate, ou os dois."
+      );
+    }
+
     const maxPlayers = Number(data.max_players);
 
     if (!Number.isSafeInteger(maxPlayers) || maxPlayers <= 0) {
@@ -1342,6 +1372,7 @@ export const createTournamentHandler = async (
 
       entry_fee: centavosToReais(entryFeeCentavos),
       prize: centavosToReais(prizeCentavos),
+      kill_prize: centavosToReais(killPrizeCentavos),
 
       status: "open",
 
