@@ -4330,6 +4330,28 @@ export const declareTournamentResultWithKillsHandler = async (
           economy_type: economy,
           kill_prize: centavosToReais(killPrize.centavos),
           placement_prize: centavosToReais(placement.centavos),
+          /**
+           * WHAT THE WINNER RECEIVED — written for the clients that predate
+           * per-kill results.
+           *
+           * The published app reads `result.prize` and knows nothing of
+           * `payouts`. Omitting the key made `moneyFromReais(undefined)`
+           * return zero, so the gold winner panel told the actual winner
+           * "VOCÊ VENCEU — PRÊMIO R$ 0,00" while their wallet had really been
+           * credited. Telling someone they won nothing is worse than telling
+           * them nothing.
+           *
+           * The value is the winner's own total, not `total_paid`: `prize` has
+           * meant "what this player got" everywhere it has ever been read, and
+           * writing the distributed sum here would show one player as having
+           * taken the whole pool. Newer clients branch on `mode` first and
+           * never reach this key, so it is corrective for old builds and inert
+           * for new ones.
+           */
+          prize: centavosToReais(
+            decision.payouts.find((p) => p.uid === winneruid)?.totalCentavos ??
+              0
+          ),
           pool: centavosToReais(decision.poolCentavos),
           total_paid: centavosToReais(decision.totalCentavos),
           payouts: persisted,

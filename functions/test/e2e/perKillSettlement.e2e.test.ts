@@ -168,6 +168,27 @@ describe("E2E — liquidação por abate", () => {
     assert.equal((result.payouts as unknown[]).length, 2);
   });
 
+  it("grava `prize` para o app publicado, com o valor do VENCEDOR", async () => {
+    // O build da loja lê result.prize e não conhece `payouts`. Sem a chave,
+    // moneyFromReais(undefined) dava zero e o painel dourado dizia ao vencedor
+    // "VOCÊ VENCEU — PRÊMIO R$ 0,00" com a carteira creditada de verdade.
+    const t = await db.collection("tournaments").doc(TID).get();
+    const result = t.get("result") as Record<string, unknown>;
+
+    // 5 abates x R$1 + R$10 de colocação = R$15,00 — o que a carteira recebeu.
+    assert.equal(result.prize, 15);
+    const wallet = await db.collection("wallets").doc(PLAYERS[0]).get();
+    assert.equal(
+      result.prize,
+      wallet.get("balance"),
+      "o painel mostraria valor diferente do que foi creditado"
+    );
+
+    // E NÃO o total distribuído: seria mostrar um jogador levando o pool todo.
+    assert.notEqual(result.prize, result.total_paid);
+    assert.equal(result.total_paid, 18);
+  });
+
   it("repetir a MESMA declaração não paga de novo", async () => {
     await handler(
       {

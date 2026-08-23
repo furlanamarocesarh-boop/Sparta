@@ -98,7 +98,21 @@ export const BETA_CATEGORIES = [
   BETA_KILL_PRIZE_CATEGORY,
 ] as const;
 
-/** Every category the classifier recognizes. Anything else → manual review. */
+/**
+ * Every category the classifier recognizes. Anything else → manual review.
+ *
+ * `commission_accrued` is DELIBERATELY ABSENT, and adding it would be dead
+ * code. The reconciler only ever sees rows returned by
+ * `where("user_ref", "==", userRef)` (audit/cli.ts:206), and a commission
+ * accrual is written WITHOUT a `user_ref` — the same omission that makes it
+ * unreadable to the referred player. So no accrual can reach this set, and
+ * listing it here would suggest the reconciler models a row it never receives.
+ *
+ * That omission is load-bearing twice over: it is the privacy boundary AND the
+ * reason a partner's commission can never contaminate a player's wallet
+ * identity. If an accrual ever gains a `user_ref`, this comment is the warning
+ * that both properties break at once.
+ */
 export const KNOWN_CATEGORIES: ReadonlySet<string> = new Set([
   ...MONEY_CATEGORIES,
   ENTRY_REFUND_CATEGORY,
