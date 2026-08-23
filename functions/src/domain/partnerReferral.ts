@@ -460,8 +460,18 @@ export interface PartnerEarningsView {
   readonly active: boolean;
   /** Everything accrued so far, in integer centavos. */
   readonly totalAccruedCentavos: number;
-  /** How many players are currently attributed to this partner. */
+  /** How many players are attributed to this partner, ever. */
   readonly attributedPlayers: number;
+  /**
+   * How many of those are still inside their earning window.
+   *
+   * Reported SEPARATELY rather than folded into the total, because the two
+   * answer different questions and collapsing them misleads in both directions:
+   * a lone total counts people who stopped earning months ago and invites the
+   * partner to expect revenue that cannot come, while a lone active count hides
+   * the audience they actually brought.
+   */
+  readonly earningPlayers: number;
   /**
    * Nothing has been paid, and the screen must say so rather than implying a
    * balance. This is a stored fact, not a UI string, so the backend cannot

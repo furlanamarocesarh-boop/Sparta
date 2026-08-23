@@ -3488,8 +3488,15 @@ export type ClaimReferralOutcome =
  * merely logs. An attribution written there could not arrive and, worse, could
  * fail invisibly. So the app calls this explicitly after sign-in.
  *
- * CREATE-ONLY. `partner_ref` is written with a precondition that it does not
- * already exist; a second claim is reported, never applied.
+ * CREATE-ONLY, ENFORCED BY A TRANSACTIONAL READ — not by a Firestore
+ * precondition. The handler reads `users/{uid}` inside the transaction and
+ * refuses when `partner_ref` is already a string, so a concurrent second claim
+ * is serialised and reported rather than applied.
+ *
+ * The limit of that mechanism, stated rather than glossed: it tests for a
+ * STRING. A document whose `partner_ref` held some other type — reachable only
+ * by an out-of-band Admin SDK or console write, never by this code — would be
+ * treated as unattributed and overwritten by a later claim.
  */
 export const claimReferralHandler = async (
   data: unknown,
@@ -3890,8 +3897,19 @@ export const getPartnerEarningsHandler = async (
   const partner = owned.docs[0];
   const partnerId = partner.id;
 
-  const [countSnap, recentSnap] = await Promise.all([
+  // The earning count is a SEPARATE query with an expiry bound. Counting only
+  // by partner_ref would report players whose window closed as if they were
+  // still producing commission.
+  const now = Timestamp.now();
+
+  const [countSnap, earningSnap, recentSnap] = await Promise.all([
     db.collection("users").where("partner_ref", "==", partnerId).count().get(),
+    db
+      .collection("users")
+      .where("partner_ref", "==", partnerId)
+      .where("attribution_expires_at", ">", now)
+      .count()
+      .get(),
     db
       .collection("transactions")
       .where("partner_ref", "==", partnerId)
@@ -3923,6 +3941,7 @@ export const getPartnerEarningsHandler = async (
         ? total
         : 0,
     attributedPlayers: countSnap.data().count,
+    earningPlayers: earningSnap.data().count,
     // Stated by the backend, not assumed by the screen: there is no payout rail
     // in this codebase, for partners or for players.
     payoutAvailable: false,
