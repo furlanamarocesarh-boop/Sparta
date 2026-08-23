@@ -346,3 +346,51 @@ export function poolFromRegistrations(
 
   return { ok: true, centavos, counted };
 }
+
+/** True when the tournament is configured to pay per kill. */
+export function hasKillPrize(tournamentData: Record<string, unknown>): boolean {
+  const seen = inspectReais(tournamentData.kill_prize, {
+    allowZero: true,
+    maxCentavos: MAX_BALANCE_CENTAVOS,
+  });
+  return seen.ok && seen.centavos > 0;
+}
+
+/** One persisted payout, read back for replay comparison. */
+export interface PersistedPayout {
+  readonly uid: unknown;
+  readonly amount: unknown;
+}
+
+/**
+ * Whether an already-persisted settlement matches the one just computed.
+ *
+ * The single-winner path compares `result.prize === tx.amount`, a 1:1 equality
+ * that has no meaning once a settlement is N rows. The equivalent question here
+ * is whether the SAME players are owed the SAME amounts — order-independent,
+ * because the stored array's order is an implementation detail.
+ *
+ * A replay that disagrees is a divergence, never an equivalent: it means the
+ * caller reported different kills for a tournament that is already settled.
+ */
+export function payoutsMatchPersisted(
+  persisted: readonly PersistedPayout[],
+  computed: readonly Payout[],
+  toCentavos: (reais: unknown) => number | null
+): boolean {
+  if (persisted.length !== computed.length) return false;
+
+  const expected = new Map<string, number>();
+  for (const p of computed) expected.set(p.uid, p.totalCentavos);
+
+  for (const row of persisted) {
+    if (typeof row.uid !== "string") return false;
+    const want = expected.get(row.uid);
+    if (want === undefined) return false;
+    const got = toCentavos(row.amount);
+    if (got === null || got !== want) return false;
+    expected.delete(row.uid);
+  }
+
+  return expected.size === 0;
+}

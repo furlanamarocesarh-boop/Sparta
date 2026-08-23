@@ -39,6 +39,7 @@ import {
   addCentavos,
   centavosToReais,
   inspectReais,
+  MAX_BALANCE_CENTAVOS,
   storedReaisToCentavos,
   subtractCentavos,
   toCentavos,
@@ -166,6 +167,17 @@ import {
   isValidPublicId,
   projectPublicPreview,
 } from "./domain/publicTournamentPreview.js";
+import {
+  assertPayoutDecision,
+  decidePayouts,
+  hasKillPrize,
+  killPrizeCategoryFor,
+  payoutTransactionId,
+  payoutsMatchPersisted,
+  poolFromRegistrations,
+  type KillReport,
+  type PersistedPayout,
+} from "./domain/killPrize.js";
 import {
   attributionExpiresAt,
   commissionAccrualId,
@@ -921,6 +933,23 @@ export const declareTournamentResultHandler = async (
       }
 
       const tournamentData = tournamentSnap.data() ?? {};
+
+      /**
+       * A per-kill tournament belongs to the other handler and is refused here.
+       *
+       * Without this the single-winner path would settle it happily: it would
+       * pay the placement prize, IGNORE every kill, and mark the tournament
+       * completed — leaving the per-kill payouts permanently unpayable, because
+       * the settlement gate refuses a second attempt. The two handlers are
+       * mutually exclusive by the tournament's own configuration, so an
+       * operator never has a choice to get wrong.
+       */
+      if (hasKillPrize(tournamentData)) {
+        throw new DomainError(
+          "failed-precondition",
+          "Este torneio paga por abate. Declare o resultado informando os abates."
+        );
+      }
 
       // The prize's economy comes EXCLUSIVELY from the stored tournament
       // (economy_type + durable lock), resolved BEFORE anything can move.
@@ -3962,4 +3991,311 @@ export const getPartnerEarnings = central.https.onCall(
       throw toHttpsError(error);
     }
   }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-kill settlement
+//
+// A SEPARATE callable, not a rewrite of declareTournamentResult. That handler
+// is ~300 lines with two economy branches and per-economy replay logic, and it
+// pays every tournament that already works. Rewriting it to add a format would
+// put the working ones at risk to serve the new one; a second path puts the
+// risk entirely on the new format. The tournament decides which applies, and
+// each handler refuses the other's tournaments, so there is never a choice.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const DECLARE_WITH_KILLS_KEYS = ["tournamentid", "winneruid", "kills"] as const;
+
+/** Reads a caller-supplied kill list into the domain shape, or refuses. */
+function normalizeKillReports(raw: unknown): KillReport[] {
+  if (!Array.isArray(raw)) {
+    throw new DomainError(
+      "invalid-argument",
+      "A lista de abates é obrigatória."
+    );
+  }
+  return raw.map((row) => {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw new DomainError("invalid-argument", "Item de abate inválido.");
+    }
+    const item = row as Record<string, unknown>;
+    const extra = Object.keys(item).filter(
+      (k) => k !== "uid" && k !== "kills"
+    );
+    if (extra.length > 0) {
+      // Same posture as assertExactPayload: an unexpected key is a rejection,
+      // never something the server quietly ignores.
+      throw new DomainError("invalid-argument", "Item de abate inválido.");
+    }
+    return {
+      uid: normalizeWinnerUid(item.uid),
+      kills: typeof item.kills === "number" ? item.kills : Number.NaN,
+    };
+  });
+}
+
+/**
+ * Settles a tournament that pays per kill.
+ *
+ * NOTHING MOVES UNLESS EVERYTHING FITS. The payout total is compared against
+ * what the registrations actually collected, and a total above the pool refuses
+ * the whole declaration — no player is paid, the tournament stays in progress,
+ * and the operator sees the refusal immediately. That is almost always a typo.
+ *
+ * ONE ROW PER PLAYER, CREATED NOT SET. Each payout writes
+ * `transactions/prize_{tid}_{uid}` with `create`, so a retry after a partial
+ * failure cannot pay anybody twice: the rows already written make the retry
+ * fail before it can duplicate a credit. The single-winner path uses `set` on a
+ * shared id, which would silently erase an earlier payment.
+ */
+export const declareTournamentResultWithKillsHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    assertAdmin(
+      context,
+      "Você precisa estar logado para declarar o resultado.",
+      "Apenas admin pode declarar o resultado."
+    );
+    assertExactPayload(data, DECLARE_WITH_KILLS_KEYS);
+
+    const tournamentid = normalizeTournamentId(data.tournamentid);
+    const winneruid = normalizeWinnerUid(data.winneruid);
+    const reports = normalizeKillReports(data.kills);
+
+    const tournamentRef = db.collection("tournaments").doc(tournamentid);
+
+    await db.runTransaction(async (transaction) => {
+      // ── Every read first: Firestore requires it, and it also means the
+      // decision below sees one consistent snapshot.
+      const tournamentSnap = await transaction.get(tournamentRef);
+      if (!tournamentSnap.exists) {
+        throw new DomainError("not-found", "Torneio não encontrado.");
+      }
+      const tournamentData = tournamentSnap.data() ?? {};
+
+      if (!hasKillPrize(tournamentData)) {
+        throw new DomainError(
+          "failed-precondition",
+          "Este torneio não paga por abate. Use a declaração de resultado comum."
+        );
+      }
+
+      const economy = resolveTournamentEconomy(tournamentData);
+      const isBeta = economy === ECONOMY_BETA_CREDIT;
+
+      const status = String(tournamentData.status || "")
+        .trim()
+        .toLowerCase();
+      const resultExists =
+        tournamentData.result !== undefined && tournamentData.result !== null;
+
+      const registrationsSnap = await transaction.get(
+        db
+          .collection("registrations")
+          .where("tournament_ref", "==", tournamentRef)
+      );
+
+      const pool = poolFromRegistrations(
+        registrationsSnap.docs.map((d) => ({
+          status: d.get("status"),
+          entryFeeSnapshot: d.get("entry_fee_snapshot"),
+        }))
+      );
+      if (!pool.ok) {
+        throw new DomainError(
+          "failed-precondition",
+          "Não foi possível apurar o total arrecadado deste torneio."
+        );
+      }
+
+      const placement = inspectReais(tournamentData.prize ?? 0, {
+        allowZero: true,
+        maxCentavos: MAX_BALANCE_CENTAVOS,
+      });
+      const killPrize = inspectReais(tournamentData.kill_prize, {
+        allowZero: false,
+        maxCentavos: MAX_BALANCE_CENTAVOS,
+      });
+      if (!placement.ok || !killPrize.ok) {
+        throw new DomainError(
+          "failed-precondition",
+          "A premiação configurada no torneio é inválida."
+        );
+      }
+
+      const decision = decidePayouts({
+        winnerUid: winneruid,
+        placementCentavos: placement.centavos,
+        killPrizeCentavos: killPrize.centavos,
+        reports,
+        poolCentavos: pool.centavos,
+      });
+      assertPayoutDecision(decision);
+      if (!decision.ok) return; // unreachable; narrows for TypeScript
+
+      // ── Idempotent replay ──────────────────────────────────────────────
+      if (status === "completed") {
+        const stored = resultExists
+          ? (tournamentData.result as Record<string, unknown>)
+          : null;
+        const rows = Array.isArray(stored?.payouts)
+          ? (stored?.payouts as PersistedPayout[])
+          : [];
+        const matches = payoutsMatchPersisted(rows, decision.payouts, (r) => {
+          const seen = inspectReais(r, {
+            allowZero: true,
+            maxCentavos: MAX_BALANCE_CENTAVOS,
+          });
+          return seen.ok ? seen.centavos : null;
+        });
+        if (!matches) {
+          throw new DomainError(
+            "failed-precondition",
+            "O resultado já declarado diverge do informado agora."
+          );
+        }
+        return; // identical replay: nothing is rewritten, no timestamp moves
+      }
+
+      if (status !== "in_progress") {
+        throw new DomainError(
+          "failed-precondition",
+          "O torneio precisa estar em andamento para declarar o resultado."
+        );
+      }
+      if (resultExists) {
+        throw new DomainError(
+          "failed-precondition",
+          "Estado de liquidação inconsistente para este torneio."
+        );
+      }
+
+      // Wallets are read BEFORE any write, in payout order.
+      const walletRefs = decision.payouts.map((p) =>
+        db.collection("wallets").doc(p.uid)
+      );
+      const walletSnaps = await Promise.all(
+        walletRefs.map((ref) => transaction.get(ref))
+      );
+
+      const stampedAt = FieldValue.serverTimestamp();
+      const persisted: Record<string, unknown>[] = [];
+
+      decision.payouts.forEach((payout, i) => {
+        const walletSnap = walletSnaps[i];
+        if (!walletSnap.exists) {
+          throw new DomainError(
+            "failed-precondition",
+            "Carteira de um dos premiados não foi encontrada."
+          );
+        }
+        const walletData = walletSnap.data() ?? {};
+        const userRef = db.collection("users").doc(payout.uid);
+        const txRef = db
+          .collection("transactions")
+          .doc(payoutTransactionId(tournamentid, payout.uid));
+        const amountReais = centavosToReais(payout.totalCentavos);
+
+        if (isBeta) {
+          const previousBeta = storedReaisToCentavos(
+            walletData.beta_balance ?? 0,
+            "saldo beta"
+          );
+          const betaAfter = credit(previousBeta, payout.totalCentavos);
+
+          transaction.update(walletRefs[i], {
+            beta_balance: centavosToReais(betaAfter),
+          });
+          // create(), never set(): a retry after a partial failure must fail
+          // here rather than credit the same player a second time.
+          transaction.create(txRef, {
+            amount: amountReais,
+            category: killPrizeCategoryFor(economy),
+            economy_type: ECONOMY_BETA_CREDIT,
+            user_ref: userRef,
+            display_name: "",
+            tournament_ref: tournamentRef,
+            beta_previous_balance: centavosToReais(previousBeta),
+            beta_balance_after: centavosToReais(betaAfter),
+            kills: payout.kills,
+            timestamp: stampedAt,
+            status: "completed",
+            external_id: payoutTransactionId(tournamentid, payout.uid),
+          });
+        } else {
+          const previousBalance = storedReaisToCentavos(
+            walletData.balance ?? 0,
+            "saldo da carteira"
+          );
+          const previousTotalWon = storedReaisToCentavos(
+            walletData.total_won ?? 0,
+            "total ganho"
+          );
+          const balanceAfter = credit(previousBalance, payout.totalCentavos);
+          const totalWonAfter = addCentavos(
+            previousTotalWon,
+            payout.totalCentavos
+          );
+
+          transaction.update(walletRefs[i], {
+            balance: centavosToReais(balanceAfter),
+            total_won: centavosToReais(totalWonAfter),
+            updated_at: stampedAt,
+          });
+          transaction.create(txRef, {
+            amount: amountReais,
+            category: killPrizeCategoryFor(economy),
+            user_ref: userRef,
+            display_name: "",
+            tournament_ref: tournamentRef,
+            previous_balance: centavosToReais(previousBalance),
+            balance_after: centavosToReais(balanceAfter),
+            kills: payout.kills,
+            timestamp: stampedAt,
+            status: "completed",
+            external_id: payoutTransactionId(tournamentid, payout.uid),
+          });
+        }
+
+        persisted.push({
+          uid: payout.uid,
+          user_ref: userRef,
+          kills: payout.kills,
+          kill_amount: centavosToReais(payout.killCentavos),
+          placement_amount: centavosToReais(payout.placementCentavos),
+          amount: amountReais,
+          transaction_ref: txRef,
+        });
+      });
+
+      transaction.update(tournamentRef, {
+        status: "completed",
+        result: {
+          mode: "per_kill",
+          winner_uid: winneruid,
+          winner_ref: db.collection("users").doc(winneruid),
+          economy_type: economy,
+          kill_prize: centavosToReais(killPrize.centavos),
+          placement_prize: centavosToReais(placement.centavos),
+          pool: centavosToReais(decision.poolCentavos),
+          total_paid: centavosToReais(decision.totalCentavos),
+          payouts: persisted,
+          declared_at: stampedAt,
+          paid_at: stampedAt,
+        },
+        updated_at: stampedAt,
+      });
+    });
+
+    return { success: true };
+  } catch (error) {
+    console.error("declareTournamentResultWithKills error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const declareTournamentResultWithKills = central.https.onCall(
+  declareTournamentResultWithKillsHandler
 );

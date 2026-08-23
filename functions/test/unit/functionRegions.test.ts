@@ -100,6 +100,7 @@ const AUTHORIZED_FUNCTIONS: Readonly<Record<string, string>> = {
   onEntryFeeTransactionCreated: CENTRAL,
   createPartner: CENTRAL,
   getPartnerEarnings: CENTRAL,
+  declareTournamentResultWithKills: CENTRAL,
 };
 
 /**

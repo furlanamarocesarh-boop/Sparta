@@ -277,8 +277,17 @@ describe("isolamento estrutural do beta_balance", () => {
   });
 
   it("grantBetaCredit nunca escreve os cinco campos cash da carteira", () => {
+    // A fatia termina no PRÓXIMO export, não no fim do arquivo. Antes ia até o
+    // fim, o que só funcionava enquanto este handler fosse o último: qualquer
+    // handler acrescentado depois entrava na fatia e fazia este teste acusar
+    // grantBetaCredit por código que não é dele. A asserção não mudou — só a
+    // fronteira, que agora é de fato o handler.
+    const start = INDEX_SOURCE.indexOf("export const grantBetaCreditHandler");
+    assert.ok(start >= 0, "grantBetaCreditHandler must exist");
+    const after = INDEX_SOURCE.indexOf("\nexport const ", start + 1);
     const block = INDEX_SOURCE.slice(
-      INDEX_SOURCE.indexOf("export const grantBetaCreditHandler")
+      start,
+      after === -1 ? undefined : after
     );
     assert.ok(block.length > 0, "grantBetaCreditHandler must exist");
     // O update da carteira é exatamente { beta_balance: ... } e nenhum outro
