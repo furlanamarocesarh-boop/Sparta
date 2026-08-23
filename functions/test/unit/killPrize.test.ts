@@ -40,6 +40,10 @@ function base(overrides: Partial<PayoutInput> = {}): PayoutInput {
       { uid: "uid-c", kills: 0 },
     ],
     poolCentavos: 10_000,
+    // The default fixture makes every reported player a confirmed registrant,
+    // so the tests below exercise the ARITHMETIC. Eligibility gets its own
+    // group — it is a separate rule and deserves separate failures.
+    eligibleUids: new Set(["uid-a", "uid-b", "uid-c"]),
     ...overrides,
   };
 }
@@ -426,30 +430,219 @@ describe("abate nas allowlists fechadas", () => {
   });
 });
 
+describe("só recebe quem pagou", () => {
+  /**
+   * THE RULE THIS GROUP EXISTS FOR.
+   *
+   * The single-winner path validates the winner's registration and its economy
+   * before crediting anybody. The per-kill path pays MANY players from a list
+   * the operator types by hand, so the same question has to be asked about all
+   * of them. Without it the pool ceiling is the only guard, and a ceiling
+   * cannot tell a typo from a teammate: an unregistered uid that fits under the
+   * pool would simply be paid, and every number would look correct afterwards.
+   */
+
+  it("recusa TUDO quando um informado não está inscrito", () => {
+    const decision = decidePayouts(
+      base({
+        reports: [
+          { uid: "uid-a", kills: 8 },
+          { uid: "estranho", kills: 5 },
+        ],
+      })
+    );
+    assert.equal(decision.ok, false);
+    assert.equal(
+      (decision as { reason: string }).reason,
+      "payee-not-registered"
+    );
+  });
+
+  it("um estranho com ZERO abates também recusa", () => {
+    // Ele não receberia nada, então seria tentador ignorá-lo. Mas o relato é
+    // uma afirmação sobre quem jogou: pegar o erro aqui é pegá-lo uma edição
+    // antes de ele virar dinheiro.
+    const decision = decidePayouts(
+      base({
+        reports: [
+          { uid: "uid-a", kills: 8 },
+          { uid: "estranho", kills: 0 },
+        ],
+      })
+    );
+    assert.equal(decision.ok, false);
+    assert.equal(
+      (decision as { reason: string }).reason,
+      "payee-not-registered"
+    );
+  });
+
+  it("a identidade é checada ANTES do dinheiro", () => {
+    // Um estranho cujo pagamento caberia no pool: se a ordem fosse a inversa,
+    // a decisão passaria e o teto reportaria tudo em ordem.
+    const decision = decidePayouts(
+      base({
+        placementCentavos: 0,
+        reports: [{ uid: "estranho", kills: 1 }],
+        poolCentavos: 1_000_000,
+      })
+    );
+    assert.equal(decision.ok, false);
+    assert.equal(
+      (decision as { reason: string }).reason,
+      "payee-not-registered"
+    );
+  });
+
+  it("o vencedor também precisa estar inscrito", () => {
+    const decision = decidePayouts(
+      base({
+        winnerUid: "estranho",
+        reports: [{ uid: "estranho", kills: 0 }],
+      })
+    );
+    assert.equal(decision.ok, false);
+    assert.equal(
+      (decision as { reason: string }).reason,
+      "payee-not-registered"
+    );
+  });
+
+  it("com todos inscritos, paga normalmente", () => {
+    const decision = decidePayouts(base());
+    assert.equal(decision.ok, true);
+  });
+
+  it("a recusa diz o que conferir", () => {
+    const message = payoutRefusalMessage("payee-not-registered");
+    assert.match(message, /inscrição confirmada/i);
+    assert.match(message, /confira os jogadores/i);
+  });
+});
+
+describe("quem financia o pool é exatamente quem pode receber", () => {
+  /**
+   * The invariant stated directly: the set that funds and the set that may be
+   * paid come out of ONE pass, so they cannot drift apart.
+   */
+
+  it("reembolsado não financia NEM recebe", () => {
+    const pool = poolFromRegistrations(
+      [
+        { status: "registered", entryFeeSnapshot: 10, uid: "fica", economyType: "cash" },
+        { status: "refunded", entryFeeSnapshot: 10, uid: "saiu", economyType: "cash" },
+      ],
+      "cash"
+    );
+    assert.equal(pool.ok, true);
+    if (!pool.ok) return;
+    assert.equal(pool.centavos, 1_000);
+    assert.equal(pool.eligibleUids.has("saiu"), false);
+
+    const decision = decidePayouts({
+      winnerUid: "fica",
+      placementCentavos: 0,
+      killPrizeCentavos: 100,
+      reports: [{ uid: "saiu", kills: 1 }],
+      poolCentavos: pool.centavos,
+      eligibleUids: pool.eligibleUids,
+    });
+    assert.equal(decision.ok, false);
+  });
+
+  it("inscrição de OUTRA economia não financia nem habilita", () => {
+    // Um torneio em dinheiro não pode ser financiado por uma inscrição beta,
+    // nem pagar quem entrou por ela — as duas economias nunca se misturam.
+    const pool = poolFromRegistrations(
+      [
+        { status: "registered", entryFeeSnapshot: 10, uid: "cash", economyType: "cash" },
+        { status: "registered", entryFeeSnapshot: 10, uid: "beta", economyType: "beta_credit" },
+      ],
+      "cash"
+    );
+    assert.equal(pool.ok, true);
+    if (!pool.ok) return;
+    assert.equal(pool.centavos, 1_000, "a inscrição beta financiou um pool cash");
+    assert.deepEqual(pool.eligibleUids, new Set(["cash"]));
+  });
+
+  it("inscrição legada (sem proveniência) vale no caminho cash", () => {
+    // Mesma regra de checkRegistrationEconomy para o vencedor: ausente é legado
+    // e só o caminho em dinheiro aceita.
+    const cash = poolFromRegistrations(
+      [{ status: "registered", entryFeeSnapshot: 10, uid: "legado", economyType: undefined }],
+      "cash"
+    );
+    assert.equal(cash.ok, true);
+    if (cash.ok) assert.deepEqual(cash.eligibleUids, new Set(["legado"]));
+
+    const beta = poolFromRegistrations(
+      [{ status: "registered", entryFeeSnapshot: 10, uid: "legado", economyType: undefined }],
+      "beta_credit"
+    );
+    assert.equal(beta.ok, true);
+    if (beta.ok) {
+      assert.equal(beta.centavos, 0);
+      assert.deepEqual(beta.eligibleUids, new Set());
+    }
+  });
+
+  it("inscrição sem uid financia, mas não habilita ninguém", () => {
+    // Descartar o valor subestimaria o teto; confiar na identidade seria
+    // inventá-la. Financia e não habilita.
+    const pool = poolFromRegistrations(
+      [{ status: "registered", entryFeeSnapshot: 10, uid: null, economyType: "cash" }],
+      "cash"
+    );
+    assert.equal(pool.ok, true);
+    if (!pool.ok) return;
+    assert.equal(pool.centavos, 1_000);
+    assert.deepEqual(pool.eligibleUids, new Set());
+  });
+});
+
 describe("pool arrecadado", () => {
   it("soma o que cada inscrição realmente pagou", () => {
-    const r = poolFromRegistrations([
-      { status: "registered", entryFeeSnapshot: 10 },
-      { status: "registered", entryFeeSnapshot: 10 },
-      { status: "registered", entryFeeSnapshot: 5.5 },
-    ]);
-    assert.deepEqual(r, { ok: true, centavos: 2_550, counted: 3 });
+    const r = poolFromRegistrations(
+      [
+        { status: "registered", entryFeeSnapshot: 10, uid: "a", economyType: "cash" },
+        { status: "registered", entryFeeSnapshot: 10, uid: "b", economyType: "cash" },
+        { status: "registered", entryFeeSnapshot: 5.5, uid: "c", economyType: "cash" },
+      ],
+      "cash"
+    );
+    assert.deepEqual(r, {
+      ok: true,
+      centavos: 2_550,
+      counted: 3,
+      eligibleUids: new Set(["a", "b", "c"]),
+    });
   });
 
   it("NÃO conta inscrição reembolsada", () => {
     // Contá-la deixaria uma inscrição cancelada financiar o abate de outro.
-    const r = poolFromRegistrations([
-      { status: "registered", entryFeeSnapshot: 10 },
-      { status: "refunded", entryFeeSnapshot: 10 },
-    ]);
-    assert.deepEqual(r, { ok: true, centavos: 1_000, counted: 1 });
+    const r = poolFromRegistrations(
+      [
+        { status: "registered", entryFeeSnapshot: 10, uid: "a", economyType: "cash" },
+        { status: "refunded", entryFeeSnapshot: 10, uid: "b", economyType: "cash" },
+      ],
+      "cash"
+    );
+    // E quem foi reembolsado também não pode RECEBER: saiu do torneio.
+    assert.deepEqual(r, {
+      ok: true,
+      centavos: 1_000,
+      counted: 1,
+      eligibleUids: new Set(["a"]),
+    });
   });
 
   it("pool vazio é zero, não erro", () => {
-    assert.deepEqual(poolFromRegistrations([]), {
+    assert.deepEqual(poolFromRegistrations([], "cash"), {
       ok: true,
       centavos: 0,
       counted: 0,
+      eligibleUids: new Set(),
     });
   });
 
@@ -457,9 +650,10 @@ describe("pool arrecadado", () => {
     // Tratar pool desconhecido como zero recusaria todo pagamento e pareceria
     // decisão de política, em vez do problema de dado que é.
     for (const bad of [undefined, null, "10", Number.NaN, -1]) {
-      const r = poolFromRegistrations([
-        { status: "registered", entryFeeSnapshot: bad },
-      ]);
+      const r = poolFromRegistrations(
+        [{ status: "registered", entryFeeSnapshot: bad, uid: "a", economyType: "cash" }],
+        "cash"
+      );
       assert.deepEqual(
         r,
         { ok: false, reason: "unusable-registration" },
@@ -469,9 +663,15 @@ describe("pool arrecadado", () => {
   });
 
   it("inscrição gratuita conta como zero, sem quebrar", () => {
-    const r = poolFromRegistrations([
-      { status: "registered", entryFeeSnapshot: 0 },
-    ]);
-    assert.deepEqual(r, { ok: true, centavos: 0, counted: 1 });
+    const r = poolFromRegistrations(
+      [{ status: "registered", entryFeeSnapshot: 0, uid: "a", economyType: "cash" }],
+      "cash"
+    );
+    assert.deepEqual(r, {
+      ok: true,
+      centavos: 0,
+      counted: 1,
+      eligibleUids: new Set(["a"]),
+    });
   });
 });

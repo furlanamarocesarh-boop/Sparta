@@ -41,6 +41,12 @@ deploy() {
 # ── Ranking e estatísticas primeiro: passam a entender as categorias de abate.
 #    Se ficassem para depois, o primeiro pagamento por abate seria ignorado
 #    silenciosamente pelo ranking.
+# ⚠ JANELA DE ROLLBACK. Este gatilho relaxa a validação de winsCount de `< 1`
+#   para `< 0`, porque uma entry só de abates tem zero vitórias legitimamente.
+#   A partir do PRIMEIRO pagamento por abate declarado, reverter este gatilho
+#   passa a classificar essa entry como corrompida e a lançar em todo prêmio
+#   seguinte daquele jogador na temporada. A janela de rollback fecha na
+#   primeira declaração por abate, não no fim do deploy.
 deploy functions:onPrizeTransactionCreated "ranking entende kill_prize/beta_kill_prize"
 deploy functions:getPlayerEngagementStats  "estatísticas idem"
 
@@ -48,6 +54,14 @@ deploy functions:getPlayerEngagementStats  "estatísticas idem"
 #    os torneios que pertencem a ela.
 deploy functions:declareTournamentResultWithKills "liquidação por abate"
 deploy functions:declareTournamentResult          "guarda: recusa torneio por abate"
+
+# `payprize` é ALIAS ESTRITO do mesmo declareTournamentResultHandler
+# (index.ts:1601). Deixá-lo obsoleto abriria uma porta sem a guarda: um admin
+# chamando payprize liquidaria um torneio por abate pelo caminho de vencedor
+# único, pagando só a colocação e IGNORANDO os abates. Pagamento errado, não
+# atraso. Tem que subir junto com o irmão, e antes da criação.
+deploy functions:payprize "alias do mesmo handler — precisa da mesma guarda"
+
 deploy functions:startTournament                  "aceita colocação zero quando abate paga"
 
 # ── SÓ AGORA um torneio por abate pode ser criado.
@@ -69,3 +83,11 @@ echo "════════════════════════�
 echo "Concluído. Confira o inventário:"
 echo "  npx firebase functions:list --project $PROJECT"
 echo "Esperado: 24 funções (19 antes + 5 novas)."
+echo
+echo "DEPOIS DO DEPLOY, ANTES DE CRIAR UM TORNEIO POR ABATE:"
+echo "  O build publicado na loja não conhece as categorias kill_prize e"
+echo "  beta_kill_prize, nem o formato de resultado por abate. Nele, um"
+echo "  torneio por abate mostra prêmio R\$ 0 e o pagamento aparece como"
+echo "  'Outro'. Em economia beta o build antigo chega a exibir o crédito"
+echo "  como R\$ real. Publique a atualização do app antes de rodar o"
+echo "  primeiro torneio por abate — sobretudo em Créditos Beta."

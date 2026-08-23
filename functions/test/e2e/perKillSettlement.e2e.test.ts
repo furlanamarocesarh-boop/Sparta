@@ -234,6 +234,61 @@ describe("E2E — liquidação por abate", () => {
     assert.equal(tournament.get("result"), undefined);
   });
 
+  it("NÃO paga quem não está inscrito — nem um centavo", async () => {
+    // A recusa mais importante desta suíte. O teto do pool não distingue um
+    // erro de digitação de um companheiro de equipe: um uid não inscrito cujo
+    // pagamento coubesse no arrecadado seria simplesmente pago, e todos os
+    // números pareceriam certos depois. Aqui o estranho tem CARTEIRA — a
+    // recusa não pode depender de ele não ter uma.
+    const STRANGER = "e2e-pk-stranger";
+    await db.collection("wallets").doc(STRANGER).set({
+      balance: 0,
+      total_deposited: 0,
+      total_won: 0,
+      total_spent: 0,
+      total_withdrawn: 0,
+      beta_balance: 0,
+    });
+
+    const FRESH = "e2e-perkill-stranger";
+    await seedTournament(FRESH, { placement: 0, killPrize: 1 });
+
+    await assert.rejects(
+      () =>
+        handler(
+          {
+            tournamentid: FRESH,
+            winneruid: PLAYERS[0],
+            kills: [
+              { uid: PLAYERS[0], kills: 2 },
+              { uid: STRANGER, kills: 3 },
+            ],
+          },
+          ADMIN_CONTEXT
+        ),
+      /inscrição confirmada/i
+    );
+
+    const [stranger, insider, tournament] = await Promise.all([
+      db.collection("wallets").doc(STRANGER).get(),
+      db.collection("wallets").doc(PLAYERS[0]).get(),
+      db.collection("tournaments").doc(FRESH).get(),
+    ]);
+    assert.equal(stranger.get("balance"), 0, "pagou um não inscrito");
+    // Falha INTEIRA: o inscrito legítimo da mesma declaração também não recebe.
+    assert.equal(insider.get("balance"), 0, "pagou parcialmente");
+    assert.equal(tournament.get("status"), "in_progress");
+    assert.equal(tournament.get("result"), undefined);
+
+    await Promise.all([
+      db.collection("wallets").doc(STRANGER).delete(),
+      db.collection("tournaments").doc(FRESH).delete(),
+      ...PLAYERS.map((uid) =>
+        db.collection("registrations").doc(`${uid}_${FRESH}`).delete()
+      ),
+    ]);
+  });
+
   it("o caminho de vencedor único RECUSA um torneio por abate", async () => {
     const mod = await import("../../src/index.js");
     const single = (

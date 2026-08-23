@@ -4037,6 +4037,19 @@ export const getPartnerEarnings = central.https.onCall(
 
 const DECLARE_WITH_KILLS_KEYS = ["tournamentid", "winneruid", "kills"] as const;
 
+/**
+ * The uid inside a `users/{uid}` reference path, or null when the path is not
+ * one. Null never becomes an eligible payee, so a registration whose
+ * `user_ref` is missing or malformed entitles nobody — it fails closed.
+ */
+function uidFromUserRefPath(path: string | null): string | null {
+  if (!path) return null;
+  const parts = path.split("/");
+  if (parts.length !== 2 || parts[0] !== "users") return null;
+  const uid = parts[1].trim();
+  return uid === "" ? null : uid;
+}
+
 /** Reads a caller-supplied kill list into the domain shape, or refuses. */
 function normalizeKillReports(raw: unknown): KillReport[] {
   if (!Array.isArray(raw)) {
@@ -4128,11 +4141,17 @@ export const declareTournamentResultWithKillsHandler = async (
           .where("tournament_ref", "==", tournamentRef)
       );
 
+      // The uid comes from the registration's OWN `user_ref`, never from the
+      // caller's payload — the caller is the party whose typo we are guarding
+      // against, so its list cannot also be the thing that authorizes payment.
       const pool = poolFromRegistrations(
         registrationsSnap.docs.map((d) => ({
           status: d.get("status"),
           entryFeeSnapshot: d.get("entry_fee_snapshot"),
-        }))
+          uid: uidFromUserRefPath(documentPath(d.get("user_ref"))),
+          economyType: d.get("economy_type"),
+        })),
+        economy
       );
       if (!pool.ok) {
         throw new DomainError(
@@ -4162,6 +4181,7 @@ export const declareTournamentResultWithKillsHandler = async (
         killPrizeCentavos: killPrize.centavos,
         reports,
         poolCentavos: pool.centavos,
+        eligibleUids: pool.eligibleUids,
       });
       assertPayoutDecision(decision);
       if (!decision.ok) return; // unreachable; narrows for TypeScript

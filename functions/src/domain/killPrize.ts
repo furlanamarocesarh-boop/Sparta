@@ -67,6 +67,7 @@ export interface Payout {
 }
 
 export type PayoutRefusal =
+  | "payee-not-registered"
   | "exceeds-pool"
   | "too-many-players"
   | "duplicate-player"
@@ -103,6 +104,20 @@ export interface PayoutInput {
    * could drift from it after refunds.
    */
   readonly poolCentavos: number;
+  /**
+   * The uids that MAY be paid: the confirmed registrations of THIS tournament,
+   * under THIS tournament's economy — the very rows that funded `poolCentavos`.
+   *
+   * REQUIRED, never optional. The single-winner path validates the winner's
+   * registration and its economy before crediting anyone; this path pays many
+   * players, so skipping the same question would make an operator typo credit a
+   * stranger. Making the field mandatory means a payout cannot be decided
+   * without stating who is entitled to one — the check cannot be forgotten at a
+   * call site, because there is no call site without it.
+   *
+   * The invariant, in one line: ONLY WHO PAID IN MAY BE PAID OUT.
+   */
+  readonly eligibleUids: ReadonlySet<string>;
 }
 
 /**
@@ -119,6 +134,7 @@ export function decidePayouts(input: PayoutInput): PayoutDecision {
     killPrizeCentavos,
     reports,
     poolCentavos,
+    eligibleUids,
   } = input;
 
   if (
@@ -145,6 +161,22 @@ export function decidePayouts(input: PayoutInput): PayoutDecision {
 
     if (!isWholeNonNegative(report.kills)) {
       return { ok: false, reason: "invalid-kills" };
+    }
+  }
+
+  /**
+   * WHO, before HOW MUCH. Every reported player must be a confirmed registrant
+   * of this tournament. Checked for EVERY row and not only the paid ones: a
+   * report is a claim about who played, and a stranger listed with zero kills
+   * is the same mistake as one listed with ten — caught one edit earlier.
+   *
+   * This runs before the arithmetic so the refusal names the real problem. An
+   * unregistered uid that happens to fit under the pool would otherwise be
+   * paid, and the pool ceiling would report everything as fine.
+   */
+  for (const report of reports) {
+    if (!eligibleUids.has(report.uid)) {
+      return { ok: false, reason: "payee-not-registered" };
     }
   }
 
@@ -201,6 +233,11 @@ export function decidePayouts(input: PayoutInput): PayoutDecision {
 /** Human-readable refusal, for the callable boundary. */
 export function payoutRefusalMessage(reason: PayoutRefusal): string {
   switch (reason) {
+    case "payee-not-registered":
+      return (
+        "Um dos jogadores informados não tem inscrição confirmada neste " +
+        "torneio. Confira os jogadores antes de declarar o resultado."
+      );
     case "exceeds-pool":
       return (
         "A premiação informada é maior do que o total arrecadado neste " +
@@ -299,10 +336,31 @@ export interface RegistrationForPool {
   readonly status: unknown;
   /** The server-authoritative amount this registration actually paid. */
   readonly entryFeeSnapshot: unknown;
+  /** Who paid it, from the registration's `user_ref` — never from the caller. */
+  readonly uid: unknown;
+  /**
+   * Which economy paid it. `undefined` means a legacy registration with no
+   * recorded provenance, which the cash path accepts and the beta path does
+   * not — the same rule `checkRegistrationEconomy` applies to the winner on the
+   * single-winner path, kept identical here on purpose.
+   */
+  readonly economyType: unknown;
 }
 
 export type PoolResult =
-  | { readonly ok: true; readonly centavos: number; readonly counted: number }
+  | {
+      readonly ok: true;
+      readonly centavos: number;
+      readonly counted: number;
+      /**
+       * Exactly the uids whose entry fees are counted in `centavos`.
+       *
+       * Returned from the SAME pass that sums the pool so the two can never
+       * disagree. A separate eligibility query could drift from the funding
+       * set — and the whole invariant is that they are the same set.
+       */
+      readonly eligibleUids: ReadonlySet<string>;
+    }
   | { readonly ok: false; readonly reason: "unusable-registration" };
 
 /**
@@ -324,13 +382,23 @@ export type PoolResult =
  * data problem it is.
  */
 export function poolFromRegistrations(
-  rows: readonly RegistrationForPool[]
+  rows: readonly RegistrationForPool[],
+  tournamentEconomy: string
 ): PoolResult {
   let centavos = 0;
   let counted = 0;
+  const eligibleUids = new Set<string>();
 
   for (const row of rows) {
     if (row.status !== "registered") continue;
+
+    /**
+     * A registration paid in ANOTHER economy funds nothing here and entitles
+     * its holder to nothing. Skipping rather than refusing: a tournament whose
+     * economy was flipped can hold stale rows, and one of them must not make
+     * the whole settlement impossible — it simply does not participate.
+     */
+    if (!economyMatches(row.economyType, tournamentEconomy)) continue;
 
     const seen = inspectReais(row.entryFeeSnapshot, {
       allowZero: true,
@@ -340,11 +408,33 @@ export function poolFromRegistrations(
       return { ok: false, reason: "unusable-registration" };
     }
 
+    // A registration with no usable uid funds the pool but entitles nobody:
+    // dropping the amount would understate the ceiling, while trusting the
+    // row's identity would be inventing one.
+    if (typeof row.uid === "string" && row.uid.trim() !== "") {
+      eligibleUids.add(row.uid.trim());
+    }
+
     centavos += seen.centavos;
     counted += 1;
   }
 
-  return { ok: true, centavos, counted };
+  return { ok: true, centavos, counted, eligibleUids };
+}
+
+/**
+ * The registration/tournament economy rule, matching `checkRegistrationEconomy`
+ * exactly: an absent provenance is legacy and cash-only; anything else must be
+ * the tournament's own economy.
+ */
+function economyMatches(
+  registrationEconomy: unknown,
+  tournamentEconomy: string
+): boolean {
+  if (registrationEconomy === undefined || registrationEconomy === null) {
+    return tournamentEconomy === "cash";
+  }
+  return registrationEconomy === tournamentEconomy;
 }
 
 /** True when the tournament is configured to pay per kill. */
