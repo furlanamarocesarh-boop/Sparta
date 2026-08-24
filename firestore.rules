@@ -228,6 +228,24 @@ service cloud.firestore {
       allow create, update, delete: if false;
     }
 
+    // CANDIDATURAS A PARCEIRO.
+    //
+    // O DONO LÊ A PRÓPRIA. O documento tem o uid como id, então a pessoa
+    // acompanha o estado da sua candidatura sem conseguir listar as outras —
+    // seguidores e audiência dos concorrentes não são da conta de ninguém.
+    //
+    // Admin lê todas: é quem avalia.
+    //
+    // NINGUÉM ESCREVE direto, dono incluído. Um candidato que pudesse escrever
+    // aqui se aprovaria sozinho — `status` é o que `reviewPartnerApplication`
+    // transforma em parceiro de verdade.
+    match /partner_applications/{applicantUid} {
+      allow get: if signedIn() && request.auth.uid == applicantUid
+                 || isAdmin();
+      allow list: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
     // CAIXA DA PLATAFORMA — o saldo que banca premiação acima da arrecadação.
     //
     // Admin LÊ: o painel do criador mostra o saldo, e sem leitura o número

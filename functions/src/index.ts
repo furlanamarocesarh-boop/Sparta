@@ -180,6 +180,13 @@ import {
   type PersistedPayout,
 } from "./domain/killPrize.js";
 import {
+  canApplicantSubmit,
+  parsePartnerApplication,
+  submitRefusalMessage,
+  PARTNER_APPLICATIONS_COLLECTION,
+  type ApplicationStatus,
+} from "./domain/partnerApplication.js";
+import {
   decideHouseFunding,
   houseDocId,
   houseFundingMessage,
@@ -4016,6 +4023,184 @@ export const createPartner = central.https.onCall(async (data, context) => {
     throw toHttpsError(error);
   }
 });
+
+const APPLY_PARTNER_KEYS = [
+  "platform",
+  "handle",
+  "followers",
+  "average_views",
+  "expected_players",
+  "proposed_code",
+] as const;
+
+/**
+ * Applies to become a partner.
+ *
+ * ANY SIGNED-IN PLAYER, and the identity comes from the token — there is no
+ * uid in the payload, so an application can only ever be about the person
+ * sending it. That is also what fixes the flow it replaces: registering a
+ * partner meant an admin typing a Firebase UID nobody knows about themselves.
+ *
+ * ONE DOCUMENT PER ACCOUNT, keyed by uid. Resubmitting updates the same
+ * application instead of queueing duplicates, and an admin's list never shows
+ * the same person twice. A DECIDED application is not reopened from here.
+ *
+ * THIS WRITES NO MONEY AND GRANTS NOTHING. It records a request; only
+ * `reviewPartnerApplication` can turn one into a partner.
+ */
+export const applyForPartnerHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const auth = assertSignedIn(
+      context as any,
+      "Entre na sua conta para se candidatar."
+    );
+    assertExactPayload(data, APPLY_PARTNER_KEYS);
+
+    const application = parsePartnerApplication({
+      platform: data.platform,
+      handle: data.handle,
+      followers: data.followers,
+      averageViews: data.average_views,
+      expectedPlayers: data.expected_players,
+      proposedCode: data.proposed_code,
+    });
+
+    const ref = db.collection(PARTNER_APPLICATIONS_COLLECTION).doc(auth.uid);
+
+    await db.runTransaction(async (transaction) => {
+      const snap = await transaction.get(ref);
+      const current = snap.exists
+        ? ((snap.get("status") as ApplicationStatus) ?? null)
+        : null;
+
+      if (!canApplicantSubmit(current)) {
+        throw new DomainError(
+          "failed-precondition",
+          submitRefusalMessage(current as ApplicationStatus)
+        );
+      }
+
+      const stampedAt = FieldValue.serverTimestamp();
+      transaction.set(
+        ref,
+        {
+          uid: auth.uid,
+          platform: application.platform,
+          handle: application.handle,
+          followers: application.followers,
+          average_views: application.averageViews,
+          expected_players: application.expectedPlayers,
+          proposed_code: application.proposedCode,
+          status: "pending",
+          submitted_at: stampedAt,
+          updated_at: stampedAt,
+        },
+        { merge: true }
+      );
+    });
+
+    return { success: true, status: "pending" };
+  } catch (error) {
+    console.error("applyForPartner error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const applyForPartner = central.https.onCall(applyForPartnerHandler);
+
+const REVIEW_APPLICATION_KEYS = ["uid", "approve"] as const;
+
+/**
+ * ADMIN-ONLY: decides one application.
+ *
+ * APPROVING CREATES THE PARTNER, using the code the applicant asked for. The
+ * uniqueness of that code is enforced by the same `referral_codes` reservation
+ * that `createPartner` uses — two applicants wanting "gamer" cannot both get
+ * it, and the second approval fails loudly instead of silently overwriting the
+ * first partner's link.
+ *
+ * REJECTING KEEPS THE APPLICATION, marked. Deleting it would let the same
+ * person reapply immediately and would erase why the decision was made.
+ */
+export const reviewPartnerApplicationHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertAdmin(
+      context,
+      "Você precisa estar logado para avaliar candidaturas.",
+      "Apenas admin pode avaliar candidaturas."
+    );
+    assertExactPayload(data, REVIEW_APPLICATION_KEYS);
+
+    const uid = String(data.uid ?? "").trim();
+    if (!uid) {
+      throw new DomainError("invalid-argument", "Informe a candidatura.");
+    }
+    if (typeof data.approve !== "boolean") {
+      throw new DomainError(
+        "invalid-argument",
+        "A decisão precisa ser verdadeira ou falsa."
+      );
+    }
+    const approve = data.approve;
+
+    const applicationRef = db
+      .collection(PARTNER_APPLICATIONS_COLLECTION)
+      .doc(uid);
+    const snap = await applicationRef.get();
+    if (!snap.exists) {
+      throw new DomainError("not-found", "Candidatura não encontrada.");
+    }
+    const current = snap.get("status") as ApplicationStatus;
+    if (current !== "pending") {
+      throw new DomainError(
+        "failed-precondition",
+        "Esta candidatura já foi avaliada."
+      );
+    }
+
+    if (!approve) {
+      await applicationRef.update({
+        status: "rejected",
+        reviewed_at: FieldValue.serverTimestamp(),
+        reviewed_by: callerAuth.uid,
+      });
+      return { success: true, status: "rejected" };
+    }
+
+    // Reuses the registration path wholesale, so a partner born from an
+    // application is byte-identical to one an admin typed in — including the
+    // referral-code uniqueness guard.
+    const created = await createPartnerHandler(
+      {
+        name: String(snap.get("handle") ?? "").trim() || uid,
+        code: String(snap.get("proposed_code") ?? "").trim(),
+        ownerUid: uid,
+      },
+      context
+    );
+
+    await applicationRef.update({
+      status: "approved",
+      reviewed_at: FieldValue.serverTimestamp(),
+      reviewed_by: callerAuth.uid,
+    });
+
+    return { success: true, status: "approved", partner: created };
+  } catch (error) {
+    console.error("reviewPartnerApplication error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const reviewPartnerApplication = central.https.onCall(
+  reviewPartnerApplicationHandler
+);
 
 /** The exact payload of `setPartnerActive`. */
 const SET_PARTNER_ACTIVE_KEYS = ["partner_id", "active"] as const;
