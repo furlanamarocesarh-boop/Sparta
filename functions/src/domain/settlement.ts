@@ -400,3 +400,50 @@ export function decideCompletedReplay(input: {
 
   return { ok: true };
 }
+
+/**
+ * The scheduled start of a tournament, or null.
+ *
+ * WHY THIS EXISTS AT ALL. `starts_at` has been written as a literal `null` at
+ * creation since the field was introduced, and nothing anywhere updates it —
+ * so every tournament in production has no schedule, and any feature that
+ * reads one is dead code that looks alive. This is the first writer.
+ *
+ * ACCEPTS epoch milliseconds or an ISO-8601 string, because a Dart client
+ * sends one and a console or script sends the other, and refusing either would
+ * make the field awkward enough to go unused a second time.
+ *
+ * ABSENT IS VALID. A tournament with no announced time is the shape every
+ * existing one has, so omitting the field must keep behaving exactly as it did.
+ * A PRESENT but unreadable value is a refusal, never a silent null: an operator
+ * who typed a time and got no time deserves to hear about it.
+ */
+export function parseScheduledStart(raw: unknown): Date | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+
+  let date: Date | null = null;
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    date = new Date(raw);
+  } else if (typeof raw === "string") {
+    const parsed = Date.parse(raw.trim());
+    if (!Number.isNaN(parsed)) date = new Date(parsed);
+  }
+
+  if (date === null || Number.isNaN(date.getTime())) {
+    throw new DomainError(
+      "invalid-argument",
+      "A data de início do campeonato é inválida."
+    );
+  }
+
+  // A tournament announced for 1974 is a typo, not a schedule. The window is
+  // deliberately generous — this rejects nonsense, it does not police planning.
+  const year = date.getUTCFullYear();
+  if (year < 2020 || year > 2100) {
+    throw new DomainError(
+      "invalid-argument",
+      "A data de início do campeonato é inválida."
+    );
+  }
+  return date;
+}

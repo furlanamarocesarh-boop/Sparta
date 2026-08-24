@@ -76,6 +76,7 @@ import {
   gateStartStatus,
   normalizeTournamentId,
   normalizeWinnerUid,
+  parseScheduledStart,
   prizeTransactionId,
 } from "./domain/settlement.js";
 import {
@@ -1402,6 +1403,8 @@ export const createTournamentHandler = async (
       );
     }
 
+    const scheduledStart = parseScheduledStart(data.starts_at);
+
     const gameMode = String(data.game_mode || "")
       .trim()
       .toLowerCase()
@@ -1488,7 +1491,11 @@ export const createTournamentHandler = async (
       // read the other, and it keeps old clients and queries working.
       ...newTournamentParticipantFields(maxPlayers),
 
-      starts_at: null,
+      // The FIRST writer of this field. It has been a literal null since it
+      // was introduced, with nothing anywhere updating it — so every existing
+      // tournament has no schedule, and anything reading one was dead code.
+      // Absent stays null, which is exactly what every old client sends.
+      starts_at: scheduledStart === null ? null : Timestamp.fromDate(scheduledStart),
       created_at: FieldValue.serverTimestamp(),
       updated_at: FieldValue.serverTimestamp(),
     });
@@ -4033,7 +4040,12 @@ export const getPartnerEarningsHandler = async (
     context as any,
     "Entre na sua conta de parceiro."
   );
-  assertExactPayload(data, PARTNER_EARNINGS_KEYS);
+  // `data ?? {}`, like every other optional-payload read callable here. Its
+  // only key has a default, so `httpsCallable(...).call()` with no argument is
+  // a legitimate request — and the SDK sends `data: null` for it, which
+  // assertExactPayload rejects outright. Requiring an empty object to ask for
+  // the default page is a contract nobody would guess.
+  assertExactPayload(data ?? {}, PARTNER_EARNINGS_KEYS);
   const limit = normalizeRecentLimit((data as { limit?: unknown })?.limit);
 
   const owned = await db
