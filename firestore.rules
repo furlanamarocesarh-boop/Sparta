@@ -228,6 +228,23 @@ service cloud.firestore {
       allow create, update, delete: if false;
     }
 
+    // CAIXA DA PLATAFORMA — o saldo que banca premiação acima da arrecadação.
+    //
+    // Admin LÊ: o painel do criador mostra o saldo, e sem leitura o número
+    // teria de vir por uma callable só para contornar esta regra.
+    //
+    // NINGUÉM ESCREVE, admin incluído. O saldo só se move dentro da transação
+    // de liquidação ou por `fundHouse`, ambas via Admin SDK, que ignora as
+    // Rules. Um admin-cliente que pudesse escrever aqui poderia se dar caixa
+    // infinito e, com ele, premiação infinita — que é exatamente a trava que
+    // este documento existe para ser.
+    //
+    // Jogador não lê: quanto a casa tem não é da conta de quem joga.
+    match /house/{economy} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
     // Bloqueia qualquer collection não prevista.
     match /{document=**} {
       allow read, write: if false;
