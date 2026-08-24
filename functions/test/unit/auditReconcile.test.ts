@@ -66,6 +66,12 @@ describe("category → wallet field mapping (confirmed against index.ts)", () =>
       // que precisa distinguir vitória de valor recebido — a identidade
       // contábil da carteira não faz essa distinção.
       kill_prize: "total_won",
+      // Aporte no caixa da plataforma alimenta total_spent porque é
+      // exatamente isso: dinheiro que saiu do saldo do criador e não volta
+      // como prêmio para ele. Mapeá-lo aqui, em vez de criar um sexto campo,
+      // é o que mantém `balance = depositado + ganho - gasto - sacado`
+      // fechando sem migrar nenhuma carteira existente.
+      house_funding: "total_spent",
     });
   });
 });

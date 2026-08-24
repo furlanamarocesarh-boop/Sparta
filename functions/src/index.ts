@@ -4580,12 +4580,23 @@ export const fundHouseHandler = async (
       .collection("transactions")
       .doc(houseFundingTransactionId(depositId));
 
+    const walletRef = db.collection("wallets").doc(callerAuth.uid);
+    const userRef = db.collection("users").doc(callerAuth.uid);
+
     const outcome = await db.runTransaction(async (transaction) => {
-      const [fundingSnap, houseSnap] = await Promise.all([
+      const [fundingSnap, houseSnap, walletSnap] = await Promise.all([
         transaction.get(fundingRef),
         transaction.get(houseRef),
+        transaction.get(walletRef),
       ]);
       const houseBefore = readHouseBalance(houseSnap);
+
+      if (!walletSnap.exists) {
+        throw new DomainError(
+          "not-found",
+          "Sua carteira não foi encontrada."
+        );
+      }
 
       if (fundingSnap.exists) {
         const stored = fundingSnap.data() ?? {};
@@ -4610,7 +4621,54 @@ export const fundHouseHandler = async (
         throw new DomainError("invalid-argument", decision.message);
       }
 
+      /**
+       * THE MONEY COMES OUT OF THE CREATOR'S OWN WALLET.
+       *
+       * It used to be credited from nothing, which made the treasury a
+       * DECLARATION rather than a balance — a number that bounded payouts
+       * without anything standing behind it. Debiting the wallet makes the
+       * capital real: it existed, it moved, and both sides are in the ledger.
+       *
+       * A TRANSFER, NOT A DIRECT CHARGE AT SETTLEMENT. Letting settlement
+       * reach into the creator's wallet would race with everything else that
+       * wallet does — an entry fee or a withdrawal could spend the same money
+       * first, and the treasury would be counting funds that were already
+       * gone. Moving it once, here, means the treasury holds what it says.
+       */
+      const walletData = walletSnap.data() ?? {};
+      const isBeta = economy === ECONOMY_BETA_CREDIT;
+
+      const previous = storedReaisToCentavos(
+        isBeta ? walletData.beta_balance ?? 0 : walletData.balance ?? 0,
+        isBeta ? "saldo beta" : "saldo da carteira"
+      );
+      if (previous < amountCentavos) {
+        throw new DomainError(
+          "failed-precondition",
+          `Saldo insuficiente para o aporte. Você tem ` +
+            `${formatCentavos(previous, economy)}.`
+        );
+      }
+      const walletAfter = debit(previous, amountCentavos);
+
       const stampedAt = FieldValue.serverTimestamp();
+
+      if (isBeta) {
+        transaction.update(walletRef, {
+          beta_balance: centavosToReais(walletAfter),
+        });
+      } else {
+        // `total_spent` moves with the balance so the audit identity
+        // (balance = deposited + won - spent - withdrawn) keeps closing.
+        const previousSpent = storedReaisToCentavos(
+          walletData.total_spent ?? 0,
+          "total gasto"
+        );
+        transaction.update(walletRef, {
+          balance: centavosToReais(walletAfter),
+          total_spent: centavosToReais(previousSpent + amountCentavos),
+        });
+      }
 
       transaction.set(
         houseRef,
@@ -4623,16 +4681,20 @@ export const fundHouseHandler = async (
       );
       // create(), never set(): a retry that raced past the existence check
       // above must fail here rather than credit the treasury twice.
+      //
+      // CARRIES user_ref, unlike the settlement's margin row. This one moved a
+      // PLAYER's balance, so the wallet reconciler has to see it or the
+      // identity would not close.
       transaction.create(fundingRef, {
+        amount: centavosToReais(amountCentavos),
         amount_centavos: amountCentavos,
-        amount_unit: "centavos",
         balance_after_centavos: decision.houseAfterCentavos,
         category: houseFundingCategoryFor(economy),
         economy_type: economy,
         deposit_id: depositId,
         note,
         funded_by: callerAuth.uid,
-        // NO user_ref: the platform's row, never a player's.
+        user_ref: userRef,
         timestamp: stampedAt,
         status: "completed",
       });

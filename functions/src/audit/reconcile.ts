@@ -3,6 +3,10 @@ import {
   KILL_PRIZE_CATEGORY,
 } from "../domain/killPrize.js";
 import {
+  HOUSE_BETA_FUNDING_CATEGORY,
+  HOUSE_FUNDING_CATEGORY,
+} from "../domain/house.js";
+import {
   BETA_REFUND_CATEGORY,
   ENTRY_REFUND_CATEGORY,
 } from "../domain/cancellation.js";
@@ -61,6 +65,13 @@ export const MONEY_CATEGORIES = [
   // season ranking must NOT count a kill as a victory; the ledger identity
   // makes no such distinction.
   KILL_PRIZE_CATEGORY,
+  // Aporte no caixa da plataforma, saindo da carteira do próprio criador.
+  //
+  // MAPEADO PARA total_spent, e não para um campo novo, porque a identidade
+  // `balance = depositado + ganho - gasto - sacado` precisa continuar fechando
+  // sem migrar carteira nenhuma. Financiar o caixa É gastar: o dinheiro saiu
+  // do saldo do criador e não volta como prêmio para ele.
+  HOUSE_FUNDING_CATEGORY,
 ] as const;
 
 export type MoneyCategory = (typeof MONEY_CATEGORIES)[number];
@@ -72,6 +83,7 @@ export const CATEGORY_TO_FIELD: Readonly<Record<MoneyCategory, WalletField>> = {
   entry_fee: "total_spent",
   withdrawal: "total_withdrawn",
   [KILL_PRIZE_CATEGORY]: "total_won",
+  [HOUSE_FUNDING_CATEGORY]: "total_spent",
 };
 
 /** Categories that ADD to the balance. The other two subtract. */
@@ -91,6 +103,7 @@ const CREDIT_CATEGORIES: ReadonlySet<string> = new Set([
  * never fall back to cash: without its economy tag it is INVALID, never cash.
  */
 export const BETA_CATEGORIES = [
+  HOUSE_BETA_FUNDING_CATEGORY,
   BETA_GRANT_CATEGORY,
   BETA_ENTRY_FEE_CATEGORY,
   BETA_PRIZE_CATEGORY,
@@ -416,7 +429,12 @@ export function reconcileWallet(
     // balance instead of adding to it — an inverted sign that reconciles to a
     // plausible-looking wrong number.
     else if (category === BETA_KILL_PRIZE_CATEGORY) betaPrizes += amount.centavos;
-    else betaEntrySpend += amount.centavos;
+    // Aporte beta sai do saldo beta do criador: é saída, e cai no mesmo lado
+    // do gasto de inscrição. EXPLÍCITO, nunca pelo `else` — a lição que a
+    // categoria de abate já custou uma vez.
+    else if (category === HOUSE_BETA_FUNDING_CATEGORY) {
+      betaEntrySpend += amount.centavos;
+    } else betaEntrySpend += amount.centavos;
   }
 
   if (unknownCategory) {
