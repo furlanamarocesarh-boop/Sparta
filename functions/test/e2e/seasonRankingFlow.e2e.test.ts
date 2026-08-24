@@ -18,6 +18,7 @@ import {
 } from "../../src/domain/seasonRanking.js";
 import { assertEmulatorOnly } from "../support/emulatorGuard.js";
 import { fetchWithTimeout } from "../support/httpTimeout.js";
+import { seedHouse } from "../support/houseFunding.js";
 
 /**
  * FULL SEASON-RANKING CYCLE, end to end, for BOTH economies.
@@ -530,6 +531,11 @@ before(async () => {
   process.env.GCLOUD_PROJECT = PROJECT_ID;
   if (admin.apps.length === 0) admin.initializeApp();
   db = admin.firestore();
+
+    // O caixa precisa cobrir prêmios acima do arrecadado — a mesma coisa que
+    // o operador terá de fazer em produção antes de garantir premiação.
+    await seedHouse(db, "cash", 100_000_00);
+    await seedHouse(db, "beta_credit", 100_000_00);
 
   try {
     await fetchWithTimeout(`http://${FUNCTIONS_HOST}/`, {}, 10_000);

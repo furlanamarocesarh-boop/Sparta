@@ -5,6 +5,7 @@ import * as admin from "firebase-admin";
 
 import { assertEmulatorOnly } from "../support/emulatorGuard.js";
 import { fetchWithTimeout } from "../support/httpTimeout.js";
+import { seedHouse } from "../support/houseFunding.js";
 
 /**
  * END-TO-END result flow, run ENTIRELY against the local Firebase Emulator Suite
@@ -243,6 +244,11 @@ describe("E2E — tournament result flow (emulator, verified-token hybrid)", () 
     jointournamentRun = (data, context) => mod.jointournament.run(data, context);
 
     db = admin.firestore();
+
+    // O caixa precisa cobrir prêmios acima do arrecadado — a mesma coisa que
+    // o operador terá de fazer em produção antes de garantir premiação.
+    await seedHouse(db, "cash", 100_000_00);
+    await seedHouse(db, "beta_credit", 100_000_00);
 
     // Functions-emulator reachability (fail-closed).
     try {

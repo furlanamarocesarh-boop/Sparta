@@ -61,6 +61,23 @@ async function clearAll(): Promise<void> {
     const snap = await db.collection(col).get();
     await Promise.all(snap.docs.map((doc) => doc.ref.delete()));
   }
+
+  // O caixa da plataforma, reposto a cada teste.
+  //
+  // A liquidação passou a exigir que a plataforma consiga cobrir a premiação:
+  // um prêmio fixo acima do arrecadado sai do caixa, e o caixa começa vazio.
+  // Estas suítes premiam generosamente contra pools pequenos, então cada uma
+  // aporta antes — exatamente o que o operador terá de fazer em produção.
+  await Promise.all([
+    db
+      .collection("house")
+      .doc("cash")
+      .set({ balance_centavos: 100_000_00, economy_type: "cash" }),
+    db
+      .collection("house")
+      .doc("beta_credit")
+      .set({ balance_centavos: 100_000_00, economy_type: "beta_credit" }),
+  ]);
 }
 
 async function seedUser(uid: string): Promise<void> {

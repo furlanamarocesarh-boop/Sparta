@@ -5,6 +5,7 @@ import * as admin from "firebase-admin";
 
 import { KILL_PRIZE_CATEGORY } from "../../src/domain/killPrize.js";
 import { assertEmulatorOnly } from "../support/emulatorGuard.js";
+import { seedHouse } from "../support/houseFunding.js";
 
 /**
  * THE WHOLE PER-KILL SETTLEMENT, against a real Firestore.
@@ -86,6 +87,10 @@ async function cleanup(): Promise<void> {
       ])
     ),
     ...PLAYERS.map((uid) => db.collection("wallets").doc(uid).delete()),
+    ...ids.map((t) => db.collection("transactions").doc(`house_${t}`).delete()),
+    // O caixa é global: um resto de execução anterior financiaria um subsídio
+    // que este teste precisa ver ser RECUSADO.
+    db.collection("house").doc("cash").delete(),
   ]);
 }
 
@@ -152,6 +157,101 @@ describe("E2E — liquidação por abate", () => {
     assert.equal(a.get("amount"), 15);
     assert.equal(a.get("kills"), 5);
     assert.equal(b.get("amount"), 3);
+  });
+
+  it("o caixa fica com a margem: arrecadado menos pago", async () => {
+    // R$30 arrecadados, R$18 pagos -> R$12 de margem, em centavos inteiros.
+    const house = await db.collection("house").doc("cash").get();
+    assert.equal(house.exists, true, "a liquidação não criou o caixa");
+    assert.equal(house.get("balance_centavos"), 1_200);
+    assert.equal(house.get("economy_type"), "cash");
+
+    const row = await db.collection("transactions").doc(`house_${TID}`).get();
+    assert.equal(row.exists, true, "movimento de caixa sem linha de razão");
+    assert.equal(row.get("amount_centavos"), 1_200);
+    assert.equal(row.get("balance_after_centavos"), 1_200);
+    assert.equal(row.get("subsidised"), false);
+    // Sem user_ref: é linha da plataforma, invisível ao reconciliador.
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(row.data() ?? {}, "user_ref"),
+      false
+    );
+  });
+
+  it("com caixa, um prêmio ACIMA do arrecadado passa", async () => {
+    // O que a trava antiga proibia por completo.
+    //
+    // Jogador e torneio PRÓPRIOS: `seedTournament` zera carteiras, e reusar os
+    // jogadores compartilhados apagaria o saldo que os testes seguintes
+    // conferem — foi exatamente o que aconteceu na primeira versão deste teste.
+    const SUB_TID = "e2e-perkill-sub";
+    const SUB_UID = "e2e-pk-sub-player";
+    const tournamentRef = db.collection("tournaments").doc(SUB_TID);
+
+    await tournamentRef.set({
+      name: "E2E subsídio",
+      status: "in_progress",
+      economy_type: "cash",
+      locked_economy_type: "cash",
+      entry_fee: 10,
+      prize: 0,
+      kill_prize: 1,
+    });
+    await db.collection("wallets").doc(SUB_UID).set({
+      balance: 0,
+      total_deposited: 0,
+      total_won: 0,
+      total_spent: 0,
+      total_withdrawn: 0,
+      beta_balance: 0,
+    });
+    await db
+      .collection("registrations")
+      .doc(`${SUB_UID}_${SUB_TID}`)
+      .set({
+        status: "registered",
+        entry_fee_snapshot: 10,
+        economy_type: "cash",
+        user_ref: db.collection("users").doc(SUB_UID),
+        tournament_ref: tournamentRef,
+      });
+
+    // Pool de R$10; 25 abates x R$1 = R$25. São R$15 acima do arrecadado,
+    // cobertos pelos R$12 de margem do TID mais o que já houver — por isso o
+    // aporte explícito, que é o que o operador fará em produção.
+    await seedHouse(db, "cash", 5_000);
+
+    await handler(
+      {
+        tournamentid: SUB_TID,
+        winneruid: SUB_UID,
+        kills: [{ uid: SUB_UID, kills: 25 }],
+      },
+      ADMIN_CONTEXT
+    );
+
+    const [wallet, house] = await Promise.all([
+      db.collection("wallets").doc(SUB_UID).get(),
+      db.collection("house").doc("cash").get(),
+    ]);
+    assert.equal(wallet.get("balance"), 25, "não pagou o prêmio garantido");
+    // 5000 + (1000 arrecadado - 2500 pago) = 3500.
+    assert.equal(house.get("balance_centavos"), 3_500, "o caixa não bancou");
+
+    const row = await db
+      .collection("transactions")
+      .doc(`house_${SUB_TID}`)
+      .get();
+    assert.equal(row.get("subsidised"), true);
+    assert.equal(row.get("amount_centavos"), -1_500);
+
+    await Promise.all([
+      tournamentRef.delete(),
+      db.collection("wallets").doc(SUB_UID).delete(),
+      db.collection("registrations").doc(`${SUB_UID}_${SUB_TID}`).delete(),
+      db.collection("transactions").doc(`house_${SUB_TID}`).delete(),
+      db.collection("transactions").doc(`prize_${SUB_TID}_${SUB_UID}`).delete(),
+    ]);
   });
 
   it("o total pago respeita o arrecadado", async () => {
@@ -225,10 +325,12 @@ describe("E2E — liquidação por abate", () => {
     assert.equal(a.get("balance"), 15);
   });
 
-  it("estourar o pool recusa TUDO — nenhuma carteira se move", async () => {
+  it("estourar o CAIXA recusa TUDO — nenhuma carteira se move", async () => {
     await seedTournament(OVER_TID, { placement: 10, killPrize: 1 });
 
-    // 100 abates x R$1 + R$10 = R$110 contra um pool de R$30.
+    // 100 abates x R$1 + R$10 = R$110 contra um pool de R$30. Passar do pool
+    // é permitido agora; o que recusa é não haver caixa para cobrir a
+    // diferença — e o caixa desta liquidação começa vazio.
     await assert.rejects(
       () =>
         handler(
@@ -239,7 +341,7 @@ describe("E2E — liquidação por abate", () => {
           },
           ADMIN_CONTEXT
         ),
-      /maior do que o total arrecadado/i
+      /caixa da plataforma não cobre/i
     );
 
     const [wallet, tx, tournament] = await Promise.all([

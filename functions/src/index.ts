@@ -179,6 +179,17 @@ import {
   type PersistedPayout,
 } from "./domain/killPrize.js";
 import {
+  decideHouseFunding,
+  houseDocId,
+  houseFundingMessage,
+  houseMarginCategoryFor,
+  decideHouseDeposit,
+  houseFundingCategoryFor,
+  houseFundingTransactionId,
+  HOUSE_BALANCE_FIELD,
+  HOUSE_COLLECTION,
+} from "./domain/house.js";
+import {
   attributionExpiresAt,
   commissionAccrualId,
   COMMISSION_ACCRUED_CATEGORY,
@@ -1075,6 +1086,41 @@ export const declareTournamentResultHandler = async (
         throw new DomainError("failed-precondition", registration.message);
       }
 
+      // ── SOLVENCY, on this path too.
+      //
+      // This handler had NO ceiling at all: a fixed prize was paid however few
+      // players joined, so an underfilled tournament quietly paid out more than
+      // it collected with nothing to stop it. Binding only the per-kill path
+      // would have left this format as the bypass — an operator wanting to
+      // overpay had merely to choose the other one.
+      //
+      // Reads first, as Firestore requires and as the decision needs.
+      const settlementRegistrations = await transaction.get(
+        db.collection("registrations").where("tournament_ref", "==", tournamentRef)
+      );
+      const settlementPool = poolFromRegistrations(
+        settlementRegistrations.docs.map((d) => ({
+          status: d.get("status"),
+          entryFeeSnapshot: d.get("entry_fee_snapshot"),
+          uid: uidFromUserRefPath(documentPath(d.get("user_ref"))),
+          economyType: d.get("economy_type"),
+          tournamentEntryFee: tournamentData.entry_fee,
+        })),
+        economy
+      );
+      if (!settlementPool.ok) {
+        throw new DomainError(
+          "failed-precondition",
+          "Não foi possível apurar o total arrecadado deste torneio."
+        );
+      }
+
+      const settlementHouseRef = db
+        .collection(HOUSE_COLLECTION)
+        .doc(houseDocId(economy));
+      const settlementHouseSnap = await transaction.get(settlementHouseRef);
+      const settlementHouseBefore = readHouseBalance(settlementHouseSnap);
+
       // The winner's registration must have been paid under the SAME economy
       // the tournament settles in. A legacy (provenance-less) registration is
       // accepted only on the cash path; a beta tournament with a cash or
@@ -1105,6 +1151,22 @@ export const declareTournamentResultHandler = async (
       }
       const prizeCentavos = prize.centavos;
 
+      // Decided here, where the prize is finally known, from the reads taken
+      // above. Refuses BEFORE any wallet, ledger or tournament write.
+      const settlementFunding = decideHouseFunding({
+        poolCentavos: settlementPool.centavos,
+        paidCentavos: prizeCentavos,
+        houseCentavos: settlementHouseBefore,
+      });
+      if (!settlementFunding.ok) {
+        throw new DomainError(
+          "failed-precondition",
+          houseFundingMessage(settlementFunding, (c) =>
+            formatCentavos(c, economy)
+          )
+        );
+      }
+
       const walletData = walletSnap.data() ?? {};
 
       const externalId = prizeTransactionId(tournamentid);
@@ -1112,6 +1174,35 @@ export const declareTournamentResultHandler = async (
       // ONE server-timestamp sentinel, reused so every stamp written in this
       // commit resolves to the exact same time.
       const stampedAt = FieldValue.serverTimestamp();
+
+      // ── The treasury moves once, outside the economy branch, because the
+      // decision above already resolved which economy's house it belongs to.
+      transaction.set(
+        settlementHouseRef,
+        {
+          [HOUSE_BALANCE_FIELD]: settlementFunding.houseAfterCentavos,
+          economy_type: economy,
+          updated_at: stampedAt,
+        },
+        { merge: true }
+      );
+      transaction.create(
+        db.collection("transactions").doc(`house_${tournamentid}`),
+        {
+          amount_centavos: settlementFunding.marginCentavos,
+          amount_unit: "centavos",
+          balance_after_centavos: settlementFunding.houseAfterCentavos,
+          category: houseMarginCategoryFor(economy),
+          economy_type: economy,
+          pool_centavos: settlementPool.centavos,
+          paid_centavos: prizeCentavos,
+          subsidised: settlementFunding.subsidised,
+          tournament_ref: tournamentRef,
+          // NO user_ref: the platform's row, invisible to the wallet reconciler.
+          timestamp: stampedAt,
+          status: "completed",
+        }
+      );
 
       if (economy === ECONOMY_BETA_CREDIT) {
         // ── BETA settlement: the prize is Beta Credits, credited EXCLUSIVELY
@@ -4050,6 +4141,36 @@ function uidFromUserRefPath(path: string | null): string | null {
   return uid === "" ? null : uid;
 }
 
+/**
+ * The treasury balance a house document holds, in integer centavos.
+ *
+ * An ABSENT document means an empty treasury, which is the correct reading for
+ * a platform that has never settled anything — and it means the house funds no
+ * subsidy until it has earned one. A PRESENT but unusable value is NOT read as
+ * zero: treating corruption as "empty" would silently forbid every guaranteed
+ * prize, which looks like a policy decision rather than the data fault it is.
+ */
+function readHouseBalance(snap: any): number {
+  if (!snap?.exists) return 0;
+  const raw = (snap.data() ?? {})[HOUSE_BALANCE_FIELD];
+  if (raw === undefined || raw === null) return 0;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0) {
+    throw new DomainError(
+      "failed-precondition",
+      "O caixa da plataforma está com valor inválido. Contate o suporte."
+    );
+  }
+  return raw;
+}
+
+/** An amount in the operator's own words, for a refusal message. */
+function formatCentavos(centavos: number, economy: string): string {
+  const value = (centavos / 100).toFixed(2).replace(".", ",");
+  return economy === ECONOMY_BETA_CREDIT
+    ? `${value} Créditos Beta`
+    : `R$ ${value}`;
+}
+
 /** Reads a caller-supplied kill list into the domain shape, or refuses. */
 function normalizeKillReports(raw: unknown): KillReport[] {
   if (!Array.isArray(raw)) {
@@ -4150,6 +4271,7 @@ export const declareTournamentResultWithKillsHandler = async (
           entryFeeSnapshot: d.get("entry_fee_snapshot"),
           uid: uidFromUserRefPath(documentPath(d.get("user_ref"))),
           economyType: d.get("economy_type"),
+          tournamentEntryFee: tournamentData.entry_fee,
         })),
         economy
       );
@@ -4220,6 +4342,27 @@ export const declareTournamentResultWithKillsHandler = async (
         throw new DomainError(
           "failed-precondition",
           "Estado de liquidação inconsistente para este torneio."
+        );
+      }
+
+      // ── SOLVENCY. The tournament may pay more than it collected; the
+      // PLATFORM may not pay more than it has. Read and decided before any
+      // wallet is touched, so an unaffordable prize refuses whole.
+      const houseRef = db
+        .collection(HOUSE_COLLECTION)
+        .doc(houseDocId(economy));
+      const houseSnap = await transaction.get(houseRef);
+      const houseBefore = readHouseBalance(houseSnap);
+
+      const funding = decideHouseFunding({
+        poolCentavos: pool.centavos,
+        paidCentavos: decision.totalCentavos,
+        houseCentavos: houseBefore,
+      });
+      if (!funding.ok) {
+        throw new DomainError(
+          "failed-precondition",
+          houseFundingMessage(funding, (c) => formatCentavos(c, economy))
         );
       }
 
@@ -4321,6 +4464,42 @@ export const declareTournamentResultWithKillsHandler = async (
         });
       });
 
+      // ── The treasury moves by exactly what this tournament kept or spent.
+      // `set` with merge, because the very first settlement of an economy is
+      // what brings its house document into existence.
+      transaction.set(
+        houseRef,
+        {
+          [HOUSE_BALANCE_FIELD]: funding.houseAfterCentavos,
+          economy_type: economy,
+          updated_at: stampedAt,
+        },
+        { merge: true }
+      );
+
+      // An audit row for every treasury movement, including the zero ones: a
+      // settlement that kept nothing is a fact worth being able to prove, and
+      // a gap in the sequence would otherwise be indistinguishable from a
+      // settlement that never wrote here at all.
+      transaction.create(
+        db.collection("transactions").doc(`house_${tournamentid}`),
+        {
+          amount_centavos: funding.marginCentavos,
+          amount_unit: "centavos",
+          balance_after_centavos: funding.houseAfterCentavos,
+          category: houseMarginCategoryFor(economy),
+          economy_type: economy,
+          pool_centavos: pool.centavos,
+          paid_centavos: decision.totalCentavos,
+          subsidised: funding.subsidised,
+          tournament_ref: tournamentRef,
+          // NO user_ref, on purpose: this is the platform's row, not a
+          // player's, and the wallet reconciler only reads rows that carry one.
+          timestamp: stampedAt,
+          status: "completed",
+        }
+      );
+
       transaction.update(tournamentRef, {
         status: "completed",
         result: {
@@ -4368,6 +4547,112 @@ export const declareTournamentResultWithKillsHandler = async (
     throw toHttpsError(error);
   }
 };
+
+/**
+ * ADMIN-ONLY: adds capital to a treasury.
+ *
+ * IDEMPOTENT BY `deposit_id`, the same discipline as `grantBetaCredit`: a retry
+ * after a timeout must not double the balance, and the caller controls the id
+ * so it can retry the SAME intended deposit safely. A replay with different
+ * numbers is a divergence and is refused rather than applied.
+ */
+export const fundHouseHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertAdmin(
+      context,
+      "Você precisa estar logado para aportar no caixa.",
+      "Apenas admin pode aportar no caixa."
+    );
+    assertExactPayload(data, ["economy", "amount", "deposit_id", "note"]);
+
+    const economy = parseRequestedEconomyType(data.economy);
+    const amountCentavos = toCentavos(data.amount, {
+      field: "valor do aporte",
+    });
+    const depositId = normalizeGrantId(data.deposit_id);
+    const note = normalizeReason(data.note);
+
+    const houseRef = db.collection(HOUSE_COLLECTION).doc(houseDocId(economy));
+    const fundingRef = db
+      .collection("transactions")
+      .doc(houseFundingTransactionId(depositId));
+
+    const outcome = await db.runTransaction(async (transaction) => {
+      const [fundingSnap, houseSnap] = await Promise.all([
+        transaction.get(fundingRef),
+        transaction.get(houseRef),
+      ]);
+      const houseBefore = readHouseBalance(houseSnap);
+
+      if (fundingSnap.exists) {
+        const stored = fundingSnap.data() ?? {};
+        // Same deposit, same numbers: success with NO second credit.
+        if (
+          stored.amount_centavos === amountCentavos &&
+          stored.economy_type === economy
+        ) {
+          return { idempotent: true, balanceCentavos: houseBefore };
+        }
+        throw new DomainError(
+          "failed-precondition",
+          "Já existe um aporte diferente com este identificador."
+        );
+      }
+
+      const decision = decideHouseDeposit({
+        amountCentavos,
+        houseCentavos: houseBefore,
+      });
+      if (!decision.ok) {
+        throw new DomainError("invalid-argument", decision.message);
+      }
+
+      const stampedAt = FieldValue.serverTimestamp();
+
+      transaction.set(
+        houseRef,
+        {
+          [HOUSE_BALANCE_FIELD]: decision.houseAfterCentavos,
+          economy_type: economy,
+          updated_at: stampedAt,
+        },
+        { merge: true }
+      );
+      // create(), never set(): a retry that raced past the existence check
+      // above must fail here rather than credit the treasury twice.
+      transaction.create(fundingRef, {
+        amount_centavos: amountCentavos,
+        amount_unit: "centavos",
+        balance_after_centavos: decision.houseAfterCentavos,
+        category: houseFundingCategoryFor(economy),
+        economy_type: economy,
+        deposit_id: depositId,
+        note,
+        funded_by: callerAuth.uid,
+        // NO user_ref: the platform's row, never a player's.
+        timestamp: stampedAt,
+        status: "completed",
+      });
+
+      return { idempotent: false, balanceCentavos: decision.houseAfterCentavos };
+    });
+
+    return {
+      success: true,
+      idempotent: outcome.idempotent,
+      balance_centavos: outcome.balanceCentavos,
+      economy,
+    };
+  } catch (error) {
+    console.error("fundHouse error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const fundHouse = central.https.onCall(fundHouseHandler);
 
 export const declareTournamentResultWithKills = central.https.onCall(
   declareTournamentResultWithKillsHandler

@@ -6,6 +6,7 @@ import * as admin from "firebase-admin";
 
 import { assertEmulatorOnly } from "../support/emulatorGuard.js";
 import { fetchWithTimeout } from "../support/httpTimeout.js";
+import { seedHouse } from "../support/houseFunding.js";
 import {
   reconcileWallet,
   TransactionRecord,
@@ -312,6 +313,11 @@ describe("BETA E2E — grant → join → start → prize; join → cancel → r
     requestwithdrawalRun = (d, c) => mod.requestwithdrawal.run(d, c);
 
     db = admin.firestore();
+
+    // O caixa precisa cobrir prêmios acima do arrecadado — a mesma coisa que
+    // o operador terá de fazer em produção antes de garantir premiação.
+    await seedHouse(db, "cash", 100_000_00);
+    await seedHouse(db, "beta_credit", 100_000_00);
 
     try {
       await fetchWithTimeout(`http://${FUNCTIONS_HOST}/`, {}, 10_000).catch(() => {

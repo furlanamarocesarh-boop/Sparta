@@ -103,53 +103,65 @@ describe("cálculo do pagamento", () => {
   });
 });
 
-describe("A TRAVA: nunca paga mais do que arrecadou", () => {
-  it("recusa quando os abates estouram o pool", () => {
-    // 60 abates x 100 = 6000, mais 5000 de colocação = 11000 > pool 10000.
-    const d = decidePayouts(
-      base({ reports: [{ uid: "uid-a", kills: 60 }] })
-    );
-    assert.deepEqual(d, { ok: false, reason: "exceeds-pool" });
-  });
+describe("a trava do pool SAIU daqui — de propósito", () => {
+  /**
+   * Este grupo substitui um que exigia o contrário.
+   *
+   * A regra antiga era "um torneio não distribui mais do que arrecadou", e ela
+   * proibia prêmio garantido — prática comum de esports que a plataforma quer
+   * oferecer. A regra não foi afrouxada: ela SUBIU de nível. `decideHouseFunding`
+   * exige que a liquidação deixe o caixa da plataforma não-negativo, e vale para
+   * os DOIS caminhos de liquidação, onde a antiga valia só para este.
+   *
+   * Os testes ficam aqui, invertidos, em vez de serem apagados: quem ler este
+   * arquivo procurando a trava precisa encontrar onde ela foi parar.
+   */
 
-  it("aceita exatamente no limite do pool", () => {
-    // 50 abates x 100 = 5000, mais 5000 = 10000 == pool.
-    const d = decidePayouts(
-      base({ reports: [{ uid: "uid-a", kills: 50 }] })
-    );
+  it("PERMITE pagar acima do arrecadado — é o prêmio garantido", () => {
+    // 60 abates x 100 = 6000, mais 5000 de colocação = 11000 contra pool 10000.
+    // Antes: recusado. Agora: decidido pelo caixa, não por este módulo.
+    const d = decidePayouts(base({ reports: [{ uid: "uid-a", kills: 60 }] }));
     assert.equal(d.ok, true);
     if (!d.ok) return;
-    assert.equal(d.totalCentavos, d.poolCentavos);
+    assert.equal(d.totalCentavos, 11_000);
+    assert.ok(d.totalCentavos > d.poolCentavos);
   });
 
-  it("recusa por INTEIRO — ninguém recebe nada", () => {
-    // A alternativa rejeitada era pagar proporcionalmente. Se algum dia
-    // alguém a implementar, este teste quebra e obriga a decisão a ser
-    // retomada de propósito, em vez de mudar de lado sem ninguém notar.
-    const d = decidePayouts(
-      base({
-        reports: [
-          { uid: "uid-a", kills: 60 },
-          { uid: "uid-b", kills: 1 },
-        ],
-      })
-    );
-    assert.equal(d.ok, false);
-    assert.equal("payouts" in d, false);
-  });
-
-  it("pool zero recusa qualquer pagamento", () => {
+  it("pool zero não recusa mais nada por si só", () => {
     const d = decidePayouts(base({ poolCentavos: 0 }));
-    assert.deepEqual(d, { ok: false, reason: "exceeds-pool" });
+    assert.equal(d.ok, true);
   });
 
-  it("a checagem do pool vem DEPOIS das de forma", () => {
-    // Números malformados E estourando: o motivo precisa ser a forma, para o
-    // operador corrigir a causa e não o sintoma.
-    const d = decidePayouts(
-      base({ reports: [{ uid: "uid-a", kills: -5 }], poolCentavos: 0 })
+  it("continua RELATANDO o pool, que é o que o caixa precisa saber", () => {
+    // O módulo parou de julgar e continuou medindo: quem decide solvência
+    // precisa deste número, e ele tem que ser o arrecadado de verdade.
+    const d = decidePayouts(base({ poolCentavos: 7_777 }));
+    assert.equal(d.ok, true);
+    if (!d.ok) return;
+    assert.equal(d.poolCentavos, 7_777);
+  });
+
+  it("as recusas de FORMA continuam todas de pé", () => {
+    // Afrouxar o teto não podia afrouxar mais nada.
+    assert.equal(
+      decidePayouts(base({ reports: [{ uid: "uid-a", kills: -5 }] })).ok,
+      false
     );
-    assert.deepEqual(d, { ok: false, reason: "invalid-kills" });
+    assert.equal(
+      decidePayouts(
+        base({
+          reports: [
+            { uid: "uid-a", kills: 1 },
+            { uid: "uid-a", kills: 2 },
+          ],
+        })
+      ).ok,
+      false
+    );
+    assert.equal(
+      decidePayouts(base({ reports: [{ uid: "estranho", kills: 1 }] })).ok,
+      false
+    );
   });
 });
 
@@ -250,7 +262,7 @@ describe("orçamento de escrita da transação", () => {
 describe("mensagens de recusa", () => {
   it("toda recusa tem mensagem própria", () => {
     const reasons = [
-      "exceeds-pool",
+      "payee-not-registered",
       "too-many-players",
       "duplicate-player",
       "invalid-kills",
@@ -269,7 +281,7 @@ describe("mensagens de recusa", () => {
 
   it("o wrapper lança na recusa e passa no sucesso", () => {
     assert.throws(() =>
-      assertPayoutDecision({ ok: false, reason: "exceeds-pool" })
+      assertPayoutDecision({ ok: false, reason: "nothing-to-pay" })
     );
     assert.doesNotThrow(() => assertPayoutDecision(decidePayouts(base())));
   });
@@ -649,7 +661,10 @@ describe("pool arrecadado", () => {
   it("falha FECHADO quando uma inscrição é ilegível", () => {
     // Tratar pool desconhecido como zero recusaria todo pagamento e pareceria
     // decisão de política, em vez do problema de dado que é.
-    for (const bad of [undefined, null, "10", Number.NaN, -1]) {
+    // AUSENTE não é CORROMPIDO: undefined/null significam que nunca houve
+    // preço registrado — contribuem zero e a liquidação segue. O que recusa é
+    // alguém ter escrito algo que não é preço.
+    for (const bad of ["10", Number.NaN, -1]) {
       const r = poolFromRegistrations(
         [{ status: "registered", entryFeeSnapshot: bad, uid: "a", economyType: "cash" }],
         "cash"
@@ -659,6 +674,27 @@ describe("pool arrecadado", () => {
         { ok: false, reason: "unusable-registration" },
         `deveria falhar em ${String(bad)}`
       );
+    }
+  });
+
+  it("preço AUSENTE contribui zero e não trava a liquidação", () => {
+    // Uma inscrição antiga sem preço registrado tornaria o torneio inteiro
+    // impossível de liquidar para sempre — o mesmo beco sem saída que a
+    // auditoria apontou no payprize, chegando pelo outro lado.
+    for (const missing of [undefined, null]) {
+      const r = poolFromRegistrations(
+        [
+          { status: "registered", entryFeeSnapshot: 10, uid: "a", economyType: "cash" },
+          { status: "registered", entryFeeSnapshot: missing, uid: "b", economyType: "cash" },
+        ],
+        "cash"
+      );
+      assert.equal(r.ok, true, `travou em ${String(missing)}`);
+      if (!r.ok) return;
+      assert.equal(r.centavos, 1_000, "subestimar é seguro; inventar não");
+      assert.equal(r.counted, 2);
+      // Continua podendo RECEBER: não pagou nada comprovável, mas jogou.
+      assert.deepEqual(r.eligibleUids, new Set(["a", "b"]));
     }
   });
 

@@ -68,7 +68,6 @@ export interface Payout {
 
 export type PayoutRefusal =
   | "payee-not-registered"
-  | "exceeds-pool"
   | "too-many-players"
   | "duplicate-player"
   | "invalid-kills"
@@ -220,13 +219,21 @@ export function decidePayouts(input: PayoutInput): PayoutDecision {
   }
 
   /**
-   * THE GUARD. Everything above is arithmetic; this is the rule. A tournament
-   * may distribute what it collected and not a centavo more.
+   * NO POOL CEILING HERE ANY MORE, deliberately.
+   *
+   * A tournament paying more than it collected is a GUARANTEED PRIZE POOL —
+   * ordinary esports practice, and something this platform wants to offer. The
+   * old rule forbade it outright, which is why it went.
+   *
+   * The ceiling did not disappear; it MOVED, and got stricter where it counts.
+   * `decideHouseFunding` requires a settlement to leave the platform treasury
+   * non-negative, and it binds BOTH settlement paths — where this rule bound
+   * only per-kill, leaving the single-winner format as an unguarded bypass.
+   *
+   * So this module went back to being pure arithmetic about ONE tournament.
+   * Solvency is a question about the PLATFORM, and it is answered in the one
+   * place the platform's balance is actually known.
    */
-  if (totalCentavos > poolCentavos) {
-    return { ok: false, reason: "exceeds-pool" };
-  }
-
   return { ok: true, payouts, totalCentavos, poolCentavos };
 }
 
@@ -237,11 +244,6 @@ export function payoutRefusalMessage(reason: PayoutRefusal): string {
       return (
         "Um dos jogadores informados não tem inscrição confirmada neste " +
         "torneio. Confira os jogadores antes de declarar o resultado."
-      );
-    case "exceeds-pool":
-      return (
-        "A premiação informada é maior do que o total arrecadado neste " +
-        "torneio. Confira os abates antes de declarar o resultado."
       );
     case "too-many-players":
       return `Um resultado pode pagar no máximo ${MAX_PAYOUT_PLAYERS} jogadores.`;
@@ -339,6 +341,13 @@ export interface RegistrationForPool {
   /** Who paid it, from the registration's `user_ref` — never from the caller. */
   readonly uid: unknown;
   /**
+   * The TOURNAMENT's configured entry fee, used ONLY as the legacy cash
+   * fallback below. Never preferred over the registration's own snapshot: the
+   * price can change after someone joins, and what they actually paid is the
+   * only honest figure.
+   */
+  readonly tournamentEntryFee?: unknown;
+  /**
    * Which economy paid it. `undefined` means a legacy registration with no
    * recorded provenance, which the cash path accepts and the beta path does
    * not — the same rule `checkRegistrationEconomy` applies to the winner on the
@@ -400,7 +409,53 @@ export function poolFromRegistrations(
      */
     if (!economyMatches(row.economyType, tournamentEconomy)) continue;
 
-    const seen = inspectReais(row.entryFeeSnapshot, {
+    /**
+     * LEGACY CASH FALLBACK, matching `decideRefundItem` in cancellation.ts
+     * exactly rather than inventing a second rule for the same situation.
+     *
+     * Registrations written before `entry_fee_snapshot` existed carry no
+     * snapshot. Refusing them outright made every such tournament impossible
+     * to settle — which is what this fallback was added to fix, after the
+     * rules suite caught it. The tournament's own `entry_fee` is what that
+     * registration was charged, and it is only trusted on the CASH path: a
+     * beta registration with no provenance is still a refusal, because
+     * guessing there could let cash prices fund Beta Credit payouts.
+     */
+    const legacyCash =
+      (row.economyType === undefined || row.economyType === null) &&
+      tournamentEconomy === "cash";
+
+    const price =
+      row.entryFeeSnapshot === undefined && legacyCash
+        ? row.tournamentEntryFee
+        : row.entryFeeSnapshot;
+
+    /**
+     * ABSENT AND CORRUPT ARE DIFFERENT, and the difference decides whether a
+     * tournament can ever be settled.
+     *
+     * ABSENT (undefined/null) — no price was ever recorded, so nothing about
+     * this registration is provably in the pool. It contributes ZERO and the
+     * settlement continues. Understating the pool is the SAFE direction: the
+     * treasury covers the gap instead, so the platform refuses EARLIER and can
+     * never let extra money out because of a gap in old data.
+     *
+     * CORRUPT (a string, NaN, a negative) — someone wrote something that is not
+     * a price. That is a data fault, and the whole pool is refused.
+     *
+     * The earlier version refused BOTH, which meant one old registration made
+     * its tournament permanently unsettleable — the same dead end the audit
+     * flagged for `payprize`, arrived at from the other side.
+     */
+    if (price === undefined || price === null) {
+      counted += 1;
+      if (typeof row.uid === "string" && row.uid.trim() !== "") {
+        eligibleUids.add(row.uid.trim());
+      }
+      continue;
+    }
+
+    const seen = inspectReais(price, {
       allowZero: true,
       maxCentavos: MAX_BALANCE_CENTAVOS,
     });
