@@ -103,6 +103,8 @@ const AUTHORIZED_FUNCTIONS: Readonly<Record<string, string>> = {
   declareTournamentResultWithKills: CENTRAL,
   fundHouse: CENTRAL,
   setPartnerActive: CENTRAL,
+  setNickname: CENTRAL,
+  getMyBadges: CENTRAL,
   applyForPartner: CENTRAL,
   reviewPartnerApplication: CENTRAL,
 };

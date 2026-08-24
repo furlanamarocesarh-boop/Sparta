@@ -180,6 +180,15 @@ import {
   type PersistedPayout,
 } from "./domain/killPrize.js";
 import {
+  isRegistrationComplete,
+  parseNickname,
+  NICKNAMES_COLLECTION,
+} from "./domain/nickname.js";
+import {
+  badgesToAward,
+  referredPlayerCounts,
+} from "./domain/badges.js";
+import {
   canApplicantSubmit,
   parsePartnerApplication,
   submitRefusalMessage,
@@ -776,6 +785,24 @@ export const jointournament = central.https.onCall(async (data, context) => {
         ...participantIncrementUpdate(counts),
         ...economyLockMaterialization(tournamentData, economy),
       });
+
+      /**
+       * The player's running count of tournaments played.
+       *
+       * DENORMALISED because the alternative is unusable: the badge tiers ask
+       * "has this account played 500 tournaments", and a partner's tier asks
+       * that of EVERY player they brought. Answering from `registrations`
+       * would be one query per player per check.
+       *
+       * Incremented in the same transaction that creates the registration, so
+       * the count and the rows it counts can never disagree. `increment` and
+       * not a read-modify-write: two concurrent joins must both be counted.
+       */
+      transaction.set(
+        userRef,
+        { tournaments_played: FieldValue.increment(1) },
+        { merge: true }
+      );
 
       transaction.set(registrationRef, {
         user_ref: userRef,
@@ -4023,6 +4050,229 @@ export const createPartner = central.https.onCall(async (data, context) => {
     throw toHttpsError(error);
   }
 });
+
+/**
+ * Sets the caller's Sparta nickname — the last step of signing up.
+ *
+ * THIS IS THE CALLABLE `docs/username.md` ASKED FOR. `users/{uid}.username` is
+ * written as `""` by the auth trigger and never populated, because the client
+ * sets a display name on the Auth profile after the trigger has already run.
+ * The name now lives in Firestore, chosen by the player, written by the server.
+ *
+ * UNIQUENESS IS A RESERVATION, not a lookup. `create` on a document whose id is
+ * the folded name means two people typing "spartano" at the same instant cannot
+ * both succeed — the second one fails. A read-then-write check would let both
+ * through, and the loser would only find out when someone impersonated them.
+ *
+ * CHANGING A NICK RELEASES THE OLD ONE, in the same transaction that takes the
+ * new one. Doing it in two steps would either strand the old name forever or
+ * leave a window where the player holds neither.
+ */
+/**
+ * The caller's badges, granting any newly earned ones.
+ *
+ * READ-AND-GRANT IN ONE CALL, rather than a nightly job. The counts come from
+ * aggregate queries that are cheap and always current, so the moment a player
+ * opens the screen their badges are correct — no job to fall behind, no
+ * "why haven't I got it yet".
+ *
+ * GRANTING IS IDEMPOTENT: `badgesToAward` subtracts what is already owned, so
+ * a screen opened twice writes once. And nothing here can REVOKE — the awards
+ * are a high-water mark, so a partner whose referred players deleted their
+ * accounts keeps the tier they reached.
+ */
+export const getMyBadgesHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const auth = assertSignedIn(
+      context as any,
+      "Entre na sua conta para ver seus selos."
+    );
+    assertExactPayload(data ?? {}, []);
+
+    const userRef = db.collection("users").doc(auth.uid);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) {
+      throw new DomainError("not-found", "Sua conta não foi encontrada.");
+    }
+    const userData = userSnap.data() ?? {};
+
+    const partnerSnap = await db
+      .collection(PARTNERS_COLLECTION)
+      .where("owner_uid", "==", auth.uid)
+      .limit(1)
+      .get();
+    const partnerId = partnerSnap.empty ? null : partnerSnap.docs[0].id;
+
+    const [createdSnap, broughtCount] = await Promise.all([
+      db
+        .collection("tournaments")
+        .where("creator_uid", "==", auth.uid)
+        .count()
+        .get(),
+      partnerId === null ? Promise.resolve(0) : countQualifiedReferrals(partnerId),
+    ]);
+
+    const counts = {
+      tournamentsCreated: createdSnap.data().count,
+      playersBrought: broughtCount,
+      tournamentsPlayed: readPlayedCount(userData.tournaments_played),
+      isPartner: partnerId !== null,
+    };
+
+    const owned: string[] = Array.isArray(userData.badges)
+      ? (userData.badges as unknown[]).filter(
+          (b): b is string => typeof b === "string"
+        )
+      : [];
+
+    const fresh = badgesToAward(counts, owned);
+    if (fresh.length > 0) {
+      await userRef.set(
+        {
+          badges: FieldValue.arrayUnion(...fresh.map((b) => b.id)),
+          badges_updated_at: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
+    return {
+      badges: [...owned, ...fresh.map((b) => b.id)],
+      awarded: fresh.map((b) => b.id),
+      counts,
+    };
+  } catch (error) {
+    console.error("getMyBadges error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const getMyBadges = central.https.onCall(getMyBadgesHandler);
+
+/**
+ * How many of a partner's referred players COUNT.
+ *
+ * Not a raw signup count: a signup costs nothing, and the partner tiers carry
+ * prizes. The filter is the registration being complete and the player having
+ * played past the floor — five entry fees, which makes the metric cost exactly
+ * the money that forging it is trying to win.
+ *
+ * Filtered in code rather than in the query because "complete" spans two
+ * fields and KYC is not a field yet; the referred set is small enough that
+ * reading it is cheaper than the composite index the alternative would need.
+ */
+async function countQualifiedReferrals(partnerId: string): Promise<number> {
+  const referred = await db
+    .collection("users")
+    .where("partner_ref", "==", partnerId)
+    .limit(20_000)
+    .get();
+
+  let qualified = 0;
+  for (const doc of referred.docs) {
+    const complete = isRegistrationComplete({
+      nickname: doc.get("username"),
+      // KYC does not exist in this backend yet. Passing the stored flag means
+      // the day it lands this line starts telling the truth without any other
+      // change — and until then it reads false, so no tier is awarded on an
+      // unverified account.
+      kycVerified: doc.get("kyc_verified") === true,
+    });
+    if (
+      referredPlayerCounts({
+        tournamentsPlayed: readPlayedCount(doc.get("tournaments_played")),
+        registrationComplete: complete,
+      })
+    ) {
+      qualified += 1;
+    }
+  }
+  return qualified;
+}
+
+/** A stored play count, or zero. Absent means an account that predates the
+ * counter, which has genuinely not been counted — never a reason to throw on
+ * a read-only screen. */
+function readPlayedCount(raw: unknown): number {
+  return typeof raw === "number" && Number.isInteger(raw) && raw >= 0 ? raw : 0;
+}
+
+const SET_NICKNAME_KEYS = ["nickname"] as const;
+
+export const setNicknameHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const auth = assertSignedIn(
+      context as any,
+      "Entre na sua conta para escolher seu nick."
+    );
+    assertExactPayload(data, SET_NICKNAME_KEYS);
+
+    const { display, normalized } = parseNickname(data.nickname);
+
+    const userRef = db.collection("users").doc(auth.uid);
+    const reservationRef = db
+      .collection(NICKNAMES_COLLECTION)
+      .doc(normalized);
+
+    await db.runTransaction(async (transaction) => {
+      const [userSnap, reservationSnap] = await Promise.all([
+        transaction.get(userRef),
+        transaction.get(reservationRef),
+      ]);
+
+      if (!userSnap.exists) {
+        throw new DomainError("not-found", "Sua conta não foi encontrada.");
+      }
+
+      const previous = String(userSnap.get("username_normalized") ?? "");
+
+      if (reservationSnap.exists) {
+        // Already ours: setting the same nick again is a no-op success, not an
+        // error — a retried request must not tell the player their own name is
+        // taken.
+        if (reservationSnap.get("uid") === auth.uid) {
+          transaction.update(userRef, { username: display });
+          return;
+        }
+        throw new DomainError(
+          "already-exists",
+          "Este nick já está em uso."
+        );
+      }
+
+      transaction.create(reservationRef, {
+        uid: auth.uid,
+        display,
+        created_at: FieldValue.serverTimestamp(),
+      });
+
+      if (previous !== "" && previous !== normalized) {
+        transaction.delete(
+          db.collection(NICKNAMES_COLLECTION).doc(previous)
+        );
+      }
+
+      transaction.update(userRef, {
+        username: display,
+        username_normalized: normalized,
+        username_set_at: FieldValue.serverTimestamp(),
+      });
+    });
+
+    return { success: true, nickname: display };
+  } catch (error) {
+    console.error("setNickname error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const setNickname = central.https.onCall(setNicknameHandler);
 
 const APPLY_PARTNER_KEYS = [
   "platform",
