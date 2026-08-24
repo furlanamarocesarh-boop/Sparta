@@ -4017,6 +4017,83 @@ export const createPartner = central.https.onCall(async (data, context) => {
   }
 });
 
+/** The exact payload of `setPartnerActive`. */
+const SET_PARTNER_ACTIVE_KEYS = ["partner_id", "active"] as const;
+
+/**
+ * ADMIN-ONLY: turns a partner on or off.
+ *
+ * WHY THIS HAD TO EXIST. `active` was read in three places — `claimReferral`
+ * refuses an inactive partner, the accrual trigger skips one, the earnings
+ * screen reports it — and written in exactly one: `createPartner`, always as
+ * true. So a partner, once created, could never be switched off. A referral
+ * code being abused had no lever at all, in a feature that moves money.
+ *
+ * REVERSIBLE ON PURPOSE, and not a delete. Deactivating stops NEW attributions
+ * and NEW accruals; it does not rewrite what a partner already earned, because
+ * that is a settled fact and erasing it would be worse than leaving it. A
+ * partner turned off by mistake is turned back on with the same call.
+ *
+ * The change is stamped with WHO made it. An `active` flag that flips with no
+ * trace is a flag nobody can defend later.
+ */
+export const setPartnerActiveHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertAdmin(
+      context,
+      "Você precisa estar logado para alterar um parceiro.",
+      "Apenas admin pode alterar um parceiro."
+    );
+    assertExactPayload(data, SET_PARTNER_ACTIVE_KEYS);
+
+    const partnerId = String(data.partner_id ?? "").trim();
+    if (!partnerId) {
+      throw new DomainError("invalid-argument", "Informe o parceiro.");
+    }
+    // Strict boolean: the string "false" is truthy in JavaScript, and reading
+    // it as "activate" would be the exact opposite of what was asked.
+    if (typeof data.active !== "boolean") {
+      throw new DomainError(
+        "invalid-argument",
+        "O estado do parceiro precisa ser verdadeiro ou falso."
+      );
+    }
+    const active = data.active;
+
+    const partnerRef = db.collection(PARTNERS_COLLECTION).doc(partnerId);
+
+    const outcome = await db.runTransaction(async (transaction) => {
+      const snap = await transaction.get(partnerRef);
+      if (!snap.exists) {
+        throw new DomainError("not-found", "Parceiro não encontrado.");
+      }
+      const before = snap.get("active") === true;
+      if (before === active) {
+        // Already in the requested state: success with NO write, so a repeated
+        // tap does not churn the timestamp or the audit trail.
+        return { changed: false, active };
+      }
+
+      transaction.update(partnerRef, {
+        active,
+        active_changed_at: FieldValue.serverTimestamp(),
+        active_changed_by: callerAuth.uid,
+      });
+      return { changed: true, active };
+    });
+
+    return { success: true, ...outcome };
+  } catch (error) {
+    console.error("setPartnerActive error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const setPartnerActive = central.https.onCall(setPartnerActiveHandler);
+
 /** The exact payload of `getPartnerEarnings`. */
 const PARTNER_EARNINGS_KEYS = ["limit"] as const;
 
