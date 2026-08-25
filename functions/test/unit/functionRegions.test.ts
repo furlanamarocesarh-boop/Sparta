@@ -109,6 +109,8 @@ const AUTHORIZED_FUNCTIONS: Readonly<Record<string, string>> = {
   onEntryFeeCreatorAccrual: CENTRAL,
   getCreatorLeaderboard: CENTRAL,
   getAdminOverview: CENTRAL,
+  declareMatchResult: CENTRAL,
+  settleTournamentByPoints: CENTRAL,
   getPublicProfile: CENTRAL,
   getMyProfile: CENTRAL,
   applyForPartner: CENTRAL,

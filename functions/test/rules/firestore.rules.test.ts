@@ -307,3 +307,33 @@ describe("rules file", () => {
     assert.doesNotMatch(rules, /Fnj4w17/);
   });
 });
+
+describe("resultados de partida", () => {
+  // NADA EXERCITAVA ESTA REGRA quando ela foi escrita, e por isso um helper
+  // com nome errado passou nos 498 testes. Um teste que a toca é o que
+  // transforma "compila" em "faz o que diz".
+  const path = "tournaments/t-regras/matches/1";
+
+  it("um jogador logado LÊ a classificação", async () => {
+    const db = testEnv.authenticatedContext("jogador").firestore();
+    await assertSucceeds(db.doc(path).get());
+  });
+
+  it("deslogado não lê", async () => {
+    const db = testEnv.unauthenticatedContext().firestore();
+    await assertFails(db.doc(path).get());
+  });
+
+  it("NINGUÉM escreve — nem admin", async () => {
+    // Lançar partida é ato do callable, que valida inscrição e limites.
+    for (const ctx of [
+      testEnv.authenticatedContext("jogador"),
+      testEnv.authenticatedContext("chefe", { admin: true }),
+    ]) {
+      const db = ctx.firestore();
+      await assertFails(db.doc(path).set({ entries: [] }));
+      await assertFails(db.doc(path).delete());
+    }
+  });
+});
+

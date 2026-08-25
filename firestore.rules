@@ -291,6 +291,15 @@ service cloud.firestore {
       }
     }
 
+    // RESULTADOS DE PARTIDA — lançados exclusivamente pelo callable de admin,
+    // e lidos por qualquer jogador logado: a classificação de um campeonato é
+    // pública para quem está nele, e esconder as partidas tornaria o placar
+    // impossível de conferir.
+    match /tournaments/{tournamentId}/matches/{matchNumber} {
+      allow read: if signedIn();
+      allow create, update, delete: if false;
+    }
+
     // Bloqueia qualquer collection não prevista.
     match /{document=**} {
       allow read, write: if false;

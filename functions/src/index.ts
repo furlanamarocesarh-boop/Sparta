@@ -200,9 +200,18 @@ import {
   type CreatorRow,
 } from "./domain/creatorRanking.js";
 import {
+  CASH_PRIZE_CATEGORY,
+} from "./domain/seasonRanking.js";
+import {
+  MAX_PAYOUT_PLAYERS,
+} from "./domain/killPrize.js";
+import {
   checkPointsConfig,
   checkPrizeDistribution,
+  computeStandings,
   MAX_MATCHES,
+  splitPrize,
+  type MatchResult,
   type PointsConfig,
   type PrizeSlice,
 } from "./domain/matchPoints.js";
@@ -4987,6 +4996,482 @@ export const getAdminOverviewHandler = async (
 
 export const getAdminOverview = central.https.onCall((data, context) =>
   getAdminOverviewHandler(data, context)
+);
+
+// ═══════════════════════════════════════════════════════════════════════
+// CAMPEONATO DE VÁRIAS PARTIDAS
+// ═══════════════════════════════════════════════════════════════════════
+
+const MATCHES_SUBCOLLECTION = "matches";
+const DECLARE_MATCH_KEYS = ["tournamentid", "match_number", "entries"] as const;
+
+/** Reads one caller-supplied match line, or refuses it. */
+function normalizeMatchEntries(raw: unknown): MatchResult["entries"] {
+  if (!Array.isArray(raw)) {
+    throw new DomainError("invalid-argument", "A lista da partida é obrigatória.");
+  }
+  if (raw.length > MAX_PAYOUT_PLAYERS) {
+    throw new DomainError("invalid-argument", "Jogadores demais numa partida.");
+  }
+  const seen = new Set<string>();
+  return raw.map((row) => {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      throw new DomainError("invalid-argument", "Item da partida inválido.");
+    }
+    const item = row as Record<string, unknown>;
+    const extra = Object.keys(item).filter(
+      (k) => k !== "uid" && k !== "kills" && k !== "placement"
+    );
+    if (extra.length > 0) {
+      // Same posture as assertExactPayload: an unexpected key is a rejection.
+      throw new DomainError("invalid-argument", "Item da partida inválido.");
+    }
+    const uid = normalizeWinnerUid(item.uid);
+    /**
+     * ONE LINE PER PLAYER PER MATCH, enforced here rather than in the domain.
+     * `computeStandings` deliberately SUMS a repeated uid so an operator can
+     * correct a typo across reports; accepting two lines for one player in a
+     * SINGLE submission would instead double their kills silently.
+     */
+    if (seen.has(uid)) {
+      throw new DomainError(
+        "invalid-argument",
+        "O mesmo jogador aparece duas vezes nesta partida."
+      );
+    }
+    seen.add(uid);
+
+    const kills = typeof item.kills === "number" ? item.kills : Number.NaN;
+    const placement =
+      typeof item.placement === "number" ? item.placement : Number.NaN;
+    if (!Number.isInteger(kills) || kills < 0 || kills > 1000) {
+      throw new DomainError("invalid-argument", "Abates inválidos.");
+    }
+    if (!Number.isInteger(placement) || placement < 1 || placement > 1000) {
+      throw new DomainError("invalid-argument", "Colocação inválida.");
+    }
+    return { uid, kills, placement };
+  });
+}
+
+/**
+ * Records the result of ONE match.
+ *
+ * ONE DOCUMENT PER MATCH, keyed by its number, so re-declaring a match
+ * REPLACES it. Getting a match wrong is ordinary — a screenshot misread, a
+ * player counted twice — and the fix has to be re-sending that match, not
+ * unpicking it from a running total. The standings are computed from these
+ * documents at settlement, so a correction before settlement simply lands.
+ *
+ * IT PAYS NOTHING. Reporting and paying are separate acts: a tournament is
+ * reported match by match as it happens, and settled once at the end. Folding
+ * them together would mean the last match's report also moved money, and a
+ * typo in it could not be corrected.
+ *
+ * ONLY REGISTERED PLAYERS MAY BE REPORTED — the same invariant the payout path
+ * enforces, checked here as well so a stranger never even reaches the
+ * standings.
+ */
+export const declareMatchResultHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    assertAdmin(
+      context as any,
+      "Você precisa estar logado.",
+      "Apenas admin pode lançar resultados."
+    );
+    assertExactPayload(data, DECLARE_MATCH_KEYS);
+
+    const tournamentid = String(data.tournamentid || "").trim();
+    if (!tournamentid || tournamentid.includes("/")) {
+      throw new DomainError("invalid-argument", "Campeonato inválido.");
+    }
+    const matchNumber = Number(data.match_number);
+    const entries = normalizeMatchEntries(data.entries);
+
+    const tournamentRef = db.collection("tournaments").doc(tournamentid);
+    const tournamentSnap = await tournamentRef.get();
+    if (!tournamentSnap.exists) {
+      throw new DomainError("not-found", "Campeonato não encontrado.");
+    }
+    const tournamentData = tournamentSnap.data() ?? {};
+
+    const matchesCount = Number(tournamentData.matches_count ?? 1);
+    if (
+      !Number.isInteger(matchNumber) ||
+      matchNumber < 1 ||
+      matchNumber > matchesCount
+    ) {
+      throw new DomainError(
+        "invalid-argument",
+        `Este campeonato tem ${matchesCount} partida(s).`
+      );
+    }
+
+    const status = String(tournamentData.status || "").trim().toLowerCase();
+    if (status === "completed" || status === "cancelled") {
+      throw new DomainError(
+        "failed-precondition",
+        "Este campeonato já foi encerrado."
+      );
+    }
+
+    // ONLY WHO PAID IN MAY BE REPORTED. Same rule as the payout path, applied
+    // one step earlier so an operator typo is caught while it is still cheap.
+    const registrations = await db
+      .collection("registrations")
+      .where("tournament_ref", "==", tournamentRef)
+      .get();
+    const eligible = new Set<string>();
+    for (const doc of registrations.docs) {
+      if (String(doc.get("status") || "") !== "registered") continue;
+      const uid = uidFromUserRefPath(documentPath(doc.get("user_ref")));
+      if (uid !== null) eligible.add(uid);
+    }
+    const stranger = entries.find((e) => !eligible.has(e.uid));
+    if (stranger !== undefined) {
+      throw new DomainError(
+        "failed-precondition",
+        "Um dos jogadores lançados não está inscrito neste campeonato."
+      );
+    }
+
+    await tournamentRef
+      .collection(MATCHES_SUBCOLLECTION)
+      .doc(String(matchNumber))
+      .set({
+        match_number: matchNumber,
+        entries,
+        reported_at: FieldValue.serverTimestamp(),
+      });
+
+    return {
+      success: true,
+      match_number: matchNumber,
+      players: entries.length,
+    };
+  } catch (error) {
+    console.error("declareMatchResult error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const declareMatchResult = central.https.onCall(
+  declareMatchResultHandler
+);
+
+const SETTLE_BY_POINTS_KEYS = ["tournamentid"] as const;
+
+/**
+ * Settles a tournament by its final standings.
+ *
+ * A SECOND SETTLEMENT PATH, like the per-kill one, and for the same reason: the
+ * working handlers pay every tournament that already works, and rewriting them
+ * to add a format would put those at risk to serve this one. A tournament with
+ * a `prize_distribution` belongs here and nowhere else, and this refuses every
+ * other kind.
+ *
+ * IT FITS IN ONE TRANSACTION, unlike the per-kill path. Placement prizes pay a
+ * handful of positions rather than every player who scored, so there is no
+ * batching problem to solve — the whole settlement is atomic.
+ *
+ * THE SAME THREE GUARDS AS EVERY OTHER PAYOUT: only registered players of this
+ * economy may be paid, the pool is read from the ledger rather than a stored
+ * field, and the treasury may never be left negative.
+ */
+export const settleTournamentByPointsHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    assertAdmin(
+      context as any,
+      "Você precisa estar logado.",
+      "Apenas admin pode encerrar campeonatos."
+    );
+    assertExactPayload(data, SETTLE_BY_POINTS_KEYS);
+
+    const tournamentid = String(data.tournamentid || "").trim();
+    if (!tournamentid || tournamentid.includes("/")) {
+      throw new DomainError("invalid-argument", "Campeonato inválido.");
+    }
+    const tournamentRef = db.collection("tournaments").doc(tournamentid);
+
+    const [matchesSnap, registrationsSnap] = await Promise.all([
+      tournamentRef.collection(MATCHES_SUBCOLLECTION).get(),
+      db
+        .collection("registrations")
+        .where("tournament_ref", "==", tournamentRef)
+        .get(),
+    ]);
+
+    const result = await db.runTransaction(async (transaction) => {
+      const tournamentSnap = await transaction.get(tournamentRef);
+      if (!tournamentSnap.exists) {
+        throw new DomainError("not-found", "Campeonato não encontrado.");
+      }
+      const tournamentData = tournamentSnap.data() ?? {};
+
+      const rawDistribution = tournamentData.prize_distribution;
+      if (!Array.isArray(rawDistribution) || rawDistribution.length === 0) {
+        throw new DomainError(
+          "failed-precondition",
+          "Este campeonato não tem divisão da premiação por colocação."
+        );
+      }
+      const slices: PrizeSlice[] = rawDistribution.map((raw: any) => ({
+        position: Number(raw?.position),
+        shareBps: Number(raw?.share_bps),
+      }));
+      if (!checkPrizeDistribution(slices).ok) {
+        throw new DomainError(
+          "failed-precondition",
+          "A divisão da premiação deste campeonato é inválida."
+        );
+      }
+
+      const status = String(tournamentData.status || "").trim().toLowerCase();
+      if (status === "completed") {
+        throw new DomainError(
+          "failed-precondition",
+          "Este campeonato já foi encerrado."
+        );
+      }
+      if (status === "cancelled") {
+        throw new DomainError(
+          "failed-precondition",
+          "Este campeonato foi cancelado."
+        );
+      }
+
+      const economy = resolveTournamentEconomy(tournamentData as any);
+      const prize = inspectReais(tournamentData.prize, {
+        allowZero: false,
+        maxCentavos: MAX_BALANCE_CENTAVOS,
+      });
+      if (!prize.ok) {
+        throw new DomainError(
+          "failed-precondition",
+          "A premiação configurada no campeonato é inválida."
+        );
+      }
+
+      // ── The standings, from the matches actually reported ───────────────
+      const config: PointsConfig = {
+        killPoints: Number(tournamentData.kill_points ?? 0),
+        placementPoints: Array.isArray(tournamentData.placement_points)
+          ? tournamentData.placement_points.map((p: unknown) => Number(p))
+          : [],
+      };
+      const matches: MatchResult[] = matchesSnap.docs.map((doc) => ({
+        matchNumber: Number(doc.get("match_number") ?? 0),
+        entries: Array.isArray(doc.get("entries")) ? doc.get("entries") : [],
+      }));
+      if (matches.length === 0) {
+        throw new DomainError(
+          "failed-precondition",
+          "Nenhuma partida foi lançada neste campeonato."
+        );
+      }
+
+      const standings = computeStandings(config, matches);
+
+      // ── Only who paid in may be paid out ────────────────────────────────
+      const pool = poolFromRegistrations(
+        registrationsSnap.docs.map((d) => ({
+          status: d.get("status"),
+          entryFeeSnapshot: d.get("entry_fee_snapshot"),
+          uid: uidFromUserRefPath(documentPath(d.get("user_ref"))),
+          economyType: d.get("economy_type"),
+          tournamentEntryFee: tournamentData.entry_fee,
+        })),
+        economy
+      );
+      if (!pool.ok) {
+        throw new DomainError(
+          "failed-precondition",
+          "As inscrições deste campeonato estão inconsistentes."
+        );
+      }
+
+      const eligible = standings.filter((s) => pool.eligibleUids.has(s.uid));
+      const split = splitPrize(prize.centavos, slices, eligible);
+
+      if (split.awards.length === 0) {
+        throw new DomainError(
+          "failed-precondition",
+          "Nenhum jogador inscrito pontuou neste campeonato."
+        );
+      }
+
+      // ── The treasury may never be left negative ─────────────────────────
+      const houseRef = db
+        .collection(HOUSE_COLLECTION)
+        .doc(houseDocId(economy));
+      const houseSnap = await transaction.get(houseRef);
+      const funding = decideHouseFunding({
+        poolCentavos: pool.centavos,
+        paidCentavos: split.paidCentavos,
+        houseCentavos: readHouseBalance(houseSnap),
+      });
+      if (!funding.ok) {
+        throw new DomainError(
+          "failed-precondition",
+          funding.reason === "house-insolvent"
+            ? `O caixa não cobre esta premiação. Faltam ${formatCentavos(
+                funding.shortfallCentavos,
+                economy
+              )}.`
+            : "Valores inválidos para liquidar este campeonato."
+        );
+      }
+
+      // ── Read every wallet before writing any ────────────────────────────
+      const wallets = await Promise.all(
+        split.awards.map((award) =>
+          transaction.get(db.collection("wallets").doc(award.uid))
+        )
+      );
+
+      const stampedAt = Timestamp.now();
+      const isBeta = economy === ECONOMY_BETA_CREDIT;
+
+      split.awards.forEach((award, index) => {
+        const walletSnap = wallets[index];
+        const walletRef = walletSnap.ref;
+        const walletData = walletSnap.data() ?? {};
+        const userRef = db.collection("users").doc(award.uid);
+        const amountReais = centavosToReais(award.centavos);
+
+        const previous = storedReaisToCentavos(
+          (isBeta ? walletData.beta_balance : walletData.balance) ?? 0,
+          "saldo da carteira"
+        );
+        const after = previous + award.centavos;
+
+        transaction.set(
+          walletRef,
+          isBeta
+            ? { beta_balance: centavosToReais(after), user_ref: userRef }
+            : {
+                balance: centavosToReais(after),
+                total_won: centavosToReais(
+                  storedReaisToCentavos(walletData.total_won ?? 0, "total ganho") +
+                    award.centavos
+                ),
+                user_ref: userRef,
+              },
+          { merge: true }
+        );
+
+        /**
+         * DETERMINISTIC ID, so a retry writes the same row instead of a second
+         * payment. `create` then makes a replay fail loudly rather than double
+         * paying — the same shape every other settlement here uses.
+         */
+        transaction.create(
+          db.collection("transactions").doc(`points_${tournamentid}_${award.uid}`),
+          {
+            amount: amountReais,
+            category: isBeta ? BETA_PRIZE_CATEGORY : CASH_PRIZE_CATEGORY,
+            economy_type: economy,
+            user_ref: userRef,
+            display_name: `${award.position}º lugar`,
+            tournament_ref: tournamentRef,
+            position: award.position,
+            ...(isBeta
+              ? {
+                  beta_previous_balance: centavosToReais(previous),
+                  beta_balance_after: centavosToReais(after),
+                }
+              : {
+                  previous_balance: centavosToReais(previous),
+                  balance_after: centavosToReais(after),
+                }),
+            timestamp: stampedAt,
+            status: "completed",
+          }
+        );
+      });
+
+      transaction.set(
+        houseRef,
+        {
+          [HOUSE_BALANCE_FIELD]: funding.houseAfterCentavos,
+          economy_type: economy,
+          updated_at: stampedAt,
+        },
+        { merge: true }
+      );
+
+      transaction.create(
+        db.collection("transactions").doc(`house_${tournamentid}`),
+        {
+          amount_centavos: funding.marginCentavos,
+          amount_unit: "centavos",
+          balance_after_centavos: funding.houseAfterCentavos,
+          category: houseMarginCategoryFor(economy),
+          economy_type: economy,
+          pool_centavos: pool.centavos,
+          paid_centavos: split.paidCentavos,
+          subsidised: funding.subsidised,
+          tournament_ref: tournamentRef,
+          timestamp: stampedAt,
+          status: "completed",
+        }
+      );
+
+      transaction.update(tournamentRef, {
+        status: "completed",
+        result: {
+          mode: "points",
+          economy_type: economy,
+          matches_reported: matches.length,
+          /**
+           * The whole final table is stored, not just who was paid. It is what
+           * a player will be shown, and recomputing it later would depend on a
+           * scoring config that may since have been edited.
+           */
+          standings: standings.slice(0, MAX_PAYOUT_PLAYERS).map((s) => ({
+            uid: s.uid,
+            points: s.points,
+            kills: s.kills,
+            matches_played: s.matchesPlayed,
+          })),
+          awards: split.awards.map((a) => ({
+            uid: a.uid,
+            position: a.position,
+            amount: centavosToReais(a.centavos),
+          })),
+          unclaimed: centavosToReais(split.unclaimedCentavos),
+        },
+        updated_at: stampedAt,
+      });
+
+      return {
+        paidCentavos: split.paidCentavos,
+        unclaimedCentavos: split.unclaimedCentavos,
+        awards: split.awards.length,
+      };
+    });
+
+    return {
+      success: true,
+      paid: centavosToReais(result.paidCentavos),
+      unclaimed: centavosToReais(result.unclaimedCentavos),
+      awards: result.awards,
+      message: "Campeonato encerrado e premiação distribuída.",
+    };
+  } catch (error) {
+    console.error("settleTournamentByPoints error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const settleTournamentByPoints = central.https.onCall(
+  settleTournamentByPointsHandler
 );
 
 /**
