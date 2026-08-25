@@ -263,6 +263,22 @@ service cloud.firestore {
       allow create, update, delete: if false;
     }
 
+    // RANKING DE CRIADORES — volume por criador, por economia. Escrito
+    // exclusivamente pelo gatilho de inscrição, servido exclusivamente pelo
+    // callable, que projeta linha por linha.
+    //
+    // NINGUÉM LÊ DIRETO, nem admin. A entrada é chaveada pelo `creator_uid` e
+    // guarda ele no documento: liberar leitura entregaria o uid de todo
+    // criador junto com quanto cada um movimenta, que é exatamente o par que
+    // o perfil público existe para não formar.
+    match /creator_rankings/{economy} {
+      allow read, write: if false;
+
+      match /entries/{creatorUid} {
+        allow read, write: if false;
+      }
+    }
+
     // Bloqueia qualquer collection não prevista.
     match /{document=**} {
       allow read, write: if false;

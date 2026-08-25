@@ -106,6 +106,8 @@ const AUTHORIZED_FUNCTIONS: Readonly<Record<string, string>> = {
   setNickname: CENTRAL,
   getMyBadges: CENTRAL,
   acknowledgeBadges: CENTRAL,
+  onEntryFeeCreatorAccrual: CENTRAL,
+  getCreatorLeaderboard: CENTRAL,
   getPublicProfile: CENTRAL,
   getMyProfile: CENTRAL,
   applyForPartner: CENTRAL,

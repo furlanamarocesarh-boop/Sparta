@@ -189,6 +189,15 @@ import {
   type PublicProfile,
 } from "./domain/publicProfile.js";
 import {
+  CREATOR_ENTRIES_SUBCOLLECTION,
+  CREATOR_LEADERBOARD_PAGE_SIZE,
+  CREATOR_RANKINGS_COLLECTION,
+  CREATOR_VOLUME_FIELD,
+  decideCreatorAccrual,
+  projectCreatorRow,
+  type CreatorRow,
+} from "./domain/creatorRanking.js";
+import {
   acknowledgeableIds,
   badgesToAward,
   pendingCelebrations,
@@ -4263,6 +4272,200 @@ export const acknowledgeBadgesHandler = async (
 
 export const acknowledgeBadges = central.https.onCall(
   acknowledgeBadgesHandler
+);
+
+// ═══════════════════════════════════════════════════════════════════════
+// RANKING DE CRIADORES
+// ═══════════════════════════════════════════════════════════════════════
+
+/** What one accrual attempt reports back, for tests and for logs. */
+export type CreatorAccrualOutcome =
+  | { readonly accrued: true; readonly economy: string; readonly centavos: number }
+  | { readonly accrued: false; readonly reason: string };
+
+/**
+ * Accrues a creator's volume when someone pays to enter their tournament.
+ *
+ * A TRIGGER, NOT A WRITE INSIDE `jointournament`. Joining is a money path with
+ * its own transaction, and hanging a leaderboard write off it would make a
+ * ranking failure able to fail a paid registration. The ledger row is the
+ * event; this reacts to it, retries on its own, and can never cost anybody
+ * their spot in a tournament.
+ *
+ * IT ACCRUES WHILE THE BOARD IS CLOSED. The app does not show this ranking
+ * yet, and that is exactly why the trigger ships now: the day it opens it
+ * opens with real history rather than from zero.
+ *
+ * THE ECONOMY IS NEVER GUESSED. The category says cash or beta, the tournament
+ * says the same, and a disagreement is refused outright — a row in the wrong
+ * board is a lie about real money.
+ */
+export const onEntryFeeCreatorAccrualHandler = async (
+  snapshot: any
+): Promise<CreatorAccrualOutcome> => {
+  const data = snapshot?.data?.();
+  if (!data) return { accrued: false, reason: "no-data" };
+
+  // ── Front door: cheap refusals, before any read ────────────────────────
+  const tournamentPath: string | null =
+    typeof data.tournament_ref?.path === "string"
+      ? data.tournament_ref.path
+      : null;
+  const tournamentId = tournamentPath?.startsWith("tournaments/")
+    ? tournamentPath.slice(12)
+    : null;
+  if (!tournamentId) return { accrued: false, reason: "no-tournament-ref" };
+
+  const userPath: string | null =
+    typeof data.user_ref?.path === "string" ? data.user_ref.path : null;
+  const payerUid = userPath?.startsWith("users/") ? userPath.slice(6) : null;
+
+  const tournamentSnap = await db
+    .collection("tournaments")
+    .doc(tournamentId)
+    .get();
+  if (!tournamentSnap.exists) {
+    return { accrued: false, reason: "tournament-missing" };
+  }
+
+  const decision = decideCreatorAccrual({
+    category: data.category,
+    amount: data.amount,
+    creatorUid: tournamentSnap.get("creator_uid"),
+    tournamentEconomy: tournamentSnap.get("economy_type"),
+    payerUid,
+  });
+
+  if (!decision.accrue) {
+    return { accrued: false, reason: decision.reason };
+  }
+
+  // ── Accepted: from here a failure must propagate so delivery retries ───
+  //
+  // The nickname and the pseudonym are DENORMALIZED onto the entry so reading
+  // the board is one ordered query instead of one lookup per row. They are
+  // refreshed on every accrual, so a creator who renames themselves is correct
+  // again after their next registration — stale for a while, never wrong
+  // forever, and the board never pays for it.
+  //
+  // The pseudonym is READ, never minted. Creating an immutable identity as a
+  // side effect of a stranger joining a tournament would mint on behalf of
+  // somebody who did nothing; a creator gets one by opening their own profile,
+  // and until then the row simply is not tappable.
+  const [creatorSnap, identitySnap] = await Promise.all([
+    db.collection("users").doc(decision.creatorUid).get(),
+    db.collection(PUBLIC_PLAYER_ID_COLLECTION).doc(decision.creatorUid).get(),
+  ]);
+
+  const storedId = identitySnap.exists
+    ? identitySnap.get("publicPlayerId")
+    : null;
+
+  await db
+    .collection(CREATOR_RANKINGS_COLLECTION)
+    .doc(decision.economy)
+    .collection(CREATOR_ENTRIES_SUBCOLLECTION)
+    .doc(decision.creatorUid)
+    .set(
+      {
+        creator_uid: decision.creatorUid,
+        nickname:
+          typeof creatorSnap.get("username") === "string"
+            ? creatorSnap.get("username")
+            : "",
+        public_player_id: isPublicPlayerId(storedId) ? storedId : null,
+        [CREATOR_VOLUME_FIELD]: FieldValue.increment(decision.centavos),
+        entries_count: FieldValue.increment(1),
+        updated_at: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+  return {
+    accrued: true,
+    economy: decision.economy,
+    centavos: decision.centavos,
+  };
+};
+
+export const onEntryFeeCreatorAccrual = central.firestore
+  .document("transactions/{transactionId}")
+  .onCreate(onEntryFeeCreatorAccrualHandler);
+
+const CREATOR_LEADERBOARD_KEYS = ["economy"] as const;
+
+/**
+ * The creator leaderboard, one bounded page, ordered by volume.
+ *
+ * SIGNED-IN ONLY, like every other read that names people. It publishes a
+ * nickname next to a money figure, which is not something an anonymous caller
+ * should be able to harvest.
+ *
+ * THE PAGE IS CAPPED because each row needs the creator's tournament count,
+ * and that is an aggregate query per creator. Counting rather than storing a
+ * counter is deliberate: a maintained counter drifts the first time a write
+ * lands half-way, and a leaderboard that quietly disagrees with the tournament
+ * list is worse than one that costs a few more reads.
+ *
+ * ORDERED BY THE SERVER, always. The client renders what it receives, in the
+ * order it arrives, and never sorts or renumbers — the same contract the
+ * season leaderboard already has.
+ */
+export const getCreatorLeaderboardHandler = async (
+  data: any,
+  context: any
+): Promise<{ economy: string; amountUnit: string; rows: CreatorRow[] }> => {
+  try {
+    assertSignedIn(
+      context as any,
+      "Entre na sua conta para ver o ranking."
+    );
+    assertExactPayload(data ?? {}, CREATOR_LEADERBOARD_KEYS);
+
+    const economy = parseRequestedEconomyType(data?.economy);
+
+    const page = await db
+      .collection(CREATOR_RANKINGS_COLLECTION)
+      .doc(economy)
+      .collection(CREATOR_ENTRIES_SUBCOLLECTION)
+      .orderBy(CREATOR_VOLUME_FIELD, "desc")
+      .limit(CREATOR_LEADERBOARD_PAGE_SIZE)
+      .get();
+
+    const counts = await Promise.all(
+      page.docs.map((doc) =>
+        db
+          .collection("tournaments")
+          .where("creator_uid", "==", String(doc.get("creator_uid") ?? ""))
+          .count()
+          .get()
+          .then((snap) => snap.data().count)
+          // A count that fails is reported as zero rather than failing the
+          // whole board: one creator's aggregate should not cost everyone the
+          // page they asked for.
+          .catch(() => 0)
+      )
+    );
+
+    const rows = page.docs.map((doc, index) =>
+      projectCreatorRow({
+        position: index + 1,
+        nickname: doc.get("nickname"),
+        publicPlayerId: doc.get("public_player_id"),
+        volumeCentavos: doc.get(CREATOR_VOLUME_FIELD),
+        tournamentsCreated: counts[index],
+      })
+    );
+
+    return { economy, amountUnit: "centavos", rows };
+  } catch (error) {
+    console.error("getCreatorLeaderboard error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const getCreatorLeaderboard = central.https.onCall(
+  getCreatorLeaderboardHandler
 );
 
 /**
