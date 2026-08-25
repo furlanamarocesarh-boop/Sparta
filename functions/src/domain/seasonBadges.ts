@@ -69,8 +69,15 @@ export const SEASON_BADGE_ECONOMY: EconomyType = ECONOMY_CASH;
  *
  * ORDER IS LOAD-BEARING: `placementTier` returns the FIRST match, which is why
  * the best tier is the one awarded.
+ *
+ * THE LADDER FOLLOWS THE ART. It began as 1/2/3/10/100 and became this when the
+ * trophies were drawn: there is no Top 2 among them, and there are a Top 25 and
+ * a Top 50. Changing it cost nothing because the feature has never granted
+ * anything — no season had closed and the switch was off. Changing it AFTER a
+ * grant would be a different problem entirely: badges are never revoked, so a
+ * retired tier would live on in accounts with no art and no meaning.
  */
-export const SEASON_BADGE_TIERS: readonly number[] = [1, 2, 3, 10, 100];
+export const SEASON_BADGE_TIERS: readonly number[] = [1, 3, 10, 25, 50, 100];
 
 const SEASON_BADGE_PREFIX = "season";
 const SEASON_ID_PATTERN = /^\d{4}-(0[1-9]|1[0-2])$/;

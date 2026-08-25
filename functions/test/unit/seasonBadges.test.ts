@@ -74,7 +74,7 @@ describe("o que NÃO é selo de temporada", () => {
     for (const bad of [
       "season_player_top7_2026-09",
       "season_player_top0_2026-09",
-      "season_player_top50_2026-09",
+      "season_player_top2_2026-09",
       "season_player_top1000_2026-09",
     ]) {
       assert.equal(parseSeasonBadgeId(bad), null, bad);
@@ -123,17 +123,28 @@ describe("o que NÃO é selo de temporada", () => {
 
 describe("qual grau uma colocação ganha", () => {
   it("o MELHOR grau, e só ele", () => {
-    // Segundo lugar satisfaz literalmente "top 3", "top 10" e "top 100"
-    // também. Entregar quatro troféus por um resultado enterraria a conquista
-    // nos próprios prêmios de consolação.
+    // Terceiro lugar satisfaz literalmente "top 10", "top 25", "top 50" e
+    // "top 100" também. Entregar cinco troféus por um resultado enterraria a
+    // conquista nos próprios prêmios de consolação.
     assert.equal(placementTier(1), 1);
-    assert.equal(placementTier(2), 2);
     assert.equal(placementTier(3), 3);
+  });
+
+  it("NÃO existe Top 2 — segundo lugar cai em Top 3", () => {
+    // A escada segue a arte, e não há troféu de Top 2 desenhado.
+    assert.equal(SEASON_BADGE_TIERS.includes(2), false);
+    assert.equal(placementTier(2), 3);
   });
 
   it("as faixas caem no teto delas", () => {
     for (const rank of [4, 7, 10]) assert.equal(placementTier(rank), 10, `${rank}`);
-    for (const rank of [11, 50, 100]) assert.equal(placementTier(rank), 100, `${rank}`);
+    for (const rank of [11, 20, 25]) assert.equal(placementTier(rank), 25, `${rank}`);
+    for (const rank of [26, 40, 50]) assert.equal(placementTier(rank), 50, `${rank}`);
+    for (const rank of [51, 90, 100]) assert.equal(placementTier(rank), 100, `${rank}`);
+  });
+
+  it("a escada é exatamente a que foi desenhada", () => {
+    assert.deepEqual(SEASON_BADGE_TIERS, [1, 3, 10, 25, 50, 100]);
   });
 
   it("fora do top 100 não ganha nada", () => {
@@ -150,11 +161,15 @@ describe("qual grau uma colocação ganha", () => {
 
   it("badgeForPlacement junta as duas pontas", () => {
     assert.equal(
-      badgeForPlacement("player", "2026-09", 2),
-      "season_player_top2_2026-09"
+      badgeForPlacement("player", "2026-09", 3),
+      "season_player_top3_2026-09"
     );
     assert.equal(
       badgeForPlacement("creator", "2026-09", 42),
+      "season_creator_top50_2026-09"
+    );
+    assert.equal(
+      badgeForPlacement("creator", "2026-09", 80),
       "season_creator_top100_2026-09"
     );
     assert.equal(badgeForPlacement("player", "2026-09", 101), null);
