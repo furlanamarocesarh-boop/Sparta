@@ -14,7 +14,8 @@
     "shell": "node -e \"console.error('RECUSADO: o shell interativo de funcoes nao consegue garantir FIRESTORE_EMULATOR_HOST e FIREBASE_AUTH_EMULATOR_HOST, entao o Admin SDK cairia no projeto real herdado de .firebaserc. Use: npm run serve'); process.exit(1)\"",
     "start": "npm run serve",
     "deploy": "node -e \"console.error('RECUSADO: publicacao ampla proibida. O runbook exige alvo seletivo, uma funcao por vez, nomeando o projeto explicitamente: docs/backend-predeploy-runbook.md secao 7.'); process.exit(1)\"",
-    "logs": "firebase functions:log --project sparta-battle"
+    "logs": "firebase functions:log --project sparta-battle",
+    "backfill:createdat": "npm run build && node lib/backfill/cli.js"
   },
   "engines": {
     "node": "22"

@@ -18,7 +18,8 @@
         "test",
         "audit-reports",
         "lib/audit",
-        "lib/adminclaim"
+        "lib/adminclaim",
+        "lib/backfill"
       ],
       "predeploy": [
         "npm --prefix \"$RESOURCE_DIR\" run build"
