@@ -4165,7 +4165,16 @@ export const getMyBadgesHandler = async (
    * without a seam there would be no way to prove the settlement at all until
    * October 2026.
    */
-  options: { readonly now?: Date } = {}
+  options: {
+    readonly now?: Date;
+    /**
+     * Test-only override of `SEASON_BADGES_ACTIVE`. Production never passes it,
+     * so the constant decides. It exists so the settlement stays PROVEN while
+     * the feature is dark — a mechanism that is only tested when it is on is a
+     * mechanism nobody can trust on the day it is switched on.
+     */
+    readonly seasonBadgesActive?: boolean;
+  } = {}
 ): Promise<Record<string, unknown>> => {
   try {
     const auth = assertSignedIn(
@@ -4213,7 +4222,8 @@ export const getMyBadgesHandler = async (
     const placements = await settleSeasonPlacements(
       auth.uid,
       userData.season_badges_through,
-      options.now ?? new Date()
+      options.now ?? new Date(),
+      options.seasonBadgesActive
     );
 
     const fresh = badgesToAward(counts, owned);
@@ -4294,9 +4304,10 @@ export const getMyBadgesHandler = async (
 async function settleSeasonPlacements(
   uid: string,
   settledThrough: unknown,
-  now: Date
+  now: Date,
+  active?: boolean
 ): Promise<{ earned: string[]; through: string | null }> {
-  const seasons = seasonsToSettle({ settledThrough, now });
+  const seasons = seasonsToSettle({ settledThrough, now, active });
   if (seasons.length === 0) return { earned: [], through: null };
 
   const economy = SEASON_BADGE_ECONOMY as RankingEconomy;

@@ -41,7 +41,19 @@ let handler: (d: unknown, c: unknown, o?: unknown) => Promise<any>;
  */
 const AFTER_SEASON = new Date(Date.UTC(2026, 9, 5, 12));
 
+/**
+ * O motor LIGADO, explicitamente.
+ *
+ * `SEASON_BADGES_ACTIVE` está false hoje, então em produção nada é concedido.
+ * O mecanismo continua sendo provado aqui de propósito: um mecanismo que só é
+ * testado quando está ligado é um mecanismo em que ninguém pode confiar no dia
+ * em que for ligado.
+ */
 const getBadges = (d: unknown, c: unknown) =>
+  handler(d, c, { now: AFTER_SEASON, seasonBadgesActive: true });
+
+/** O motor como está em produção: sem override nenhum. */
+const getBadgesAsShipped = (d: unknown, c: unknown) =>
   handler(d, c, { now: AFTER_SEASON });
 
 const creatorEntries = (economy: string) =>
@@ -171,6 +183,31 @@ describe("E2E — selos de colocação de temporada", () => {
       out.badges.filter((b: string) => b.startsWith("season_")),
       []
     );
+  });
+
+  it("DESLIGADO, uma vitória não vira troféu — e o cursor não anda", async () => {
+    // É o estado de produção hoje. O cursor ficar parado é o que torna ligar
+    // retroativo: quem venceu setembro não perde por a feature estar apagada.
+    await wipe();
+    await freshAccount();
+    await creatorEntries("cash").doc(ME).set({
+      creator_uid: ME,
+      [CREATOR_VOLUME_FIELD]: 500_000,
+    });
+
+    const out = await getBadgesAsShipped({}, ctx(ME));
+    assert.deepEqual(
+      out.badges.filter((b: string) => b.startsWith("season_")),
+      []
+    );
+
+    const stored = await db.collection("users").doc(ME).get();
+    assert.equal(stored.get("season_badges_through"), undefined);
+  });
+
+  it("e ligar depois concede a MESMA vitória, retroativamente", async () => {
+    const out = await getBadges({}, ctx(ME));
+    assert.ok(out.badges.includes(`season_creator_top1_${SEASON}`));
   });
 
   it("os quinze selos fixos continuam funcionando ao lado", async () => {

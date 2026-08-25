@@ -30,6 +30,29 @@ import { FIRST_ACTIVE_SEASON_ID, seasonWindow } from "./seasonRanking.js";
  * shape the rest of the badge engine already has, with no job to fall behind.
  */
 
+/**
+ * THE SWITCH. While this is false, no placement is ever computed and no trophy
+ * is ever granted.
+ *
+ * IT LIVES ON THE SERVER, and that is the whole point: granting happens here,
+ * on a badge read, so a flag in the app could hide the trophies but not stop
+ * them from being awarded. There is a companion switch in the app that decides
+ * whether the section is shown — it controls DISPLAY, this one controls TRUTH,
+ * and only this one is load-bearing.
+ *
+ * TURNING IT ON IS RETROACTIVE, deliberately. The cursor does not advance while
+ * this is false, so the first read after it flips settles every season that has
+ * already closed — bounded to `MAX_SEASONS_PER_SETTLEMENT` per call, with the
+ * rest on the next call. Somebody who won September does not lose it because
+ * the feature was still dark that month.
+ *
+ * IT IS NOT THE SAME DECISION AS `FIRST_ACTIVE_SEASON_ID`. That constant says
+ * which month the RANKING starts counting, and moving it puts a month's prizes
+ * permanently out of scope. This one only says whether placements become
+ * trophies.
+ */
+export const SEASON_BADGES_ACTIVE = false;
+
 /** Which ranking a placement came from. */
 export type SeasonBadgeTrack = "player" | "creator";
 
@@ -180,6 +203,15 @@ export interface SeasonsToSettleInput {
   /** `season_badges_through` from the account: the last season already settled. */
   readonly settledThrough: unknown;
   readonly now: Date;
+  /**
+   * Whether the feature is on. Defaults to [SEASON_BADGES_ACTIVE].
+   *
+   * AN INPUT RATHER THAN A HIDDEN CONDITION so the rule stays provable in both
+   * states. A switch read directly from the constant would make every test of
+   * the settlement rule dead the moment the feature is turned off — and the
+   * rule is exactly what must keep working for the day it is turned on.
+   */
+  readonly active?: boolean;
 }
 
 /**
@@ -193,6 +225,10 @@ export interface SeasonsToSettleInput {
  * NEVER THE CURRENT MONTH. A placement is not a fact until the month is over.
  */
 export function seasonsToSettle(input: SeasonsToSettleInput): string[] {
+  // Checked FIRST, before anything is read or derived: while the feature is
+  // off, the answer is "no seasons" regardless of the clock or the cursor.
+  if (!(input.active ?? SEASON_BADGES_ACTIVE)) return [];
+
   const first = FIRST_ACTIVE_SEASON_ID;
   if (first === null) return [];
 

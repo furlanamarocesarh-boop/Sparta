@@ -11,6 +11,7 @@ import {
   placementTier,
   previousSeasonId,
   SEASON_BADGE_ECONOMY,
+  SEASON_BADGES_ACTIVE,
   SEASON_BADGE_TIERS,
   seasonBadgeId,
   seasonsToSettle,
@@ -198,6 +199,56 @@ describe("vizinhança de meses", () => {
   });
 });
 
+describe("o interruptor", () => {
+  it("está DESLIGADO hoje", () => {
+    // Enquanto estiver assim, nenhuma colocação é apurada e nenhum troféu é
+    // concedido. Ele vive no servidor porque é lá que a concessão acontece:
+    // um sinalizador no app esconderia os troféus sem impedir de premiar.
+    assert.equal(SEASON_BADGES_ACTIVE, false);
+  });
+
+  it("desligado, nenhuma temporada é liquidada — nem com o relógio à frente", () => {
+    assert.deepEqual(
+      seasonsToSettle({
+        active: false,
+        settledThrough: undefined,
+        now: new Date(Date.UTC(2030, 0, 5)),
+      }),
+      []
+    );
+  });
+
+  it("o padrão segue a constante", () => {
+    // Sem `active`, a resposta é a do produto — hoje, nada.
+    assert.deepEqual(
+      seasonsToSettle({
+        settledThrough: undefined,
+        now: new Date(Date.UTC(2030, 0, 5)),
+      }),
+      []
+    );
+  });
+
+  it("desligado o CURSOR não anda, então ligar é retroativo", () => {
+    // Quem venceu setembro não perde o troféu por a feature estar apagada
+    // naquele mês: a primeira leitura depois de ligar liquida tudo que já
+    // fechou.
+    const off = seasonsToSettle({
+      active: false,
+      settledThrough: undefined,
+      now: new Date(Date.UTC(2026, 10, 5)),
+    });
+    assert.deepEqual(off, [], "liquidou com o motor desligado");
+
+    const on = seasonsToSettle({
+      active: true,
+      settledThrough: undefined,
+      now: new Date(Date.UTC(2026, 10, 5)),
+    });
+    assert.deepEqual(on, ["2026-09", "2026-10"]);
+  });
+});
+
 describe("quais temporadas ainda devem conferência", () => {
   const first = FIRST_ACTIVE_SEASON_ID!;
 
@@ -206,6 +257,7 @@ describe("quais temporadas ainda devem conferência", () => {
     // uma leitura que só pode responder "não", e conceder troféu por um mês
     // que nunca foi ranqueado seria inventar resultado.
     const out = seasonsToSettle({
+      active: true,
       settledThrough: undefined,
       now: new Date(Date.UTC(2026, 10, 5)),
     });
@@ -214,6 +266,7 @@ describe("quais temporadas ainda devem conferência", () => {
 
   it("NUNCA inclui o mês corrente", () => {
     const out = seasonsToSettle({
+      active: true,
       settledThrough: undefined,
       now: new Date(Date.UTC(2026, 9, 15)), // meio de outubro
     });
@@ -222,6 +275,7 @@ describe("quais temporadas ainda devem conferência", () => {
 
   it("continua de onde parou", () => {
     const out = seasonsToSettle({
+      active: true,
       settledThrough: "2026-09",
       now: new Date(Date.UTC(2026, 11, 5)),
     });
@@ -231,6 +285,7 @@ describe("quais temporadas ainda devem conferência", () => {
   it("em dia, não devolve nada", () => {
     assert.deepEqual(
       seasonsToSettle({
+        active: true,
         settledThrough: "2026-10",
         now: new Date(Date.UTC(2026, 10, 15)),
       }),
@@ -241,6 +296,7 @@ describe("quais temporadas ainda devem conferência", () => {
   it("um cursor corrompido cai para a primeira temporada, sem estourar", () => {
     for (const bad of [null, 42, "lixo", "2026-13", {}]) {
       const out = seasonsToSettle({
+        active: true,
         settledThrough: bad,
         now: new Date(Date.UTC(2026, 10, 5)),
       });
@@ -250,6 +306,7 @@ describe("quais temporadas ainda devem conferência", () => {
 
   it("um cursor ANTERIOR à primeira temporada não reabre o passado", () => {
     const out = seasonsToSettle({
+      active: true,
       settledThrough: "2020-01",
       now: new Date(Date.UTC(2026, 10, 5)),
     });
@@ -260,6 +317,7 @@ describe("quais temporadas ainda devem conferência", () => {
     // O cursor faz o resto ser liquidado na chamada seguinte, em vez de
     // perdido.
     const out = seasonsToSettle({
+      active: true,
       settledThrough: undefined,
       now: new Date(Date.UTC(2030, 0, 5)),
     });
