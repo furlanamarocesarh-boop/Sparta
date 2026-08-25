@@ -1,3 +1,5 @@
+import { isSeasonBadgeId } from "./seasonBadges.js";
+
 /**
  * Rare items: badges now, avatars later.
  *
@@ -204,6 +206,21 @@ export const MAX_ACKNOWLEDGED_BADGES = 32;
  * same celebration is the ordinary case, and the second one legitimately has
  * nothing left to clear.
  */
+/**
+ * Whether an id names a badge this backend can actually grant.
+ *
+ * TWO ANSWERS, NOT ONE. The fifteen fixed badges live in [BADGES] and are
+ * looked up; a season placement badge is not in any table — its id space is
+ * infinite, one per month — so it is PARSED instead. Every check that used to
+ * ask `badgeById(id) !== null` has to ask this, or a season trophy becomes an
+ * id the engine refuses to acknowledge and the celebration repeats forever.
+ */
+export function isKnownBadgeId(id: unknown): boolean {
+  return (
+    (typeof id === "string" && badgeById(id) !== null) || isSeasonBadgeId(id)
+  );
+}
+
 export function acknowledgeableIds(
   requested: readonly unknown[],
   unseen: readonly unknown[]
@@ -218,7 +235,7 @@ export function acknowledgeableIds(
     if (typeof raw !== "string") continue;
     if (seen.has(raw)) continue;
     if (!pending.has(raw)) continue;
-    if (badgeById(raw) === null) continue;
+    if (!isKnownBadgeId(raw)) continue;
     seen.add(raw);
     out.push(raw);
   }
@@ -240,7 +257,7 @@ export function pendingCelebrations(
 ): string[] {
   const stored = Array.isArray(storedUnseen)
     ? storedUnseen.filter(
-        (id): id is string => typeof id === "string" && badgeById(id) !== null
+        (id): id is string => typeof id === "string" && isKnownBadgeId(id)
       )
     : [];
 

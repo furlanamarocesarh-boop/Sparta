@@ -5,6 +5,7 @@ import {
   BADGES,
   acknowledgeableIds,
   badgeById,
+  isKnownBadgeId,
   badgesToAward,
   pendingCelebrations,
   MAX_ACKNOWLEDGED_BADGES,
@@ -325,5 +326,52 @@ describe("o momento da conquista", () => {
       assert.deepEqual(acknowledgeableIds(["creator_verified"], []), []);
       assert.deepEqual(acknowledgeableIds([], unseen), []);
     });
+  });
+});
+
+describe("o motor reconhece as DUAS famílias de id", () => {
+  // Os quinze fixos vivem numa tabela e são PROCURADOS. Um selo de colocação
+  // não está em tabela nenhuma — o espaço de ids dele é infinito, um por mês —
+  // então é INTERPRETADO. Toda checagem que perguntava "existe na tabela?"
+  // passou a perguntar as duas coisas; sem isso, um troféu de temporada vira
+  // um id que o motor recusa confirmar, e a comemoração se repete para sempre.
+  const SEASON = "season_player_top1_2026-09";
+
+  it("um selo fixo é conhecido", () => {
+    assert.equal(isKnownBadgeId("creator_verified"), true);
+  });
+
+  it("um selo de temporada é conhecido", () => {
+    assert.equal(isKnownBadgeId(SEASON), true);
+    assert.equal(isKnownBadgeId("season_creator_top100_2027-01"), true);
+  });
+
+  it("lixo não é conhecido", () => {
+    for (const bad of [
+      "selo_inventado",
+      "season_player_top7_2026-09",
+      "",
+      null,
+      42,
+      {},
+    ]) {
+      assert.equal(isKnownBadgeId(bad), false, String(bad));
+    }
+  });
+
+  it("a comemoração de um troféu de temporada pode ser CONFIRMADA", () => {
+    // Este é o bug que a mudança evita: sem reconhecer o id, `arrayRemove`
+    // nunca limparia a dívida e o diálogo voltaria em toda leitura.
+    assert.deepEqual(acknowledgeableIds([SEASON], [SEASON]), [SEASON]);
+  });
+
+  it("um troféu de temporada sobrevive na fila de comemoração", () => {
+    assert.deepEqual(pendingCelebrations([SEASON], []), [SEASON]);
+  });
+
+  it("um id de temporada MALFORMADO continua sendo descartado", () => {
+    const fake = "season_player_top7_2026-09";
+    assert.deepEqual(acknowledgeableIds([fake], [fake]), []);
+    assert.deepEqual(pendingCelebrations([fake], []), []);
   });
 });

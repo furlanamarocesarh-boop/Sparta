@@ -279,6 +279,18 @@ service cloud.firestore {
       }
     }
 
+    // RANKING DE CRIADORES POR TEMPORADA — a mesma coisa do quadro acumulado,
+    // recortada por mês, e é dela que sai a colocação de um selo de temporada.
+    // Fechada pelo mesmo motivo: a entrada guarda `creator_uid`, e liberar
+    // leitura entregaria o uid de todo criador junto com quanto movimenta.
+    match /creator_seasons/{seasonDoc} {
+      allow read, write: if false;
+
+      match /entries/{creatorUid} {
+        allow read, write: if false;
+      }
+    }
+
     // Bloqueia qualquer collection não prevista.
     match /{document=**} {
       allow read, write: if false;

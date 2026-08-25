@@ -190,6 +190,7 @@ import {
 } from "./domain/publicProfile.js";
 import {
   CREATOR_ENTRIES_SUBCOLLECTION,
+  CREATOR_SEASONS_COLLECTION,
   CREATOR_LEADERBOARD_PAGE_SIZE,
   CREATOR_RANKINGS_COLLECTION,
   CREATOR_VOLUME_FIELD,
@@ -197,6 +198,11 @@ import {
   projectCreatorRow,
   type CreatorRow,
 } from "./domain/creatorRanking.js";
+import {
+  badgeForPlacement,
+  SEASON_BADGE_ECONOMY,
+  seasonsToSettle,
+} from "./domain/seasonBadges.js";
 import {
   acknowledgeableIds,
   badgesToAward,
@@ -3070,6 +3076,64 @@ function seasonEntriesQuery(
 }
 
 /** A domain ordering scalar, as the Firestore value the queries compare. */
+/**
+ * The three disjoint counting queries that define "entries ahead of mine".
+ *
+ * EXTRACTED SO THERE IS ONE DEFINITION. `getMySeasonRanking` tells a player
+ * their ordinal, and the season-badge settlement decides whether that ordinal
+ * earned a permanent trophy. If the two ever computed "ahead" differently, a
+ * player could be shown 3rd and awarded Top 10, and neither number would be
+ * provably wrong — the worst kind of disagreement to debug.
+ *
+ * The rule (§4.3), unchanged: a strictly better score, OR the same score with
+ * more wins, OR both equal with a lower document id. Every third-level bound is
+ * strict, so the caller's own row falls in none of the three.
+ *
+ * The queries are returned UNEXECUTED because the two callers run them
+ * differently — one inside a read-only transaction, one as plain reads over a
+ * season that is already closed and therefore stable.
+ */
+function aheadQueries(
+  entries: FirebaseFirestore.CollectionReference,
+  mine: {
+    readonly scoreCentavos: number;
+    readonly winsCount: number;
+    readonly documentId: string;
+  }
+): FirebaseFirestore.AggregateQuery<
+  { count: FirebaseFirestore.AggregateField<number> },
+  FirebaseFirestore.DocumentData,
+  FirebaseFirestore.DocumentData
+>[] {
+  const myScore = rankTimestamp(encodeRankScalar(mine.scoreCentavos));
+  const myWins = rankTimestamp(encodeRankScalar(mine.winsCount));
+
+  return [
+    entries
+      .where("scoreOrder", ">", myScore)
+      .where("scoreOrder", "<=", MAX_RANK_TS)
+      .where("winsOrder", ">=", MIN_RANK_TS)
+      .where("winsOrder", "<=", MAX_RANK_TS)
+      .orderBy("scoreOrder", "desc")
+      .orderBy("winsOrder", "desc")
+      .orderBy(FieldPath.documentId(), "asc")
+      .count(),
+    entries
+      .where("scoreOrder", "==", myScore)
+      .where("winsOrder", ">", myWins)
+      .where("winsOrder", "<=", MAX_RANK_TS)
+      .orderBy("winsOrder", "desc")
+      .orderBy(FieldPath.documentId(), "asc")
+      .count(),
+    entries
+      .where("scoreOrder", "==", myScore)
+      .where("winsOrder", "==", myWins)
+      .where(FieldPath.documentId(), "<", mine.documentId)
+      .orderBy(FieldPath.documentId(), "asc")
+      .count(),
+  ];
+}
+
 function rankTimestamp(scalar: RankScalar): Timestamp {
   return new Timestamp(scalar.seconds, scalar.nanoseconds);
 }
@@ -3498,49 +3562,19 @@ export const getMySeasonRankingHandler = async (
           seasonId
         );
 
-        // THREE DISJOINT COUNTS over the same typed domain, all in this
-        // transaction: a strictly better score, or the same score with more
-        // wins, or both equal with a lower document id. Together they cover
-        // exactly the entries ahead under §4.3, and the caller's own row is in
-        // none of them because every third-level bound is strict.
-        const myScore = rankTimestamp(encodeRankScalar(mine.scoreCentavos));
-        const myWins = rankTimestamp(encodeRankScalar(mine.winsCount));
-
+        // THREE DISJOINT COUNTS covering exactly the entries ahead under §4.3.
+        // The QUERIES are built by `aheadQueries` so this handler and the
+        // season-badge settlement share one definition of "ahead" — a placement
+        // trophy that disagreed with the leaderboard it came from would be the
+        // worst possible bug in either.
         const [betterScore, sameScoreMoreWins, sameTupleEarlierId] =
-          await Promise.all([
-            transaction.get(
-              entries
-                .where("scoreOrder", ">", myScore)
-                .where("scoreOrder", "<=", MAX_RANK_TS)
-                .where("winsOrder", ">=", MIN_RANK_TS)
-                .where("winsOrder", "<=", MAX_RANK_TS)
-                .orderBy("scoreOrder", "desc")
-                .orderBy("winsOrder", "desc")
-                .orderBy(FieldPath.documentId(), "asc")
-                .count()
-            ),
-            transaction.get(
-              entries
-                .where("scoreOrder", "==", myScore)
-                .where("winsOrder", ">", myWins)
-                .where("winsOrder", "<=", MAX_RANK_TS)
-                .orderBy("winsOrder", "desc")
-                .orderBy(FieldPath.documentId(), "asc")
-                .count()
-            ),
-            transaction.get(
-              entries
-                .where("scoreOrder", "==", myScore)
-                .where("winsOrder", "==", myWins)
-                .where(
-                  FieldPath.documentId(),
-                  "<",
-                  entrySnap.id
-                )
-                .orderBy(FieldPath.documentId(), "asc")
-                .count()
-            ),
-          ]);
+          await Promise.all(
+            aheadQueries(entries, {
+              scoreCentavos: mine.scoreCentavos,
+              winsCount: mine.winsCount,
+              documentId: entrySnap.id,
+            }).map((query) => transaction.get(query))
+          );
 
         const ahead =
           betterScore.data().count +
@@ -4122,7 +4156,16 @@ export const createPartner = central.https.onCall(async (data, context) => {
  */
 export const getMyBadgesHandler = async (
   data: any,
-  context: any
+  context: any,
+  /**
+   * Test-only clock, following the options-with-defaults convention already
+   * used by `ensurePublicPlayerIdHandler` and `getMySeasonRanking`. Production
+   * never passes it. It exists because season settlement depends on WHICH
+   * seasons have closed, and the first ranked season is still in the future —
+   * without a seam there would be no way to prove the settlement at all until
+   * October 2026.
+   */
+  options: { readonly now?: Date } = {}
 ): Promise<Record<string, unknown>> => {
   try {
     const auth = assertSignedIn(
@@ -4167,9 +4210,22 @@ export const getMyBadgesHandler = async (
         )
       : [];
 
+    const placements = await settleSeasonPlacements(
+      auth.uid,
+      userData.season_badges_through,
+      options.now ?? new Date()
+    );
+
     const fresh = badgesToAward(counts, owned);
-    const freshIds = fresh.map((b) => b.id);
-    if (fresh.length > 0) {
+    // Placement trophies are ids the fixed table does not contain, so they are
+    // merged here rather than produced by `badgesToAward`. Already-owned ones
+    // are filtered out for the same reason granting is idempotent everywhere
+    // else: settling a season twice must write nothing the second time.
+    const ownedSet = new Set(owned);
+    const freshPlacements = placements.earned.filter((id) => !ownedSet.has(id));
+    const freshIds = [...fresh.map((b) => b.id), ...freshPlacements];
+
+    if (freshIds.length > 0 || placements.through !== null) {
       /**
        * `badges_unseen` IS WRITTEN IN THE SAME WRITE THAT GRANTS.
        *
@@ -4182,9 +4238,19 @@ export const getMyBadgesHandler = async (
        */
       await userRef.set(
         {
-          badges: FieldValue.arrayUnion(...freshIds),
-          badges_unseen: FieldValue.arrayUnion(...freshIds),
-          badges_updated_at: FieldValue.serverTimestamp(),
+          ...(freshIds.length > 0
+            ? {
+                badges: FieldValue.arrayUnion(...freshIds),
+                badges_unseen: FieldValue.arrayUnion(...freshIds),
+                badges_updated_at: FieldValue.serverTimestamp(),
+              }
+            : {}),
+          // THE CURSOR MOVES EVEN WHEN NOTHING WAS EARNED. Placing nowhere is
+          // the ordinary outcome, and re-checking the same closed season on
+          // every read forever would be a growing cost that buys nothing.
+          ...(placements.through !== null
+            ? { season_badges_through: placements.through }
+            : {}),
         },
         { merge: true }
       );
@@ -4206,7 +4272,109 @@ export const getMyBadgesHandler = async (
   }
 };
 
-export const getMyBadges = central.https.onCall(getMyBadgesHandler);
+/**
+ * The placement trophies a closed season owes this account.
+ *
+ * COMPUTED ON READ, NOT ON A SCHEDULE. "You finished third" only becomes a fact
+ * when the month ends, and this backend has no scheduler — so the answer is
+ * worked out on the first badge read after the season closed. That is the same
+ * read-and-grant shape the rest of the engine already has: no job to fall
+ * behind, and nothing to re-run if one fails.
+ *
+ * CASH ONLY. `SEASON_BADGE_ECONOMY` is a constant, not a parameter, so no
+ * caller can mint a permanent trophy out of the play-money board.
+ *
+ * IT USES THE LEADERBOARD'S OWN DEFINITION OF "AHEAD" via `aheadQueries`. A
+ * trophy that disagreed with the board it came from would be the worst bug
+ * either could have.
+ *
+ * A SEASON WITH NO ENTRY EARNS NOTHING, silently: not competing is the ordinary
+ * case, not an error.
+ */
+async function settleSeasonPlacements(
+  uid: string,
+  settledThrough: unknown,
+  now: Date
+): Promise<{ earned: string[]; through: string | null }> {
+  const seasons = seasonsToSettle({ settledThrough, now });
+  if (seasons.length === 0) return { earned: [], through: null };
+
+  const economy = SEASON_BADGE_ECONOMY as RankingEconomy;
+  const identitySnap = await db
+    .collection(PUBLIC_PLAYER_ID_COLLECTION)
+    .doc(uid)
+    .get();
+  const storedId = identitySnap.exists
+    ? identitySnap.get("publicPlayerId")
+    : null;
+  const publicPlayerId = isPublicPlayerId(storedId) ? storedId : null;
+
+  const earned: string[] = [];
+
+  for (const seasonId of seasons) {
+    // ── The player board ────────────────────────────────────────────────
+    if (publicPlayerId !== null) {
+      const entries = db
+        .collection(SEASON_RANKINGS_COLLECTION)
+        .doc(seasonDocumentId(economy, seasonId))
+        .collection(SEASON_ENTRIES_SUBCOLLECTION);
+      const entrySnap = await entries.doc(publicPlayerId).get();
+      if (entrySnap.exists) {
+        const mine = publicEntry(
+          1,
+          entrySnap.id,
+          entrySnap.data() ?? {},
+          economy,
+          seasonId
+        );
+        const counts = await Promise.all(
+          aheadQueries(entries, {
+            scoreCentavos: mine.scoreCentavos,
+            winsCount: mine.winsCount,
+            documentId: entrySnap.id,
+          }).map((query) => query.get())
+        );
+        const ahead = counts.reduce((sum, c) => sum + c.data().count, 0);
+        const badge = badgeForPlacement("player", seasonId, ahead + 1);
+        if (badge !== null) earned.push(badge);
+      }
+    }
+
+    // ── The creator board ───────────────────────────────────────────────
+    const creatorEntries = db
+      .collection(CREATOR_SEASONS_COLLECTION)
+      .doc(seasonDocumentId(economy, seasonId))
+      .collection(CREATOR_ENTRIES_SUBCOLLECTION);
+    const mineSnap = await creatorEntries.doc(uid).get();
+    if (mineSnap.exists) {
+      const volume = mineSnap.get(CREATOR_VOLUME_FIELD);
+      if (typeof volume === "number" && Number.isFinite(volume)) {
+        // Two disjoint counts, the same shape as the player board's three:
+        // strictly more volume, or the same volume with a lower document id.
+        // The creator's own row is in neither, because both bounds are strict.
+        const [more, tied] = await Promise.all([
+          creatorEntries.where(CREATOR_VOLUME_FIELD, ">", volume).count().get(),
+          creatorEntries
+            .where(CREATOR_VOLUME_FIELD, "==", volume)
+            .where(FieldPath.documentId(), "<", uid)
+            .count()
+            .get(),
+        ]);
+        const ahead = more.data().count + tied.data().count;
+        const badge = badgeForPlacement("creator", seasonId, ahead + 1);
+        if (badge !== null) earned.push(badge);
+      }
+    }
+  }
+
+  return { earned, through: seasons[seasons.length - 1] };
+}
+
+// Wrapped rather than passed directly: the handler's third parameter is a
+// test-only clock, and the callable runtime has nothing to put there.
+export const getMyBadges = central.https.onCall((data, context) =>
+  getMyBadgesHandler(data, context)
+);
 
 const ACKNOWLEDGE_BADGES_KEYS = ["badge_ids"] as const;
 
@@ -4301,7 +4469,8 @@ export type CreatorAccrualOutcome =
  * board is a lie about real money.
  */
 export const onEntryFeeCreatorAccrualHandler = async (
-  snapshot: any
+  snapshot: any,
+  options: { readonly now?: Date } = {}
 ): Promise<CreatorAccrualOutcome> => {
   const data = snapshot?.data?.();
   if (!data) return { accrued: false, reason: "no-data" };
@@ -4361,25 +4530,38 @@ export const onEntryFeeCreatorAccrualHandler = async (
     ? identitySnap.get("publicPlayerId")
     : null;
 
-  await db
-    .collection(CREATOR_RANKINGS_COLLECTION)
-    .doc(decision.economy)
-    .collection(CREATOR_ENTRIES_SUBCOLLECTION)
-    .doc(decision.creatorUid)
-    .set(
-      {
-        creator_uid: decision.creatorUid,
-        nickname:
-          typeof creatorSnap.get("username") === "string"
-            ? creatorSnap.get("username")
-            : "",
-        public_player_id: isPublicPlayerId(storedId) ? storedId : null,
-        [CREATOR_VOLUME_FIELD]: FieldValue.increment(decision.centavos),
-        entries_count: FieldValue.increment(1),
-        updated_at: FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
+  const row = {
+    creator_uid: decision.creatorUid,
+    nickname:
+      typeof creatorSnap.get("username") === "string"
+        ? creatorSnap.get("username")
+        : "",
+    public_player_id: isPublicPlayerId(storedId) ? storedId : null,
+    [CREATOR_VOLUME_FIELD]: FieldValue.increment(decision.centavos),
+    entries_count: FieldValue.increment(1),
+    updated_at: FieldValue.serverTimestamp(),
+  };
+
+  // TWO BOARDS FROM ONE EVENT. The all-time board is what the app shows; the
+  // seasonal one is what a placement badge is computed from at month end.
+  // Deriving one from the other would mean either summing every season on
+  // every read, or never being able to say which month a trophy belongs to.
+  const seasonId = seasonIdFromInstant(options.now ?? new Date());
+
+  await Promise.all([
+    db
+      .collection(CREATOR_RANKINGS_COLLECTION)
+      .doc(decision.economy)
+      .collection(CREATOR_ENTRIES_SUBCOLLECTION)
+      .doc(decision.creatorUid)
+      .set(row, { merge: true }),
+    db
+      .collection(CREATOR_SEASONS_COLLECTION)
+      .doc(seasonDocumentId(decision.economy as RankingEconomy, seasonId))
+      .collection(CREATOR_ENTRIES_SUBCOLLECTION)
+      .doc(decision.creatorUid)
+      .set(row, { merge: true }),
+  ]);
 
   return {
     accrued: true,
@@ -4390,7 +4572,9 @@ export const onEntryFeeCreatorAccrualHandler = async (
 
 export const onEntryFeeCreatorAccrual = central.firestore
   .document("transactions/{transactionId}")
-  .onCreate(onEntryFeeCreatorAccrualHandler);
+  // Wrapped rather than passed directly: the handler's second parameter is a
+  // test-only clock, and Firestore would hand it an EventContext there.
+  .onCreate((snapshot) => onEntryFeeCreatorAccrualHandler(snapshot));
 
 const CREATOR_LEADERBOARD_KEYS = ["economy"] as const;
 

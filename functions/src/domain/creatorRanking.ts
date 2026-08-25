@@ -29,6 +29,21 @@ import { inspectReais } from "./money.js";
  */
 
 export const CREATOR_RANKINGS_COLLECTION = "creator_rankings";
+
+/**
+ * The per-season creator board, kept ALONGSIDE the all-time one above.
+ *
+ * TWO BOARDS, NOT A REPLACEMENT. The leaderboard the app shows is all-time —
+ * "who has moved the most, ever" — and turning it into a monthly board would
+ * silently change a feature that was already decided. But a season placement
+ * badge needs a season, so the same accrual also writes here. It is one extra
+ * document per paid registration, which is nothing against the cost of having
+ * one number mean two different things.
+ *
+ * Document id follows `seasonDocumentId`: the economy and the season, never one
+ * without the other.
+ */
+export const CREATOR_SEASONS_COLLECTION = "creator_seasons";
 export const CREATOR_ENTRIES_SUBCOLLECTION = "entries";
 
 /** The field the board is ordered by. Integer centavos, never reais. */
