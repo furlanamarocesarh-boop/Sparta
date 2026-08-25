@@ -335,6 +335,20 @@ export const onUserCreated = east.auth.user().onCreate(async (user) => {
     player_id: playerId,
     pix_key: "",
     whatsapp: "",
+    /**
+     * When the account started.
+     *
+     * WRITTEN HERE BECAUSE NOTHING ELSE WROTE IT. The public profile shows
+     * "Desde agosto de 2026", and `projectPublicProfile` reads `created_at` —
+     * which no path in this backend had ever set, so the line rendered for
+     * nobody. This is the only moment the answer is knowable without guessing.
+     *
+     * ACCOUNTS THAT PREDATE THIS LINE stay without it, and their profile shows
+     * no "Desde". Backfilling would mean inventing a date from whatever
+     * artefact happened to survive — a first tournament, a wallet document —
+     * and a profile is a bad place to publish a guess as a fact.
+     */
+    created_at: FieldValue.serverTimestamp(),
   };
 
   const walletData = {
@@ -2603,8 +2617,13 @@ export const getPlayerEngagementStats = central.https.onCall(
  * surface; `functionRegions.test.ts` discovers deployable exports by their
  * `__trigger` and this has none. It is exported so the ranking trigger and
  * `getMySeasonRanking` can call it internally later, and so its real Firestore
- * behaviour can be tested. THIS COMMIT ADDS NO CALL SITE — deciding WHEN an
- * identity is first created belongs to step 5 of section 21.
+ * behaviour can be tested.
+ *
+ * TWO CALL SITES TODAY, and both are deliberate: prize settlement — a winner
+ * needs a leaderboard row — and `getMyProfile`, because sharing a profile
+ * requires having an address and a player who never won had none. Being
+ * create-only and idempotent is what makes a second call site safe: neither
+ * can overwrite, reassign or release what the other created.
  *
  * THE RESERVATION IS A CREATE-ONLY PAIR, in one transaction:
  *   public_player_ids/{uid}                  -> { publicPlayerId, createdAt }
@@ -3384,8 +3403,13 @@ export const getMySeasonRankingHandler = async (
     const uid = normalizeIdentityUid(callerAuth.uid);
 
     // Read INSIDE the snapshot below, like everything else this answer rests
-    // on. An identity is MINTED by settlement, never by a leaderboard read, so
-    // a player who never won stays unregistered.
+    // on. This read never MINTS: an identity is created by settlement, or by
+    // the player opening their own profile — never by a leaderboard read.
+    //
+    // AND HAVING ONE STILL DOES NOT MEAN BEING RANKED. What decides that is
+    // the season ENTRY below, which only settlement writes. So a player who
+    // opened their profile and never won has an identity and no entry, and
+    // reads as unranked — the same answer as before this was ever minted here.
     const identityRef = db.collection(PUBLIC_PLAYER_ID_COLLECTION).doc(uid);
 
     const entries = seasonEntriesQuery(economy, seasonId);
@@ -4250,27 +4274,7 @@ export const getPublicProfileHandler = async (
       throw new DomainError("not-found", "Perfil não encontrado.");
     }
 
-    const [userSnap, createdSnap] = await Promise.all([
-      db.collection("users").doc(uid).get(),
-      db
-        .collection("tournaments")
-        .where("creator_uid", "==", uid)
-        .count()
-        .get(),
-    ]);
-    if (!userSnap.exists) {
-      throw new DomainError("not-found", "Perfil não encontrado.");
-    }
-    const userData = userSnap.data() ?? {};
-
-    return projectPublicProfile({
-      publicPlayerId,
-      username: userData.username,
-      badges: userData.badges,
-      tournamentsPlayed: userData.tournaments_played,
-      tournamentsCreated: createdSnap.data().count,
-      createdAt: userData.created_at ?? userData.createdAt,
-    });
+    return await loadPublicProfile(uid, publicPlayerId);
   } catch (error) {
     console.error("getPublicProfile error:", error);
     throw toHttpsError(error);
@@ -4278,6 +4282,88 @@ export const getPublicProfileHandler = async (
 };
 
 export const getPublicProfile = central.https.onCall(getPublicProfileHandler);
+
+/**
+ * Reads one account and projects it. The ONE place a profile is built, so the
+ * owner's preview and a stranger's view can never diverge.
+ *
+ * WHY THAT MATTERS MORE THAN THE DUPLICATION IT SAVES. `getMyProfile` exists so
+ * a player can see what they are about to share. If it built its own answer,
+ * the preview would be a SECOND opinion about what is public — and the day the
+ * two drift, the app shows the owner one thing and hands strangers another.
+ * Sharing the loader makes the preview true by construction.
+ */
+async function loadPublicProfile(
+  uid: string,
+  publicPlayerId: string
+): Promise<PublicProfile> {
+  const [userSnap, createdSnap] = await Promise.all([
+    db.collection("users").doc(uid).get(),
+    db.collection("tournaments").where("creator_uid", "==", uid).count().get(),
+  ]);
+  if (!userSnap.exists) {
+    throw new DomainError("not-found", "Perfil não encontrado.");
+  }
+  const userData = userSnap.data() ?? {};
+
+  return projectPublicProfile({
+    publicPlayerId,
+    username: userData.username,
+    badges: userData.badges,
+    tournamentsPlayed: userData.tournaments_played,
+    tournamentsCreated: createdSnap.data().count,
+    createdAt: userData.created_at ?? userData.createdAt,
+  });
+}
+
+/**
+ * The caller's OWN profile — and the pseudonym that addresses it.
+ *
+ * WHY THIS EXISTS AT ALL. Sharing a profile requires knowing your own
+ * `publicPlayerId`, and until now nothing told a player theirs: the pseudonym
+ * was minted by prize settlement and surfaced only to someone already on a
+ * leaderboard. So a player who had never won had no address, and no link.
+ *
+ * THIS IS THEREFORE THE SECOND PLACE AN IDENTITY IS MINTED, deliberately.
+ * `ensurePublicPlayerIdHandler` is create-only and idempotent, so minting here
+ * cannot overwrite or reassign anything — and the leaderboard is unaffected,
+ * because being RANKED depends on having a season ENTRY, which only settlement
+ * writes. An identity with no entry reads as unranked, exactly as before.
+ *
+ * IT RETURNS THE PUBLIC PROJECTION, not the private account. What the owner
+ * sees here is byte-for-byte what a stranger sees, because it is the same
+ * loader — which is the point: this is a preview of the thing being shared.
+ */
+export const getMyProfileHandler = async (
+  data: any,
+  context: any
+): Promise<PublicProfile> => {
+  try {
+    const auth = assertSignedIn(
+      context as any,
+      "Entre na sua conta para ver seu perfil."
+    );
+    assertExactPayload(data ?? {}, []);
+
+    // EXISTÊNCIA ANTES DA CUNHAGEM. Uma identidade é create-only e nunca
+    // liberada, então cunhar uma para uma conta que não existe deixa um par de
+    // documentos órfãos que nada pode limpar depois. A ordem custa uma leitura
+    // e é a única que não escreve algo permanente por engano.
+    const userSnap = await db.collection("users").doc(auth.uid).get();
+    if (!userSnap.exists) {
+      throw new DomainError("not-found", "Sua conta não foi encontrada.");
+    }
+
+    const { publicPlayerId } = await ensurePublicPlayerIdHandler(auth.uid);
+
+    return await loadPublicProfile(auth.uid, publicPlayerId);
+  } catch (error) {
+    console.error("getMyProfile error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const getMyProfile = central.https.onCall(getMyProfileHandler);
 
 const SET_NICKNAME_KEYS = ["nickname"] as const;
 
