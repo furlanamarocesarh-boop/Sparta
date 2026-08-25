@@ -185,6 +185,10 @@ import {
   NICKNAMES_COLLECTION,
 } from "./domain/nickname.js";
 import {
+  projectPublicProfile,
+  type PublicProfile,
+} from "./domain/publicProfile.js";
+import {
   badgesToAward,
   referredPlayerCounts,
 } from "./domain/badges.js";
@@ -4199,6 +4203,81 @@ async function countQualifiedReferrals(partnerId: string): Promise<number> {
 function readPlayedCount(raw: unknown): number {
   return typeof raw === "number" && Number.isInteger(raw) && raw >= 0 ? raw : 0;
 }
+
+const PUBLIC_PROFILE_KEYS = ["public_player_id"] as const;
+
+/**
+ * A player's public profile, by pseudonym.
+ *
+ * OPEN TO ANY SIGNED-IN PLAYER, which is the whole point: a profile is a page
+ * you send to someone else. Signed-in rather than fully public because an
+ * unauthenticated endpoint over a 22-character id is a scraping surface, and
+ * requiring an account puts a name on whoever walks the space.
+ *
+ * THE PSEUDONYM IS THE ADDRESS. The caller never sends a uid and never
+ * receives one — `public_player_id_index` resolves the pseudonym server-side,
+ * through the Admin SDK, and the uid stays inside this function.
+ *
+ * THE PROJECTION IS AN ALLOWLIST, built key by key in `projectPublicProfile`.
+ * A field added to `users/{uid}` next month is invisible here until somebody
+ * deliberately adds it, which is the only version of this that stays safe.
+ */
+export const getPublicProfileHandler = async (
+  data: any,
+  context: any
+): Promise<PublicProfile> => {
+  try {
+    assertSignedIn(
+      context as any,
+      "Entre na sua conta para ver perfis."
+    );
+    assertExactPayload(data, PUBLIC_PROFILE_KEYS);
+
+    const publicPlayerId = String(data.public_player_id ?? "").trim();
+    if (!isPublicPlayerId(publicPlayerId)) {
+      throw new DomainError("invalid-argument", "Perfil inválido.");
+    }
+
+    const indexSnap = await db
+      .collection(PUBLIC_PLAYER_ID_INDEX_COLLECTION)
+      .doc(publicPlayerId)
+      .get();
+    if (!indexSnap.exists) {
+      throw new DomainError("not-found", "Perfil não encontrado.");
+    }
+    const uid = String(indexSnap.get("uid") ?? "");
+    if (!uid) {
+      throw new DomainError("not-found", "Perfil não encontrado.");
+    }
+
+    const [userSnap, createdSnap] = await Promise.all([
+      db.collection("users").doc(uid).get(),
+      db
+        .collection("tournaments")
+        .where("creator_uid", "==", uid)
+        .count()
+        .get(),
+    ]);
+    if (!userSnap.exists) {
+      throw new DomainError("not-found", "Perfil não encontrado.");
+    }
+    const userData = userSnap.data() ?? {};
+
+    return projectPublicProfile({
+      publicPlayerId,
+      username: userData.username,
+      badges: userData.badges,
+      tournamentsPlayed: userData.tournaments_played,
+      tournamentsCreated: createdSnap.data().count,
+      createdAt: userData.created_at ?? userData.createdAt,
+    });
+  } catch (error) {
+    console.error("getPublicProfile error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const getPublicProfile = central.https.onCall(getPublicProfileHandler);
 
 const SET_NICKNAME_KEYS = ["nickname"] as const;
 
