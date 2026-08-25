@@ -232,7 +232,7 @@ describe("somando por economia", () => {
   });
 });
 
-describe("o resultado: o que ficou, e para quem", () => {
+describe("o lucro vem do razão, não da margem", () => {
   const t = (
     category: string,
     count: number,
@@ -252,69 +252,118 @@ describe("o resultado: o que ficou, e para quem", () => {
   const cashOf = (rows: readonly { economy: string }[]) =>
     rows.find((r) => r.economy === "cash") as any;
 
-  it("a margem é o lucro, e ela tem dono", () => {
-    // O único lucro com razão por trás. A taxa de 7,5% é POLÍTICA de produto:
-    // a liquidação credita o prêmio cheio e não retém nada, então nenhuma
-    // linha registra uma taxa sendo tirada. Reportá-la seria inventar dinheiro
-    // que nunca foi separado.
+  it("arrecadado menos pago é o resultado", () => {
     const split = cashOf(
-      splitProfit([t("house_margin", 3, 10_000), t("commission_accrued", 2, 300)])
+      splitProfit([t("entry_fee", 10, 100_000), t("prize", 1, 70_000)])
     );
-    assert.equal(split.marginCentavos, 10_000);
+    assert.equal(split.collectedCentavos, 100_000);
+    assert.equal(split.paidCentavos, 70_000);
+    assert.equal(split.grossCentavos, 30_000);
+    assert.equal(split.ownerCentavos, 30_000);
+  });
+
+  it("PAGAR MAIS DO QUE ENTROU É PREJUÍZO, não zero", () => {
+    // É exatamente o caso de produção: R$ 10,03 entraram e R$ 30,30 saíram.
+    // Prêmio é CREDITADO sem debitar fonte, então isso sai do nada — e um
+    // painel que pisasse em zero esconderia justamente esse buraco.
+    const split = cashOf(
+      splitProfit([t("entry_fee", 1, 1003), t("prize", 1, 3030)])
+    );
+    assert.equal(split.grossCentavos, -2027);
+    assert.equal(split.ownerCentavos, -2027);
+  });
+
+  it("estorno reduz o arrecadado", () => {
+    const split = cashOf(
+      splitProfit([t("entry_fee", 2, 2000), t("entry_refund", 1, 1000)])
+    );
+    assert.equal(split.collectedCentavos, 1000);
+  });
+
+  it("prêmio por abate também é pagamento", () => {
+    const split = cashOf(
+      splitProfit([t("entry_fee", 1, 5000), t("kill_prize", 3, 1500)])
+    );
+    assert.equal(split.paidCentavos, 1500);
+    assert.equal(split.grossCentavos, 3500);
+  });
+
+  it("A MARGEM NÃO ENTRA — senão o mesmo dinheiro conta duas vezes", () => {
+    // `house_margin` é o registro derivado da MESMA diferença. Somá-la por
+    // cima dobraria o resultado das liquidações que a têm.
+    const split = cashOf(
+      splitProfit([
+        t("entry_fee", 1, 10_000),
+        t("prize", 1, 6_000),
+        t("house_margin", 1, 4_000),
+      ])
+    );
+    assert.equal(split.grossCentavos, 4_000);
+  });
+
+  it("depósito, saque e aporte não são receita", () => {
+    // Dinheiro entrando numa carteira ou no caixa é o operador trocando de
+    // bolso. Só inscrição é alguém pagando à plataforma.
+    const split = cashOf(
+      splitProfit([
+        t("deposit", 1, 50_000),
+        t("withdrawal", 1, 20_000),
+        t("house_funding", 1, 100_000),
+        t("admin_correction", 1, 1_000),
+      ])
+    );
+    assert.equal(split.collectedCentavos, 0);
+    assert.equal(split.paidCentavos, 0);
+    assert.equal(split.ownerCentavos, 0);
+  });
+
+  it("a comissão sai do resultado do dono", () => {
+    const split = cashOf(
+      splitProfit([
+        t("entry_fee", 1, 10_000),
+        t("prize", 1, 6_000),
+        t("commission_accrued", 1, 300),
+      ])
+    );
+    assert.equal(split.grossCentavos, 4_000);
     assert.equal(split.commissionCentavos, 300);
-    assert.equal(split.ownerCentavos, 9_700);
-  });
-
-  it("MARGEM NEGATIVA é um prejuízo, não um zero", () => {
-    // O bug que isto conserta: a casa subsidiando o prêmio grava valor
-    // negativo, e um painel que o pisasse em zero esconderia exatamente o
-    // número que o operador precisa ver.
-    const split = cashOf(splitProfit([t("house_margin", 1, -5_000)]));
-    assert.equal(split.marginCentavos, -5_000);
-    assert.equal(split.ownerCentavos, -5_000);
-  });
-
-  it("o dono pode ficar negativo, e isso não é aparado", () => {
-    const split = cashOf(
-      splitProfit([t("house_margin", 1, 100), t("commission_accrued", 1, 900)])
-    );
-    assert.equal(split.ownerCentavos, -800);
-  });
-
-  it("a comissão nunca entra negativa no cálculo", () => {
-    // Ela é passivo: só existe devendo. Um valor negativo gravado seria dado
-    // corrompido, e somá-lo aumentaria a parte do dono.
-    const split = cashOf(splitProfit([t("commission_accrued", 1, -500)]));
-    assert.equal(split.commissionCentavos, 500);
-    assert.equal(split.ownerCentavos, -500);
+    assert.equal(split.ownerCentavos, 3_700);
   });
 
   it("as duas economias têm resultados separados", () => {
     const rows = splitProfit([
-      t("house_margin", 1, 10_000),
-      t("beta_house_margin", 1, 777),
+      t("entry_fee", 1, 10_000),
+      t("beta_entry_fee", 1, 500),
     ]);
-    assert.equal(cashOf(rows).marginCentavos, 10_000);
+    assert.equal(cashOf(rows).collectedCentavos, 10_000);
     assert.equal(
-      (rows.find((r) => r.economy === "beta_credit") as any).marginCentavos,
-      777
+      (rows.find((r) => r.economy === "beta_credit") as any).collectedCentavos,
+      500
     );
   });
 
-  it("sem movimento, resultado zero — mas as duas linhas existem", () => {
+  it("sem movimento, tudo zero — mas as duas linhas existem", () => {
     const rows = splitProfit([]);
     assert.equal(rows.length, 2);
     assert.ok(rows.every((r) => r.ownerCentavos === 0));
   });
 
-  it("nenhuma outra categoria conta como lucro", () => {
-    // Aporte no caixa é dinheiro COLOCADO, não ganho. Contá-lo como lucro
-    // faria um depósito seu parecer receita.
-    const split = cashOf(
-      splitProfit([t("house_funding", 1, 100_000), t("deposit", 1, 50_000)])
-    );
-    assert.equal(split.marginCentavos, 0);
-    assert.equal(split.ownerCentavos, 0);
+  it("todo papel de lucro está declarado, e só onde faz sentido", () => {
+    const roles: Record<string, string> = {};
+    for (const [id, spec] of Object.entries(CATEGORY_SPECS)) {
+      if (spec.profitRole) roles[id] = spec.profitRole;
+    }
+    assert.deepEqual(roles, {
+      entry_fee: "collected",
+      beta_entry_fee: "collected",
+      entry_refund: "refunded",
+      beta_refund: "refunded",
+      prize: "paid",
+      beta_prize: "paid",
+      kill_prize: "paid",
+      beta_kill_prize: "paid",
+      commission_accrued: "commission",
+    });
   });
 });
 

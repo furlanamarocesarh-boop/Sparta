@@ -52,12 +52,31 @@ export type MoneyDirection =
   /** Neither — an internal move that funds the house. */
   | "internal";
 
+/**
+ * How a category enters the profit calculation.
+ *
+ * `collected` minus `refunded` is what the platform took in; `paid` is what it
+ * handed back out as prizes; the difference is the operating result. Anything
+ * with no role — a deposit, a withdrawal, a treasury top-up — moves money
+ * without the platform earning or losing any.
+ */
+export type ProfitRole = "collected" | "refunded" | "paid" | "commission";
+
 export interface CategorySpec {
   readonly economy: EconomyType;
   readonly shape: AmountShape;
   readonly direction: MoneyDirection;
   /** What an admin should read it as. */
   readonly label: string;
+  /**
+   * What this category is, for the profit calculation.
+   *
+   * DECLARED PER CATEGORY rather than inferred from `direction`, because the
+   * two answer different questions: `direction` says which way a WALLET moved,
+   * and this says whether the PLATFORM earned or spent. A deposit moves a
+   * wallet and earns the platform nothing.
+   */
+  readonly profitRole?: ProfitRole;
   /**
    * True when the stored amount may legitimately be NEGATIVE.
    *
@@ -90,12 +109,14 @@ export const CATEGORY_SPECS: Readonly<Record<string, CategorySpec>> = {
     label: "Saque",
   },
   entry_fee: {
+    profitRole: "collected",
     economy: ECONOMY_CASH,
     shape: "reais",
     direction: "out",
     label: "Inscrição",
   },
   prize: {
+    profitRole: "paid",
     economy: ECONOMY_CASH,
     shape: "reais",
     direction: "in",
@@ -113,12 +134,14 @@ export const CATEGORY_SPECS: Readonly<Record<string, CategorySpec>> = {
     label: "Correção manual",
   },
   entry_refund: {
+    profitRole: "refunded",
     economy: ECONOMY_CASH,
     shape: "reais",
     direction: "in",
     label: "Estorno de inscrição",
   },
   kill_prize: {
+    profitRole: "paid",
     economy: ECONOMY_CASH,
     shape: "reais",
     direction: "in",
@@ -154,18 +177,21 @@ export const CATEGORY_SPECS: Readonly<Record<string, CategorySpec>> = {
     signed: true,
   },
   commission_accrued: {
+    profitRole: "commission",
     economy: ECONOMY_CASH,
     shape: "centavos",
     direction: "internal",
     label: "Comissão de colaborador",
   },
   beta_entry_fee: {
+    profitRole: "collected",
     economy: ECONOMY_BETA_CREDIT,
     shape: "reais",
     direction: "out",
     label: "Inscrição (beta)",
   },
   beta_prize: {
+    profitRole: "paid",
     economy: ECONOMY_BETA_CREDIT,
     shape: "reais",
     direction: "in",
@@ -178,12 +204,14 @@ export const CATEGORY_SPECS: Readonly<Record<string, CategorySpec>> = {
     label: "Crédito beta concedido",
   },
   beta_refund: {
+    profitRole: "refunded",
     economy: ECONOMY_BETA_CREDIT,
     shape: "reais",
     direction: "in",
     label: "Estorno de inscrição (beta)",
   },
   beta_kill_prize: {
+    profitRole: "paid",
     economy: ECONOMY_BETA_CREDIT,
     shape: "reais",
     direction: "in",
@@ -261,12 +289,6 @@ export function aggregateToCentavos(
  * NAMED HERE rather than matched by string at the call site, so "what counts as
  * profit" is a decision with one home.
  */
-export const MARGIN_CATEGORIES: readonly string[] = [
-  "house_margin",
-  "beta_house_margin",
-];
-export const COMMISSION_CATEGORY = "commission_accrued";
-
 /**
  * What the platform actually kept, and what it owes for it.
  *
@@ -288,34 +310,71 @@ export const COMMISSION_CATEGORY = "commission_accrued";
  */
 export interface ProfitSplit {
   readonly economy: EconomyType;
-  /** `pool - paid`, summed. Negative when the house subsidised more than it kept. */
-  readonly marginCentavos: number;
+  /** Entry fees taken in, net of refunds. */
+  readonly collectedCentavos: number;
+  /** Prize money handed out. */
+  readonly paidCentavos: number;
+  /** `collected - paid`. Negative when prizes exceeded what came in. */
+  readonly grossCentavos: number;
   /** Accrued and unpaid. Always zero or more. */
   readonly commissionCentavos: number;
-  /** Margin minus commissions. What is left for the owner. */
+  /** Gross minus commissions. What is left for the owner. */
   readonly ownerCentavos: number;
 }
 
+/**
+ * What the platform actually earned, straight from the ledger.
+ *
+ * COMPUTED FROM ENTRY FEES AND PRIZES, not from `house_margin`. The margin row
+ * is only written by settlements that happened AFTER the treasury shipped — so
+ * reading it reports zero for every tournament that came before, which in
+ * practice means every tournament so far. The entry fees and the prizes are in
+ * the ledger from the first day, so the profit derived from them covers all of
+ * history. That is why the margin category carries NO profit role: counting it
+ * would double the same money for the settlements that do have one.
+ *
+ * A DEPOSIT IS NOT REVENUE, and neither is a treasury top-up. Money moving into
+ * a wallet or into the house is the operator's own money changing pockets. Only
+ * an entry fee is somebody paying the platform, and only a prize is the
+ * platform paying out.
+ *
+ * IT CAN BE NEGATIVE, and that is the number worth having. Prize money is
+ * CREDITED with no source debited, so a tournament that pays more than it
+ * collected is funded out of nothing — exactly the hole the treasury was built
+ * to close. A panel that floored this at zero would hide it.
+ *
+ * THE COMMISSION IS A LIABILITY, NOT A PAYMENT. Nothing in this backend ever
+ * pays a partner, so this is what is OWED, and the owner's share is what
+ * remains after honouring it.
+ */
 export function splitProfit(
   totals: readonly CategoryTotal[]
 ): ProfitSplit[] {
   return [ECONOMY_CASH, ECONOMY_BETA_CREDIT].map((economy) => {
-    let margin = 0;
+    let collected = 0;
+    let paid = 0;
     let commission = 0;
+
     for (const total of totals) {
       if (total.economy !== economy) continue;
-      if (MARGIN_CATEGORIES.includes(total.category)) margin += total.centavos;
-      if (total.category === COMMISSION_CATEGORY) {
-        commission += Math.abs(total.centavos);
-      }
+      const role = specFor(total.category)?.profitRole;
+      const value = Math.abs(total.centavos);
+      if (role === "collected") collected += value;
+      else if (role === "refunded") collected -= value;
+      else if (role === "paid") paid += value;
+      else if (role === "commission") commission += value;
     }
+
+    const gross = collected - paid;
     return {
       economy,
-      marginCentavos: margin,
+      collectedCentavos: collected,
+      paidCentavos: paid,
+      grossCentavos: gross,
       commissionCentavos: commission,
-      // NOT floored at zero. A month where the house subsidised more than it
-      // kept leaves the owner NEGATIVE, and that is the fact.
-      ownerCentavos: margin - commission,
+      // NOT floored at zero: a period where prizes exceeded entries leaves the
+      // owner negative, and that is the fact.
+      ownerCentavos: gross - commission,
     };
   });
 }

@@ -78,6 +78,9 @@ describe("E2E — painel do admin", () => {
     // MARGEM NEGATIVA: a casa subsidiou este prêmio. É gravada abaixo de zero.
     await tx("m2", { category: "house_margin", amount_centavos: -100, economy_type: "cash" }, 4);
     await tx("c1", { category: "commission_accrued", amount_centavos: 30, economy_type: "cash" }, 4);
+    // Uma liquidação que pagou MAIS do que arrecadou — o caso de produção.
+    await tx("e1", { category: "entry_fee", amount: 10.03, economy_type: "cash" }, 1);
+    await tx("p1", { category: "prize", amount: 30.3, economy_type: "cash" }, 1);
     // Beta, que nunca pode se misturar com dinheiro.
     await tx("b1", { category: "beta_entry_fee", amount: 5, economy_type: "beta_credit" }, 6);
     // Mais velha que 24h, dentro da semana.
@@ -117,6 +120,14 @@ describe("E2E — painel do admin", () => {
 
     const margem = categoryOf(out, "day", "house_margin");
     assert.equal(margem.centavos, 150, "250 retidos menos 100 subsidiados");
+    // E a margem NÃO entra no lucro: ela é o registro derivado da mesma
+    // diferença, e somá-la dobraria o dinheiro das liquidações que a têm.
+    const lucro = windowOf(out, "day").profit.find(
+      (p: any) => p.economy === "cash"
+    );
+    // -2027 vem SÓ de inscrição menos prêmio. Se a margem entrasse, os 150
+    // apareceriam aqui e o mesmo dinheiro contaria duas vezes.
+    assert.equal(lucro.grossCentavos, -2027);
   });
 
   it("MARGEM NEGATIVA sobrevive ao agregado", async () => {
@@ -126,9 +137,22 @@ describe("E2E — painel do admin", () => {
     const lucro = windowOf(out, "day").profit.find(
       (p: any) => p.economy === "cash"
     );
-    assert.equal(lucro.marginCentavos, 150);
+    // Não há inscrição nem prêmio nesta janela do seed além do de baixo, então
+    // o que importa aqui é a comissão sair do resultado.
     assert.equal(lucro.commissionCentavos, 30);
-    assert.equal(lucro.ownerCentavos, 120, "margem menos comissão");
+  });
+
+  it("O LUCRO VEM DAS INSCRIÇÕES E DOS PRÊMIOS, não da margem", async () => {
+    // A margem só é gravada por liquidações posteriores ao caixa existir — em
+    // produção não há nenhuma. Inscrição e prêmio estão no razão desde o
+    // primeiro dia, então o lucro derivado deles cobre toda a história.
+    const out = await overview(ctx(ADMIN));
+    const lucro = windowOf(out, "day").profit.find(
+      (p: any) => p.economy === "cash"
+    );
+    assert.equal(lucro.collectedCentavos, 1003);
+    assert.equal(lucro.paidCentavos, 3030);
+    assert.equal(lucro.grossCentavos, -2027, "pagou mais do que entrou");
   });
 
   it("um subsídio MOVEU dinheiro, então conta no volume", async () => {
@@ -155,15 +179,18 @@ describe("E2E — painel do admin", () => {
     assert.equal(beta.volumeCentavos, 500, "só a inscrição beta");
     // A margem entra como |líquido|: +250 retidos e -100 subsidiados chegam
     // já somados pelo Firestore, então contribuem 150 — não 350.
-    assert.equal(cash.volumeCentavos, 5001 + 502 + 10_000 + 150 + 30);
+    assert.equal(
+      cash.volumeCentavos,
+      5001 + 502 + 10_000 + 150 + 30 + 1003 + 3030
+    );
   });
 
   it("entrada e saída ficam ao lado do volume", async () => {
     const cash = windowOf(await overview(ctx(ADMIN)), "day").economies.find(
       (e: any) => e.economy === "cash"
     );
-    assert.equal(cash.inCentavos, 5001, "depósitos");
-    assert.equal(cash.outCentavos, 502, "saque");
+    assert.equal(cash.inCentavos, 5001 + 3030, "depósitos e prêmio");
+    assert.equal(cash.outCentavos, 502 + 1003, "saque e inscrição");
     // O caixa e a margem são internos: entram no volume e em nenhum lado.
     assert.equal(
       cash.volumeCentavos - cash.inCentavos - cash.outCentavos,
@@ -186,7 +213,7 @@ describe("E2E — painel do admin", () => {
     // Uma linha zerada lê como "aconteceu e deu zero"; ausência lê como
     // "não aconteceu", que é a verdade.
     const out = await overview(ctx(ADMIN));
-    assert.equal(categoryOf(out, "day", "prize"), undefined);
+    assert.equal(categoryOf(out, "day", "kill_prize"), undefined);
   });
 
   it("conta novos usuários por janela", async () => {
