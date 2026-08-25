@@ -20,10 +20,32 @@ import { isSeasonBadgeId } from "./seasonBadges.js";
  * first one did.
  */
 
-export type BadgeTrack = "creator" | "partner" | "player";
+export type BadgeTrack =
+  | "creator"
+  | "partner"
+  | "player"
+  | /**
+     * One-off badges that commemorate a moment rather than a climb.
+     *
+     * NOT A FOURTH LADDER. The three tracks answer "how far up are you"; a
+     * commemorative badge answers "you were there". It has no next tier, no
+     * "faltam N", and it can stop being earnable — which is exactly what makes
+     * it worth having.
+     */
+    "commemorative";
 
 /** What a track counts. Named so the source is unmistakable at the call site. */
 export type BadgeMetric =
+  /**
+   * How many tournaments this account actually REGISTERED for.
+   *
+   * Counted from `registrations`, not from `users.tournaments_played`. That
+   * counter was added late and never backfilled, so it reads zero for exactly
+   * the accounts a beta badge exists to honour — the ones that were here
+   * first. A badge that skipped the earliest players would be worse than no
+   * badge at all.
+   */
+  | "betaRegistrations"
   /** Tournaments this account created. */
   | "tournamentsCreated"
   /**
@@ -53,7 +75,26 @@ export interface BadgeDefinition {
    * reward is recorded here as null until it is decided.
    */
   readonly reward: string | null;
+  /**
+   * When true, this badge can only be earned while the beta is open.
+   *
+   * A PROPERTY OF THE BADGE, not a check buried in the handler, so "this stops
+   * being earnable one day" is visible in the same table that says what it
+   * takes to earn it.
+   */
+  readonly requiresBetaOpen?: true;
 }
+
+/**
+ * Whether the beta is still open, and therefore whether its badge can still be
+ * earned.
+ *
+ * FLIPPING THIS IS THE ACT OF CLOSING THE BETA. Everyone who earned the badge
+ * keeps it — nothing here revokes — and nobody new can get one. Leaving it true
+ * after the beta really ends is the one failure mode: latecomers would collect
+ * a veteran's badge, and no later fix could take it back.
+ */
+export const BETA_OPEN = true;
 
 /**
  * THE TABLE. Order within a track is ascending by threshold, which
@@ -80,6 +121,13 @@ export const BADGES: readonly BadgeDefinition[] = [
   { id: "spartan_semi_pro", track: "player", metric: "tournamentsPlayed", threshold: 1_500, name: "Spartano semi profissional", reward: null },
   { id: "spartan_pro", track: "player", metric: "tournamentsPlayed", threshold: 3_000, name: "Spartano profissional", reward: null },
   { id: "spartan_legend", track: "player", metric: "tournamentsPlayed", threshold: 5_000, name: "Spartano lendário", reward: null },
+
+  // ── Comemorativo: esteve aqui no começo.
+  //
+  // UM CAMPEONATO BASTA. É participação, não conquista — quem entrou numa
+  // partida durante o beta estava aqui, e é isso que o selo diz. Exigir mais
+  // transformaria uma lembrança num degrau.
+  { id: "beta_veteran", track: "commemorative", metric: "betaRegistrations", threshold: 1, name: "Veterano do beta", reward: null, requiresBetaOpen: true },
 ];
 
 /**
@@ -121,13 +169,22 @@ export interface BadgeCounts {
   readonly playersBrought: number;
   readonly tournamentsPlayed: number;
   readonly isPartner: boolean;
+  readonly betaRegistrations: number;
+  /** Defaults to [BETA_OPEN] when absent. */
+  readonly betaOpen?: boolean;
 }
 
 /** Which badges these counts qualify for, ignoring what is already owned. */
 export function qualifiedBadges(
   counts: BadgeCounts
 ): readonly BadgeDefinition[] {
+  const betaOpen = counts.betaOpen ?? BETA_OPEN;
+
   return BADGES.filter((badge) => {
+    // Checked BEFORE the count: once the beta closes, no amount of play earns
+    // this, and asking "how many" first would read as if it still could.
+    if (badge.requiresBetaOpen && !betaOpen) return false;
+
     const value = counts[
       badge.metric === "isPartner" ? "isPartner" : badge.metric
     ];

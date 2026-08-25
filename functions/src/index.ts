@@ -4197,13 +4197,26 @@ export const getMyBadgesHandler = async (
       .get();
     const partnerId = partnerSnap.empty ? null : partnerSnap.docs[0].id;
 
-    const [createdSnap, broughtCount] = await Promise.all([
+    const [createdSnap, broughtCount, registeredSnap] = await Promise.all([
       db
         .collection("tournaments")
         .where("creator_uid", "==", auth.uid)
         .count()
         .get(),
       partnerId === null ? Promise.resolve(0) : countQualifiedReferrals(partnerId),
+      /**
+       * COUNTED, NOT READ FROM THE COUNTER. `users.tournaments_played` was
+       * added late and never backfilled, so it reads zero for exactly the
+       * accounts the beta badge exists to honour — the ones that were here
+       * first. The tiers keep using the counter, because a partner's tier asks
+       * this of every player they brought and that would be a query each; this
+       * one badge is about the caller alone, so it can afford the truth.
+       */
+      db
+        .collection("registrations")
+        .where("user_ref", "==", userRef)
+        .count()
+        .get(),
     ]);
 
     const counts = {
@@ -4211,6 +4224,7 @@ export const getMyBadgesHandler = async (
       playersBrought: broughtCount,
       tournamentsPlayed: readPlayedCount(userData.tournaments_played),
       isPartner: partnerId !== null,
+      betaRegistrations: registeredSnap.data().count,
     };
 
     const owned: string[] = Array.isArray(userData.badges)

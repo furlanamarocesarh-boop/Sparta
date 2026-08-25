@@ -11,6 +11,7 @@ import {
   MAX_ACKNOWLEDGED_BADGES,
   highestEarned,
   nextTier,
+  BETA_OPEN,
   qualifiedBadges,
   referredPlayerCounts,
   PLAYER_COUNTS_AFTER_TOURNAMENTS,
@@ -22,14 +23,27 @@ const none: BadgeCounts = {
   playersBrought: 0,
   tournamentsPlayed: 0,
   isPartner: false,
+  betaRegistrations: 0,
 };
 
 const ids = (list: readonly { id: string }[]) => list.map((b) => b.id);
 
 describe("a tabela de selos", () => {
-  it("tem os quinze, e nenhum id repetido", () => {
-    assert.equal(BADGES.length, 15);
-    assert.equal(new Set(ids(BADGES)).size, 15);
+  it("três escadas de cinco, mais os comemorativos", () => {
+    // Contado por ESTRUTURA e não por um número solto: um selo comemorativo
+    // novo não deve fazer este teste falhar, mas uma trilha que perde ou ganha
+    // um degrau deve — é ela que `highestEarned` e `nextTier` percorrem.
+    for (const track of ["creator", "partner", "player"] as const) {
+      assert.equal(BADGES.filter((b) => b.track === track).length, 5, track);
+    }
+    assert.deepEqual(
+      ids(BADGES.filter((b) => b.track === "commemorative")),
+      ["beta_veteran"]
+    );
+  });
+
+  it("nenhum id repetido", () => {
+    assert.equal(new Set(ids(BADGES)).size, BADGES.length);
   });
 
   it("cada trilha sobe: os limiares estão em ordem crescente", () => {
@@ -106,10 +120,9 @@ describe("quem qualifica", () => {
 
   it("as trilhas são independentes", () => {
     const both = qualifiedBadges({
+      ...none,
       tournamentsCreated: 10,
-      playersBrought: 0,
       tournamentsPlayed: 50,
-      isPartner: false,
     });
     assert.deepEqual(ids(both), ["creator_verified", "spartan_noobie"]);
   });
@@ -373,5 +386,65 @@ describe("o motor reconhece as DUAS famílias de id", () => {
     const fake = "season_player_top7_2026-09";
     assert.deepEqual(acknowledgeableIds([fake], [fake]), []);
     assert.deepEqual(pendingCelebrations([fake], []), []);
+  });
+});
+
+
+describe("o selo comemorativo do beta", () => {
+  const played = (n: number, betaOpen?: boolean): BadgeCounts => ({
+    ...none,
+    betaRegistrations: n,
+    ...(betaOpen === undefined ? {} : { betaOpen }),
+  });
+
+  it("UM campeonato basta", () => {
+    // É participação, não conquista: quem entrou numa partida durante o beta
+    // estava aqui, e é isso que o selo diz. Exigir mais transformaria uma
+    // lembrança num degrau.
+    assert.ok(ids(qualifiedBadges(played(1))).includes("beta_veteran"));
+  });
+
+  it("nenhum campeonato não basta", () => {
+    // Ter conta não é ter jogado.
+    assert.equal(ids(qualifiedBadges(played(0))).includes("beta_veteran"), false);
+  });
+
+  it("FECHADO o beta, nem jogar mil vezes ganha", () => {
+    assert.equal(
+      ids(qualifiedBadges(played(1000, false))).includes("beta_veteran"),
+      false
+    );
+  });
+
+  it("fechar o beta não mexe em nenhum outro selo", () => {
+    // O portão é propriedade DESTE selo, não um interruptor geral.
+    const counts: BadgeCounts = {
+      ...none,
+      tournamentsPlayed: 50,
+      betaRegistrations: 50,
+      betaOpen: false,
+    };
+    assert.ok(ids(qualifiedBadges(counts)).includes("spartan_noobie"));
+  });
+
+  it("o padrão segue a constante do produto", () => {
+    assert.equal(BETA_OPEN, true);
+    assert.ok(ids(qualifiedBadges(played(1))).includes("beta_veteran"));
+  });
+
+  it("ele não pertence a nenhuma das três escadas", () => {
+    // As três trilhas respondem "quão longe você subiu"; um comemorativo
+    // responde "você estava aqui". Ele não tem próximo degrau.
+    const badge = badgeById("beta_veteran")!;
+    assert.equal(badge.track, "commemorative");
+    assert.equal(nextTier("commemorative", []), badge);
+    assert.equal(nextTier("commemorative", ["beta_veteran"]), null);
+  });
+
+  it("conceder continua idempotente", () => {
+    assert.deepEqual(
+      ids(badgesToAward(played(1), ["beta_veteran"])),
+      []
+    );
   });
 });
