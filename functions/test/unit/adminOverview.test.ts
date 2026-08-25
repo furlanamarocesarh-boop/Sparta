@@ -8,6 +8,7 @@ import {
   KNOWN_CATEGORIES,
   rollUpByEconomy,
   specFor,
+  splitProfit,
   WINDOW_KEYS,
   windowStart,
   type CategoryTotal,
@@ -228,5 +229,113 @@ describe("somando por economia", () => {
       ["beta_credit", "cash"]
     );
     assert.ok(rows.every((r) => r.count === 0 && r.volumeCentavos === 0));
+  });
+});
+
+describe("o resultado: o que ficou, e para quem", () => {
+  const t = (
+    category: string,
+    count: number,
+    centavos: number
+  ): CategoryTotal => {
+    const spec = specFor(category)!;
+    return {
+      category,
+      label: spec.label,
+      economy: spec.economy,
+      direction: spec.direction,
+      count,
+      centavos,
+    };
+  };
+
+  const cashOf = (rows: readonly { economy: string }[]) =>
+    rows.find((r) => r.economy === "cash") as any;
+
+  it("a margem é o lucro, e ela tem dono", () => {
+    // O único lucro com razão por trás. A taxa de 7,5% é POLÍTICA de produto:
+    // a liquidação credita o prêmio cheio e não retém nada, então nenhuma
+    // linha registra uma taxa sendo tirada. Reportá-la seria inventar dinheiro
+    // que nunca foi separado.
+    const split = cashOf(
+      splitProfit([t("house_margin", 3, 10_000), t("commission_accrued", 2, 300)])
+    );
+    assert.equal(split.marginCentavos, 10_000);
+    assert.equal(split.commissionCentavos, 300);
+    assert.equal(split.ownerCentavos, 9_700);
+  });
+
+  it("MARGEM NEGATIVA é um prejuízo, não um zero", () => {
+    // O bug que isto conserta: a casa subsidiando o prêmio grava valor
+    // negativo, e um painel que o pisasse em zero esconderia exatamente o
+    // número que o operador precisa ver.
+    const split = cashOf(splitProfit([t("house_margin", 1, -5_000)]));
+    assert.equal(split.marginCentavos, -5_000);
+    assert.equal(split.ownerCentavos, -5_000);
+  });
+
+  it("o dono pode ficar negativo, e isso não é aparado", () => {
+    const split = cashOf(
+      splitProfit([t("house_margin", 1, 100), t("commission_accrued", 1, 900)])
+    );
+    assert.equal(split.ownerCentavos, -800);
+  });
+
+  it("a comissão nunca entra negativa no cálculo", () => {
+    // Ela é passivo: só existe devendo. Um valor negativo gravado seria dado
+    // corrompido, e somá-lo aumentaria a parte do dono.
+    const split = cashOf(splitProfit([t("commission_accrued", 1, -500)]));
+    assert.equal(split.commissionCentavos, 500);
+    assert.equal(split.ownerCentavos, -500);
+  });
+
+  it("as duas economias têm resultados separados", () => {
+    const rows = splitProfit([
+      t("house_margin", 1, 10_000),
+      t("beta_house_margin", 1, 777),
+    ]);
+    assert.equal(cashOf(rows).marginCentavos, 10_000);
+    assert.equal(
+      (rows.find((r) => r.economy === "beta_credit") as any).marginCentavos,
+      777
+    );
+  });
+
+  it("sem movimento, resultado zero — mas as duas linhas existem", () => {
+    const rows = splitProfit([]);
+    assert.equal(rows.length, 2);
+    assert.ok(rows.every((r) => r.ownerCentavos === 0));
+  });
+
+  it("nenhuma outra categoria conta como lucro", () => {
+    // Aporte no caixa é dinheiro COLOCADO, não ganho. Contá-lo como lucro
+    // faria um depósito seu parecer receita.
+    const split = cashOf(
+      splitProfit([t("house_funding", 1, 100_000), t("deposit", 1, 50_000)])
+    );
+    assert.equal(split.marginCentavos, 0);
+    assert.equal(split.ownerCentavos, 0);
+  });
+});
+
+describe("volume com valor negativo", () => {
+  it("um subsídio MOVEU dinheiro, então engorda o volume", () => {
+    // Somar -5000 deixaria um prejuízo encolher o volume e faria um mês
+    // movimentado parecer parado.
+    const spec = specFor("house_margin")!;
+    const rows = rollUpByEconomy([
+      {
+        category: "house_margin",
+        label: spec.label,
+        economy: spec.economy,
+        direction: spec.direction,
+        count: 1,
+        centavos: -5_000,
+      },
+    ]);
+    assert.equal(
+      rows.find((r) => r.economy === "cash")!.volumeCentavos,
+      5_000
+    );
   });
 });

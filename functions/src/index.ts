@@ -204,6 +204,7 @@ import {
   KNOWN_CATEGORIES,
   rollUpByEconomy,
   specFor,
+  splitProfit,
   WINDOW_KEYS,
   windowStart,
   type CategoryTotal,
@@ -4795,6 +4796,8 @@ export const getAdminOverviewHandler = async (
           window: key,
           newUsers,
           economies: rollUpByEconomy(categories),
+          // O que a plataforma de fato reteve, e o que deve por isso.
+          profit: splitProfit(categories),
           categories,
         };
       })

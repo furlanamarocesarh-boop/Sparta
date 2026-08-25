@@ -22,11 +22,14 @@ import { ECONOMY_BETA_CREDIT, ECONOMY_CASH, type EconomyType } from "./economy.j
  * unit are declared per category, in a table, and a category missing from it
  * is REFUSED rather than assumed.
  *
- * THE SIGN IS IN THE CATEGORY, NOT IN THE NUMBER. Every stored amount is
- * positive — an entry fee of R$ 10 and a prize of R$ 10 both store 10. So the
- * direction of money is a property of the category, declared here, and totals
- * are reported as VOLUME (what moved) with the direction available separately.
- * Netting them without saying so would produce a number that means nothing.
+ * THE SIGN IS IN THE CATEGORY, NOT IN THE NUMBER — with ONE exception. Every
+ * stored amount is positive: an entry fee of R$ 10 and a prize of R$ 10 both
+ * store 10, and the direction is a property of the category. The exception is
+ * the house margin, which is `pool - paid` and is stored NEGATIVE when the
+ * house subsidised the prize. Treating it as unsigned would report a subsidy as
+ * zero and quietly turn a loss into "nothing happened" — so `signed` is
+ * declared per category, and volume takes the magnitude while the result takes
+ * the sign.
  *
  * THE TWO ECONOMIES ARE NEVER SUMMED TOGETHER. Same rule as the wallet, the
  * season ranking and the creator board: cash and Beta Credits are different
@@ -55,6 +58,14 @@ export interface CategorySpec {
   readonly direction: MoneyDirection;
   /** What an admin should read it as. */
   readonly label: string;
+  /**
+   * True when the stored amount may legitimately be NEGATIVE.
+   *
+   * Only the house margin is: `pool - paid` goes below zero whenever the house
+   * funded part of a prize. Everything else is a magnitude, and a negative one
+   * would be corrupt data rather than a subsidy.
+   */
+  readonly signed?: true;
 }
 
 /**
@@ -127,6 +138,7 @@ export const CATEGORY_SPECS: Readonly<Record<string, CategorySpec>> = {
     shape: "centavos",
     direction: "internal",
     label: "Margem da casa",
+    signed: true,
   },
   beta_house_funding: {
     economy: ECONOMY_BETA_CREDIT,
@@ -139,6 +151,7 @@ export const CATEGORY_SPECS: Readonly<Record<string, CategorySpec>> = {
     shape: "centavos",
     direction: "internal",
     label: "Margem da casa (beta)",
+    signed: true,
   },
   commission_accrued: {
     economy: ECONOMY_CASH,
@@ -242,6 +255,71 @@ export function aggregateToCentavos(
   return shape === "centavos" ? Math.round(sum) : Math.round(sum * 100);
 }
 
+/**
+ * The margin categories, and the one that funds partners.
+ *
+ * NAMED HERE rather than matched by string at the call site, so "what counts as
+ * profit" is a decision with one home.
+ */
+export const MARGIN_CATEGORIES: readonly string[] = [
+  "house_margin",
+  "beta_house_margin",
+];
+export const COMMISSION_CATEGORY = "commission_accrued";
+
+/**
+ * What the platform actually kept, and what it owes for it.
+ *
+ * MARGIN IS THE ONLY PROFIT WITH A LEDGER BEHIND IT. The 7,5 % Sparta fee is
+ * PRODUCT POLICY, not bookkeeping: settlement credits the winner the full prize
+ * and retains nothing, so no row anywhere records a fee being taken. What the
+ * house really keeps is `pool - paid` per settlement — whatever a creator left
+ * on the table — and that is what `house_margin` records. Reporting the 7,5 %
+ * as revenue would be inventing money that was never set aside.
+ *
+ * IT CAN BE NEGATIVE, and saying so is the point: a subsidised tournament is a
+ * loss, and a panel that floors it at zero would hide exactly the number an
+ * operator needs to see.
+ *
+ * THE COMMISSION IS A LIABILITY, NOT A PAYMENT. Nothing in this backend ever
+ * pays a partner — `requestwithdrawal` writes `pending` and no code moves it
+ * on. So this is what is OWED, and the owner's share is what is left after
+ * honouring it.
+ */
+export interface ProfitSplit {
+  readonly economy: EconomyType;
+  /** `pool - paid`, summed. Negative when the house subsidised more than it kept. */
+  readonly marginCentavos: number;
+  /** Accrued and unpaid. Always zero or more. */
+  readonly commissionCentavos: number;
+  /** Margin minus commissions. What is left for the owner. */
+  readonly ownerCentavos: number;
+}
+
+export function splitProfit(
+  totals: readonly CategoryTotal[]
+): ProfitSplit[] {
+  return [ECONOMY_CASH, ECONOMY_BETA_CREDIT].map((economy) => {
+    let margin = 0;
+    let commission = 0;
+    for (const total of totals) {
+      if (total.economy !== economy) continue;
+      if (MARGIN_CATEGORIES.includes(total.category)) margin += total.centavos;
+      if (total.category === COMMISSION_CATEGORY) {
+        commission += Math.abs(total.centavos);
+      }
+    }
+    return {
+      economy,
+      marginCentavos: margin,
+      commissionCentavos: commission,
+      // NOT floored at zero. A month where the house subsidised more than it
+      // kept leaves the owner NEGATIVE, and that is the fact.
+      ownerCentavos: margin - commission,
+    };
+  });
+}
+
 /** One category's activity inside one window. */
 export interface CategoryTotal {
   readonly category: string;
@@ -289,7 +367,18 @@ export function rollUpByEconomy(
       outC: 0,
     };
     bucket.count += total.count;
-    bucket.volume += total.centavos;
+    /**
+     * MAGNITUDE, not the signed value: a loss must not shrink the volume and
+     * make a busy month look quiet.
+     *
+     * FOR A SIGNED CATEGORY THIS IS |NET|, NOT THE SUM OF EACH ROW'S
+     * MAGNITUDE. The figure arrives already summed by Firestore, so a month of
+     * +R$ 2,50 kept and -R$ 1,00 subsidised contributes R$ 1,50 here, not
+     * R$ 3,50. Recovering per-row magnitudes would mean reading every document,
+     * which is the entire cost this panel avoids — and the net is the figure
+     * that answers "what did the house end up with", which is the question.
+     */
+    bucket.volume += Math.abs(total.centavos);
     if (total.direction === "in") bucket.inC += total.centavos;
     if (total.direction === "out") bucket.outC += total.centavos;
     byEconomy.set(total.economy, bucket);

@@ -75,6 +75,9 @@ describe("E2E — painel do admin", () => {
     // A FAMÍLIA DA PLATAFORMA: valor em centavos, e SEM `amount`.
     await tx("h1", { category: "house_funding", amount_centavos: 10_000, economy_type: "cash" }, 4);
     await tx("m1", { category: "house_margin", amount_centavos: 250, economy_type: "cash" }, 4);
+    // MARGEM NEGATIVA: a casa subsidiou este prêmio. É gravada abaixo de zero.
+    await tx("m2", { category: "house_margin", amount_centavos: -100, economy_type: "cash" }, 4);
+    await tx("c1", { category: "commission_accrued", amount_centavos: 30, economy_type: "cash" }, 4);
     // Beta, que nunca pode se misturar com dinheiro.
     await tx("b1", { category: "beta_entry_fee", amount: 5, economy_type: "beta_credit" }, 6);
     // Mais velha que 24h, dentro da semana.
@@ -113,7 +116,27 @@ describe("E2E — painel do admin", () => {
     assert.equal(caixa.centavos, 10_000);
 
     const margem = categoryOf(out, "day", "house_margin");
-    assert.equal(margem.centavos, 250);
+    assert.equal(margem.centavos, 150, "250 retidos menos 100 subsidiados");
+  });
+
+  it("MARGEM NEGATIVA sobrevive ao agregado", async () => {
+    // Um subsídio é gravado abaixo de zero. Se o painel o pisasse em zero, um
+    // prejuízo apareceria como "nada aconteceu".
+    const out = await overview(ctx(ADMIN));
+    const lucro = windowOf(out, "day").profit.find(
+      (p: any) => p.economy === "cash"
+    );
+    assert.equal(lucro.marginCentavos, 150);
+    assert.equal(lucro.commissionCentavos, 30);
+    assert.equal(lucro.ownerCentavos, 120, "margem menos comissão");
+  });
+
+  it("um subsídio MOVEU dinheiro, então conta no volume", async () => {
+    const cash = windowOf(await overview(ctx(ADMIN)), "day").economies.find(
+      (e: any) => e.economy === "cash"
+    );
+    // 100 de subsídio entram como magnitude, não encolhendo o volume.
+    assert.ok(cash.volumeCentavos > 0);
   });
 
   it("reais viram centavos exatos, sem sobra de ponto flutuante", async () => {
@@ -130,7 +153,9 @@ describe("E2E — painel do admin", () => {
     const beta = eco.find((e: any) => e.economy === "beta_credit");
 
     assert.equal(beta.volumeCentavos, 500, "só a inscrição beta");
-    assert.equal(cash.volumeCentavos, 5001 + 502 + 10_000 + 250);
+    // A margem entra como |líquido|: +250 retidos e -100 subsidiados chegam
+    // já somados pelo Firestore, então contribuem 150 — não 350.
+    assert.equal(cash.volumeCentavos, 5001 + 502 + 10_000 + 150 + 30);
   });
 
   it("entrada e saída ficam ao lado do volume", async () => {
@@ -140,7 +165,10 @@ describe("E2E — painel do admin", () => {
     assert.equal(cash.inCentavos, 5001, "depósitos");
     assert.equal(cash.outCentavos, 502, "saque");
     // O caixa e a margem são internos: entram no volume e em nenhum lado.
-    assert.equal(cash.volumeCentavos - cash.inCentavos - cash.outCentavos, 10_250);
+    assert.equal(
+      cash.volumeCentavos - cash.inCentavos - cash.outCentavos,
+      10_000 + 150 + 30
+    );
   });
 
   it("a janela maior contém a menor", async () => {
