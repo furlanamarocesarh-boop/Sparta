@@ -18,6 +18,7 @@ import * as admin from "firebase-admin";
  * works; only its attached statics are missing.
  */
 import {
+  AggregateField,
   type CollectionReference,
   FieldPath,
   FieldValue,
@@ -198,6 +199,16 @@ import {
   projectCreatorRow,
   type CreatorRow,
 } from "./domain/creatorRanking.js";
+import {
+  aggregateToCentavos,
+  KNOWN_CATEGORIES,
+  rollUpByEconomy,
+  specFor,
+  WINDOW_KEYS,
+  windowStart,
+  type CategoryTotal,
+  type WindowKey,
+} from "./domain/adminOverview.js";
 import {
   badgeForPlacement,
   SEASON_BADGE_ECONOMY,
@@ -4675,6 +4686,179 @@ export const getCreatorLeaderboardHandler = async (
 
 export const getCreatorLeaderboard = central.https.onCall(
   getCreatorLeaderboardHandler
+);
+
+// ═══════════════════════════════════════════════════════════════════════
+// PAINEL DO ADMINISTRADOR
+// ═══════════════════════════════════════════════════════════════════════
+
+const ADMIN_OVERVIEW_KEYS = [] as const;
+
+/**
+ * Everything that moved, and everyone who arrived.
+ *
+ * ADMIN ONLY, checked on the server. It reports total platform volume and
+ * where every user came from — the single most sensitive read in this backend.
+ *
+ * EXACT, NOT SAMPLED. Every figure comes from a Firestore aggregate — `count()`
+ * and `sum()` — which returns the true total without reading documents. A
+ * bounded scan would have been cheaper to write and would have quietly stopped
+ * being right the month the data outgrew the cap, on a screen whose entire
+ * purpose is to be trusted.
+ *
+ * THE MONEY FIELD IS PER CATEGORY. Wallet rows carry `amount` in reais; the
+ * platform's own rows — house funding, house margin, partner commission —
+ * carry `amount_centavos` and no `user_ref`. `CATEGORY_SPECS` decides which,
+ * and a category absent from it is skipped LOUDLY via `unknownCategories`
+ * rather than silently contributing zero.
+ *
+ * NO COUNTERS, NO TRIGGERS, NO BACKFILL. A maintained counter drifts the first
+ * time a write lands half-way, and a panel that disagrees with the ledger is
+ * worse than one that costs a few reads. This is opened by one person,
+ * occasionally.
+ */
+export const getAdminOverviewHandler = async (
+  data: any,
+  context: any,
+  options: { readonly now?: Date } = {}
+): Promise<Record<string, unknown>> => {
+  try {
+    assertAdmin(
+      context as any,
+      "Entre na sua conta.",
+      "Apenas administradores podem ver o painel."
+    );
+    assertExactPayload(data ?? {}, ADMIN_OVERVIEW_KEYS);
+
+    const now = options.now ?? new Date();
+    const transactions = db.collection("transactions");
+    const users = db.collection("users");
+
+    /** One (window, category) aggregate: how many, and how much. */
+    const totalFor = async (
+      key: WindowKey,
+      category: string
+    ): Promise<CategoryTotal | null> => {
+      const spec = specFor(category);
+      if (spec === null) return null;
+
+      const field = spec.shape === "centavos" ? "amount_centavos" : "amount";
+      const start = windowStart(key, now);
+      let query: FirebaseFirestore.Query = transactions.where(
+        "category",
+        "==",
+        category
+      );
+      if (start !== null) {
+        query = query.where("timestamp", ">=", Timestamp.fromDate(start));
+      }
+
+      const snap = await query
+        .aggregate({
+          count: AggregateField.count(),
+          total: AggregateField.sum(field),
+        })
+        .get();
+
+      return {
+        category,
+        label: spec.label,
+        economy: spec.economy,
+        direction: spec.direction,
+        count: snap.data().count,
+        centavos: aggregateToCentavos(spec.shape, snap.data().total),
+      };
+    };
+
+    /** How many accounts were created inside a window. */
+    const newUsersIn = async (key: WindowKey): Promise<number> => {
+      const start = windowStart(key, now);
+      let query: FirebaseFirestore.Query = users;
+      if (start !== null) {
+        query = query.where("created_at", ">=", Timestamp.fromDate(start));
+      }
+      const snap = await query.count().get();
+      return snap.data().count;
+    };
+
+    // ── Every window, in parallel ──────────────────────────────────────
+    const windows = await Promise.all(
+      WINDOW_KEYS.map(async (key) => {
+        const [totals, newUsers] = await Promise.all([
+          Promise.all(KNOWN_CATEGORIES.map((c) => totalFor(key, c))),
+          newUsersIn(key),
+        ]);
+        const categories = totals.filter(
+          (t): t is CategoryTotal => t !== null && t.count > 0
+        );
+        return {
+          window: key,
+          newUsers,
+          economies: rollUpByEconomy(categories),
+          categories,
+        };
+      })
+    );
+
+    // ── Where players came from ────────────────────────────────────────
+    //
+    // ATTRIBUTION IS COUNTED PER PARTNER, from `users.partner_ref` — the field
+    // `claimReferral` writes and never rewrites. The unattributed count is
+    // derived by subtraction rather than queried, because "no partner_ref"
+    // cannot be expressed as a Firestore filter without an index on absence.
+    const partnersSnap = await db.collection(PARTNERS_COLLECTION).get();
+    const partners = await Promise.all(
+      partnersSnap.docs.map(async (doc) => {
+        const perWindow = await Promise.all(
+          WINDOW_KEYS.map(async (key) => {
+            const start = windowStart(key, now);
+            let query: FirebaseFirestore.Query = users.where(
+              "partner_ref",
+              "==",
+              doc.id
+            );
+            if (start !== null) {
+              query = query.where("created_at", ">=", Timestamp.fromDate(start));
+            }
+            const snap = await query.count().get();
+            return [key, snap.data().count] as const;
+          })
+        );
+        return {
+          partnerId: doc.id,
+          active: doc.get("active") === true,
+          brought: Object.fromEntries(perWindow),
+        };
+      })
+    );
+
+    const attributedTotal = partners.reduce(
+      (sum, p) => sum + ((p.brought as Record<string, number>).all ?? 0),
+      0
+    );
+    const totalUsers =
+      windows.find((w) => w.window === "all")?.newUsers ?? 0;
+
+    return {
+      amountUnit: "centavos",
+      generatedAt: now.toISOString(),
+      windows,
+      origin: {
+        totalUsers,
+        attributed: attributedTotal,
+        /** Everyone with no partner. Derived, because absence is not filterable. */
+        direct: Math.max(0, totalUsers - attributedTotal),
+        partners,
+      },
+    };
+  } catch (error) {
+    console.error("getAdminOverview error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const getAdminOverview = central.https.onCall((data, context) =>
+  getAdminOverviewHandler(data, context)
 );
 
 /**
