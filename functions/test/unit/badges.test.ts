@@ -3,8 +3,11 @@ import { describe, it } from "node:test";
 
 import {
   BADGES,
+  acknowledgeableIds,
   badgeById,
   badgesToAward,
+  pendingCelebrations,
+  MAX_ACKNOWLEDGED_BADGES,
   highestEarned,
   nextTier,
   qualifiedBadges,
@@ -227,5 +230,100 @@ describe("quem conta como 'usuário trazido'", () => {
         String(bad)
       );
     }
+  });
+});
+
+describe("o momento da conquista", () => {
+  // GANHAR UM SELO ACONTECE UMA VEZ SÓ. Se a comemoração vivesse apenas na
+  // resposta que concedeu, um app fechado entre a concessão e o diálogo
+  // perderia o momento para sempre: a chamada seguinte não tem nada de novo a
+  // relatar porque não HÁ nada de novo — o selo já é da pessoa.
+
+  describe("pendingCelebrations", () => {
+    it("junta o que acabou de ser concedido com o que ficou devendo", () => {
+      assert.deepEqual(
+        pendingCelebrations(["creator_verified"], ["spartan_noobie"]),
+        ["creator_verified", "spartan_noobie"]
+      );
+    });
+
+    it("não repete um id que já estava pendente", () => {
+      // Conceder é idempotente, então a mesma chamada pode ver as duas coisas.
+      assert.deepEqual(
+        pendingCelebrations(["creator_verified"], ["creator_verified"]),
+        ["creator_verified"]
+      );
+    });
+
+    it("descarta o que está gravado e não é selo", () => {
+      assert.deepEqual(
+        pendingCelebrations(
+          ["creator_verified", "selo_inventado", 42, null, ""],
+          []
+        ),
+        ["creator_verified"]
+      );
+    });
+
+    it("um campo ausente ou de tipo errado vira lista vazia", () => {
+      for (const bad of [undefined, null, "creator_verified", 42, {}]) {
+        assert.deepEqual(pendingCelebrations(bad, []), [], String(bad));
+      }
+    });
+
+    it("sem nada pendente e sem nada novo, não há o que comemorar", () => {
+      assert.deepEqual(pendingCelebrations([], []), []);
+    });
+  });
+
+  describe("acknowledgeableIds", () => {
+    const unseen = ["creator_verified", "spartan_noobie"];
+
+    it("limpa o que foi realmente mostrado", () => {
+      assert.deepEqual(acknowledgeableIds(["creator_verified"], unseen), [
+        "creator_verified",
+      ]);
+    });
+
+    it("IGNORA um id que não estava pendente", () => {
+      // O cliente diz "mostrei estes"; o servidor decide o que isso pode
+      // significar. Aceitar qualquer id deixaria alguém descobrir, observando
+      // o que muda, quais selos a conta tem.
+      assert.deepEqual(acknowledgeableIds(["creator_legend"], unseen), []);
+    });
+
+    it("IGNORA o que não é selo, mesmo se estiver gravado", () => {
+      assert.deepEqual(
+        acknowledgeableIds(["selo_inventado"], ["selo_inventado"]),
+        []
+      );
+    });
+
+    it("ignora tipos errados sem estourar", () => {
+      assert.deepEqual(acknowledgeableIds([42, null, {}, ""], unseen), []);
+    });
+
+    it("não repete um id pedido duas vezes", () => {
+      // Os ids vão para um arrayRemove; duplicar só engorda a escrita.
+      assert.deepEqual(
+        acknowledgeableIds(["creator_verified", "creator_verified"], unseen),
+        ["creator_verified"]
+      );
+    });
+
+    it("limita quantos ids uma chamada pode nomear", () => {
+      const flood = Array.from(
+        { length: MAX_ACKNOWLEDGED_BADGES + 50 },
+        () => "creator_verified"
+      );
+      assert.equal(acknowledgeableIds(flood, unseen).length, 1);
+    });
+
+    it("nada a limpar é resultado normal, não erro", () => {
+      // Dois aparelhos comemorando a mesma coisa é o caso comum, e o segundo
+      // legitimamente não tem o que fazer.
+      assert.deepEqual(acknowledgeableIds(["creator_verified"], []), []);
+      assert.deepEqual(acknowledgeableIds([], unseen), []);
+    });
   });
 });

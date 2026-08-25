@@ -180,6 +180,80 @@ export function nextTier(
   return null;
 }
 
+/**
+ * How many badge ids one acknowledgement may name.
+ *
+ * There are fifteen badges, so a real client never sends more. The cap exists
+ * because the ids reach `arrayRemove`, and an unbounded list would let a
+ * hostile payload build an enormous write from a single call.
+ */
+export const MAX_ACKNOWLEDGED_BADGES = 32;
+
+/**
+ * Which of the [requested] ids may be cleared from [unseen].
+ *
+ * WHY THIS IS AN INTERSECTION AND NOT A TRUST. The client says "I showed these
+ * to the player"; the server decides what that is allowed to mean. Removing an
+ * id that was never unseen is harmless but lets a client discover, by watching
+ * what changes, which badges an account is holding — and removing something
+ * that is not a badge id at all would write junk into a field the profile
+ * reads. So the answer is the intersection of what was asked, what is really
+ * unseen, and what is really a badge.
+ *
+ * AN EMPTY RESULT IS NORMAL, never an error. Two devices acknowledging the
+ * same celebration is the ordinary case, and the second one legitimately has
+ * nothing left to clear.
+ */
+export function acknowledgeableIds(
+  requested: readonly unknown[],
+  unseen: readonly unknown[]
+): string[] {
+  const pending = new Set(
+    unseen.filter((id): id is string => typeof id === "string")
+  );
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of requested.slice(0, MAX_ACKNOWLEDGED_BADGES)) {
+    if (typeof raw !== "string") continue;
+    if (seen.has(raw)) continue;
+    if (!pending.has(raw)) continue;
+    if (badgeById(raw) === null) continue;
+    seen.add(raw);
+    out.push(raw);
+  }
+  return out;
+}
+
+/**
+ * The ids awaiting a celebration, after this call's fresh awards.
+ *
+ * KEPT AS STORED STATE rather than derived from "what this call granted",
+ * because a grant happens exactly once. If the moment were only in the
+ * response, an app killed between the grant and the dialog would lose the
+ * celebration permanently — the next call reports nothing fresh, because there
+ * is nothing fresh: the badge is already owned.
+ */
+export function pendingCelebrations(
+  storedUnseen: unknown,
+  freshlyAwarded: readonly string[]
+): string[] {
+  const stored = Array.isArray(storedUnseen)
+    ? storedUnseen.filter(
+        (id): id is string => typeof id === "string" && badgeById(id) !== null
+      )
+    : [];
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const id of [...stored, ...freshlyAwarded]) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
 export function badgeById(id: string): BadgeDefinition | null {
   return BADGES.find((b) => b.id === id) ?? null;
 }

@@ -189,7 +189,9 @@ import {
   type PublicProfile,
 } from "./domain/publicProfile.js";
 import {
+  acknowledgeableIds,
   badgesToAward,
+  pendingCelebrations,
   referredPlayerCounts,
 } from "./domain/badges.js";
 import {
@@ -4157,10 +4159,22 @@ export const getMyBadgesHandler = async (
       : [];
 
     const fresh = badgesToAward(counts, owned);
+    const freshIds = fresh.map((b) => b.id);
     if (fresh.length > 0) {
+      /**
+       * `badges_unseen` IS WRITTEN IN THE SAME WRITE THAT GRANTS.
+       *
+       * Granting happens exactly once. If the celebration lived only in this
+       * response, an app killed between the grant and the dialog would lose
+       * the moment permanently — the next call reports nothing fresh, because
+       * there IS nothing fresh: the badge is already owned. Persisting the
+       * debt means the celebration waits for the player instead of the player
+       * having to be looking at the right screen at the right instant.
+       */
       await userRef.set(
         {
-          badges: FieldValue.arrayUnion(...fresh.map((b) => b.id)),
+          badges: FieldValue.arrayUnion(...freshIds),
+          badges_unseen: FieldValue.arrayUnion(...freshIds),
           badges_updated_at: FieldValue.serverTimestamp(),
         },
         { merge: true }
@@ -4168,8 +4182,13 @@ export const getMyBadgesHandler = async (
     }
 
     return {
-      badges: [...owned, ...fresh.map((b) => b.id)],
-      awarded: fresh.map((b) => b.id),
+      badges: [...owned, ...freshIds],
+      awarded: freshIds,
+      /**
+       * Everything still owed a celebration — this call's awards plus anything
+       * an earlier call granted and nobody ever acknowledged.
+       */
+      unseen: pendingCelebrations(userData.badges_unseen, freshIds),
       counts,
     };
   } catch (error) {
@@ -4179,6 +4198,72 @@ export const getMyBadgesHandler = async (
 };
 
 export const getMyBadges = central.https.onCall(getMyBadgesHandler);
+
+const ACKNOWLEDGE_BADGES_KEYS = ["badge_ids"] as const;
+
+/**
+ * Marks badge celebrations as shown.
+ *
+ * WHY A SEPARATE CALL, and not a flag on `getMyBadges`. Reading badges must
+ * stay safe to repeat — the badges card, the collection screen and the shell
+ * all watch it — and folding "I showed this" into the read would mean any
+ * screen that merely LOOKED at the badges silently spent the celebration.
+ * Clearing is its own act, made by the widget that actually displayed it.
+ *
+ * THE SERVER DECIDES WHAT THE CLIENT'S CLAIM MEANS. `acknowledgeableIds`
+ * intersects what was asked with what is genuinely unseen and genuinely a
+ * badge, so a payload cannot write junk into a field the public profile's
+ * neighbour reads, nor probe the account by watching what changes.
+ *
+ * FAILURE LEANS TOWARD CELEBRATING TWICE. If this call never lands, the ids
+ * stay unseen and the moment repeats on the next read. That is the right way
+ * round: a repeated celebration is a small annoyance, a lost one is the whole
+ * feature failing silently.
+ */
+export const acknowledgeBadgesHandler = async (
+  data: any,
+  context: any
+): Promise<{ acknowledged: string[] }> => {
+  try {
+    const auth = assertSignedIn(
+      context as any,
+      "Entre na sua conta para ver seus selos."
+    );
+    assertExactPayload(data, ACKNOWLEDGE_BADGES_KEYS);
+
+    const requested = Array.isArray(data.badge_ids) ? data.badge_ids : [];
+
+    const userRef = db.collection("users").doc(auth.uid);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) {
+      throw new DomainError("not-found", "Sua conta não foi encontrada.");
+    }
+
+    const unseen = userSnap.get("badges_unseen");
+    const clearing = acknowledgeableIds(
+      requested,
+      Array.isArray(unseen) ? unseen : []
+    );
+
+    // NOTHING TO CLEAR IS A SUCCESS. Two devices acknowledging the same
+    // celebration is ordinary, and the second one has legitimately nothing
+    // left to do — answering with an error would make the app retry forever.
+    if (clearing.length > 0) {
+      await userRef.update({
+        badges_unseen: FieldValue.arrayRemove(...clearing),
+      });
+    }
+
+    return { acknowledged: clearing };
+  } catch (error) {
+    console.error("acknowledgeBadges error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const acknowledgeBadges = central.https.onCall(
+  acknowledgeBadgesHandler
+);
 
 /**
  * How many of a partner's referred players COUNT.
