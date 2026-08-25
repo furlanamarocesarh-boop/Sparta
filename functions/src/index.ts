@@ -200,6 +200,13 @@ import {
   type CreatorRow,
 } from "./domain/creatorRanking.js";
 import {
+  checkPointsConfig,
+  checkPrizeDistribution,
+  MAX_MATCHES,
+  type PointsConfig,
+  type PrizeSlice,
+} from "./domain/matchPoints.js";
+import {
   aggregateToCentavos,
   KNOWN_CATEGORIES,
   rollUpByEconomy,
@@ -1399,6 +1406,34 @@ export const declareTournamentResultHandler = async (
 // function (no trigger metadata), so it is NOT a deployable endpoint — only the
 // `createTournament` / `createtournament` onCall wrappers below are. Both wrap
 // this same guarded handler.
+/** A frozen operator-facing message for each scoring/ distribution refusal. */
+function pointsConfigMessage(reason: string): string {
+  switch (reason) {
+    case "bad-matches-count":
+      return `A quantidade de partidas precisa ser um número inteiro de 1 a ${MAX_MATCHES}.`;
+    case "bad-kill-points":
+      return "Os pontos por abate precisam ser um número inteiro e não negativo.";
+    case "bad-placement-points":
+      return "Os pontos por colocação precisam ser números inteiros e não negativos.";
+    case "too-many-placements":
+      return "A tabela de pontos por colocação tem posições demais.";
+    case "empty-distribution":
+      return "Informe ao menos uma posição na divisão da premiação.";
+    case "bad-slice":
+      return "Cada posição da divisão precisa de um percentual entre 0,01% e 100%.";
+    case "duplicate-position":
+      return "A mesma posição aparece duas vezes na divisão da premiação.";
+    case "non-consecutive-positions":
+      return "A divisão precisa começar no 1º lugar e não pular posições.";
+    case "shares-must-total-100":
+      return "A soma dos percentuais da divisão precisa dar exatamente 100%.";
+    case "too-many-slices":
+      return "A divisão da premiação tem posições demais.";
+    default:
+      return "Configuração de pontuação inválida.";
+  }
+}
+
 export const createTournamentHandler = async (
   data: any,
   context: any
@@ -1475,6 +1510,75 @@ export const createTournamentHandler = async (
       );
     }
 
+    /**
+     * MULTI-PARTIDA E PONTUAÇÃO.
+     *
+     * `matches_count` ausente significa UMA partida, que é a forma de todo
+     * torneio que já existe — omitir não muda nada. Um campeonato de uma
+     * partida com pontuação é normal, não um caso especial.
+     */
+    const matchesCount =
+      data.matches_count === undefined || data.matches_count === null
+        ? 1
+        : Number(data.matches_count);
+
+    const pointsConfig: PointsConfig = {
+      killPoints:
+        data.kill_points === undefined || data.kill_points === null
+          ? 0
+          : Number(data.kill_points),
+      placementPoints: Array.isArray(data.placement_points)
+        ? data.placement_points.map((p: unknown) => Number(p))
+        : [],
+    };
+
+    const configCheck = checkPointsConfig(matchesCount, pointsConfig);
+    if (!configCheck.ok) {
+      throw new DomainError(
+        "invalid-argument",
+        pointsConfigMessage(configCheck.reason)
+      );
+    }
+
+    /**
+     * A DIVISÃO DO PRÊMIO É DO CRIADOR, e vale para qualquer campeonato — de
+     * uma partida ou de doze. Ausente mantém o comportamento de sempre: o
+     * vencedor único leva a premiação inteira.
+     */
+    const rawDistribution = data.prize_distribution;
+    let prizeDistribution: PrizeSlice[] | null = null;
+    if (rawDistribution !== undefined && rawDistribution !== null) {
+      if (!Array.isArray(rawDistribution)) {
+        throw new DomainError(
+          "invalid-argument",
+          "A divisão da premiação precisa ser uma lista de posições."
+        );
+      }
+      const slices: PrizeSlice[] = rawDistribution.map((raw: any) => ({
+        position: Number(raw?.position),
+        shareBps: Number(raw?.share_bps),
+      }));
+      const check = checkPrizeDistribution(slices);
+      if (!check.ok) {
+        throw new DomainError(
+          "invalid-argument",
+          pointsConfigMessage(check.reason)
+        );
+      }
+      /**
+       * DIVIDIR ZERO NÃO É DIVIDIR. Uma distribuição sobre premiação zero
+       * criaria posições pagantes que pagam nada — configurável, e impossível
+       * de liquidar de forma que faça sentido.
+       */
+      if (prizeCentavos === 0) {
+        throw new DomainError(
+          "invalid-argument",
+          "Para dividir a premiação por colocação, informe um valor de premiação."
+        );
+      }
+      prizeDistribution = slices;
+    }
+
     const maxPlayers = Number(data.max_players);
 
     if (!Number.isSafeInteger(maxPlayers) || maxPlayers <= 0) {
@@ -1548,6 +1652,27 @@ export const createTournamentHandler = async (
       entry_fee: centavosToReais(entryFeeCentavos),
       prize: centavosToReais(prizeCentavos),
       kill_prize: centavosToReais(killPrizeCentavos),
+      /**
+       * PARTIDAS E PONTUAÇÃO. Sempre gravados, mesmo no formato de sempre:
+       * `matches_count: 1` com pontuação zerada descreve exatamente o que um
+       * torneio de partida única é, e um campo ausente obrigaria todo leitor a
+       * adivinhar de novo qual era o padrão.
+       */
+      matches_count: matchesCount,
+      kill_points: pointsConfig.killPoints,
+      placement_points: pointsConfig.placementPoints,
+      /**
+       * NULO quando o criador não dividiu: o vencedor único leva tudo, que é o
+       * comportamento de todo torneio existente. Uma lista vazia diria
+       * "dividido entre ninguém", que é outra coisa.
+       */
+      prize_distribution:
+        prizeDistribution === null
+          ? null
+          : prizeDistribution.map((slice) => ({
+              position: slice.position,
+              share_bps: slice.shareBps,
+            })),
 
       status: "open",
 
