@@ -36,9 +36,9 @@ const SQUAD = {
   kill_points: 1,
   placement_points: [12, 9, 8, 7, 6],
   prize_distribution: [
-    { position: 1, share_bps: 5000 },
-    { position: 2, share_bps: 3000 },
-    { position: 3, share_bps: 2000 },
+    { position: 1, amount_centavos: 5000 },
+    { position: 2, amount_centavos: 3000 },
+    { position: 3, amount_centavos: 2000 },
   ],
 };
 
@@ -242,13 +242,29 @@ describe("E2E — configurações salvas de pontuação", () => {
       () => save({ ...SQUAD, matches_count: 51 }, ctx(ME)),
       /1 a 50/
     );
+    // UM PRESET NÃO CONFERE A SOMA — ele não tem premiação para conferir
+    // contra. O que ele confere é a forma, e com as mesmas frases.
     await assert.rejects(
       () =>
         save(
-          { ...SQUAD, prize_distribution: [{ position: 1, share_bps: 9999 }] },
+          {
+            ...SQUAD,
+            prize_distribution: [
+              { position: 1, amount_centavos: 5000 },
+              { position: 3, amount_centavos: 5000 },
+            ],
+          },
           ctx(ME)
         ),
-      /exatamente 100%/
+      /pular posições/
+    );
+    await assert.rejects(
+      () =>
+        save(
+          { ...SQUAD, prize_distribution: [{ position: 1, amount_centavos: 0 }] },
+          ctx(ME)
+        ),
+      /maior que zero/
     );
   });
 });

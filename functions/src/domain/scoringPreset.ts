@@ -9,9 +9,14 @@
  *
  * IT IS THE SAME CONFIGURATION, NOT A PARALLEL ONE. A preset holds exactly the
  * fields `createTournament` accepts, and it is validated by exactly the same
- * functions — `checkPointsConfig` and `checkPrizeDistribution`. A preset that
- * saved cleanly and then failed to create a tournament would be worse than no
- * preset at all, so the two can never diverge: there is no second rule here.
+ * functions — `checkPointsConfig` and `checkPrizeSlices`. A preset that saved
+ * cleanly and then failed to create a tournament would be worse than no preset
+ * at all, so the two can never diverge: there is no second rule here.
+ *
+ * THE ONE CHECK A PRESET CANNOT MAKE is that the split sums to the prize —
+ * there is no prize here, only a saved format. The app closes that gap where it
+ * has both: applying a preset sets the tournament's prize to the sum of its
+ * positions, so a preset that saved still creates.
  *
  * THE NAME IS THE IDENTITY. The id is derived from the name, so saving "Squad 6
  * partidas" twice REPLACES it instead of leaving two rows the creator has to
@@ -25,7 +30,7 @@
 
 import {
   checkPointsConfig,
-  checkPrizeDistribution,
+  checkPrizeSlices,
   type PointsConfig,
   type PrizeSlice,
 } from "./matchPoints.js";
@@ -170,9 +175,9 @@ export function checkPreset(input: {
     if (!Array.isArray(raw)) return { ok: false, reason: "bad-slice" };
     const slices: PrizeSlice[] = raw.map((entry: any) => ({
       position: Number(entry?.position),
-      shareBps: Number(entry?.share_bps),
+      centavos: Number(entry?.amount_centavos),
     }));
-    const check = checkPrizeDistribution(slices);
+    const check = checkPrizeSlices(slices);
     if (!check.ok) return { ok: false, reason: check.reason };
     prizeDistribution = slices;
   }

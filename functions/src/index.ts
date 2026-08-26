@@ -208,6 +208,7 @@ import {
 import {
   checkPointsConfig,
   checkPrizeDistribution,
+  checkPrizeSlices,
   computeStandings,
   MAX_MATCHES,
   splitPrize,
@@ -1435,13 +1436,13 @@ function pointsConfigMessage(reason: string): string {
     case "empty-distribution":
       return "Informe ao menos uma posição na divisão da premiação.";
     case "bad-slice":
-      return "Cada posição da divisão precisa de um percentual entre 0,01% e 100%.";
+      return "Cada posição da divisão precisa de um valor maior que zero.";
     case "duplicate-position":
       return "A mesma posição aparece duas vezes na divisão da premiação.";
     case "non-consecutive-positions":
       return "A divisão precisa começar no 1º lugar e não pular posições.";
-    case "shares-must-total-100":
-      return "A soma dos percentuais da divisão precisa dar exatamente 100%.";
+    case "must-total-prize":
+      return "A soma da divisão precisa dar exatamente o valor da premiação.";
     case "too-many-slices":
       return "A divisão da premiação tem posições demais.";
     default:
@@ -1571,24 +1572,28 @@ export const createTournamentHandler = async (
       }
       const slices: PrizeSlice[] = rawDistribution.map((raw: any) => ({
         position: Number(raw?.position),
-        shareBps: Number(raw?.share_bps),
+        centavos: Number(raw?.amount_centavos),
       }));
-      const check = checkPrizeDistribution(slices);
-      if (!check.ok) {
-        throw new DomainError(
-          "invalid-argument",
-          pointsConfigMessage(check.reason)
-        );
-      }
       /**
-       * DIVIDIR ZERO NÃO É DIVIDIR. Uma distribuição sobre premiação zero
-       * criaria posições pagantes que pagam nada — configurável, e impossível
-       * de liquidar de forma que faça sentido.
+       * DIVIDIR ZERO NÃO É DIVIDIR. Conferido ANTES da soma para que quem
+       * esqueceu a premiação ouça sobre a premiação, e não sobre um total que
+       * nunca teria como fechar.
        */
       if (prizeCentavos === 0) {
         throw new DomainError(
           "invalid-argument",
           "Para dividir a premiação por colocação, informe um valor de premiação."
+        );
+      }
+      /**
+       * A SOMA TEM QUE DAR A PREMIAÇÃO, ao centavo. É aqui que os dois números
+       * existem juntos — o preset salvo não tem premiação para conferir.
+       */
+      const check = checkPrizeDistribution(slices, prizeCentavos);
+      if (!check.ok) {
+        throw new DomainError(
+          "invalid-argument",
+          pointsConfigMessage(check.reason)
         );
       }
       prizeDistribution = slices;
@@ -1686,7 +1691,7 @@ export const createTournamentHandler = async (
           ? null
           : prizeDistribution.map((slice) => ({
               position: slice.position,
-              share_bps: slice.shareBps,
+              amount_centavos: slice.centavos,
             })),
 
       status: "open",
@@ -5229,9 +5234,10 @@ export const settleTournamentByPointsHandler = async (
       }
       const slices: PrizeSlice[] = rawDistribution.map((raw: any) => ({
         position: Number(raw?.position),
-        shareBps: Number(raw?.share_bps),
+        centavos: Number(raw?.amount_centavos),
       }));
-      if (!checkPrizeDistribution(slices).ok) {
+      // A FORMA agora; a SOMA logo abaixo, quando a premiação estiver lida.
+      if (!checkPrizeSlices(slices).ok) {
         throw new DomainError(
           "failed-precondition",
           "A divisão da premiação deste campeonato é inválida."
@@ -5261,6 +5267,22 @@ export const settleTournamentByPointsHandler = async (
         throw new DomainError(
           "failed-precondition",
           "A premiação configurada no campeonato é inválida."
+        );
+      }
+
+      /**
+       * A SOMA CONFERIDA DE NOVO, contra a premiação gravada.
+       *
+       * Isto já foi validado na criação, e nem a premiação nem a divisão mudam
+       * depois. Refazer a conta aqui é a rede: um documento escrito por um
+       * caminho antigo ou por uma mão fora do produto não vai pagar mais do que
+       * o campeonato tem, nem deixar dinheiro parado sem regra de destino. O
+       * custo é uma soma de no máximo cinquenta inteiros.
+       */
+      if (!checkPrizeDistribution(slices, prize.centavos).ok) {
+        throw new DomainError(
+          "failed-precondition",
+          "A divisão da premiação não fecha com a premiação do campeonato."
         );
       }
 
@@ -5543,7 +5565,7 @@ function projectPreset(
   const distribution = Array.isArray(data.prize_distribution)
     ? data.prize_distribution.map((slice: any) => ({
         position: Number(slice?.position),
-        share_bps: Number(slice?.share_bps),
+        amount_centavos: Number(slice?.amount_centavos),
       }))
     : null;
 
@@ -5636,7 +5658,7 @@ export const saveScoringPresetHandler = async (
             ? null
             : preset.prizeDistribution.map((slice) => ({
                 position: slice.position,
-                share_bps: slice.shareBps,
+                amount_centavos: slice.centavos,
               })),
         updated_at: FieldValue.serverTimestamp(),
       };
@@ -5657,7 +5679,7 @@ export const saveScoringPresetHandler = async (
             ? null
             : preset.prizeDistribution.map((slice) => ({
                 position: slice.position,
-                share_bps: slice.shareBps,
+                amount_centavos: slice.centavos,
               })),
       }),
     };

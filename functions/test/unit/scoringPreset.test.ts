@@ -119,9 +119,9 @@ describe("configuração inteira", () => {
     killPoints: 1,
     placementPoints: [12, 9, 8, 7, 6],
     prizeDistribution: [
-      { position: 1, share_bps: 5000 },
-      { position: 2, share_bps: 3000 },
-      { position: 3, share_bps: 2000 },
+      { position: 1, amount_centavos: 5000 },
+      { position: 2, amount_centavos: 3000 },
+      { position: 3, amount_centavos: 2000 },
     ],
   };
 
@@ -136,9 +136,9 @@ describe("configuração inteira", () => {
       killPoints: 1,
       placementPoints: [12, 9, 8, 7, 6],
       prizeDistribution: [
-        { position: 1, shareBps: 5000 },
-        { position: 2, shareBps: 3000 },
-        { position: 3, shareBps: 2000 },
+        { position: 1, centavos: 5000 },
+        { position: 2, centavos: 3000 },
+        { position: 3, centavos: 2000 },
       ],
     });
   });
@@ -188,18 +188,18 @@ describe("configuração inteira", () => {
       (
         checkPreset({
           ...base,
-          prizeDistribution: [{ position: 1, share_bps: 9999 }],
+          prizeDistribution: [{ position: 1, amount_centavos: 0 }],
         }) as any
       ).reason,
-      "shares-must-total-100"
+      "bad-slice"
     );
     assert.equal(
       (
         checkPreset({
           ...base,
           prizeDistribution: [
-            { position: 1, share_bps: 5000 },
-            { position: 3, share_bps: 5000 },
+            { position: 1, amount_centavos: 5000 },
+            { position: 3, amount_centavos: 5000 },
           ],
         }) as any
       ).reason,
@@ -213,6 +213,15 @@ describe("configuração inteira", () => {
       (checkPreset({ ...base, prizeDistribution: "tudo" }) as any).reason,
       "bad-slice"
     );
+  });
+
+  it("um preset NÃO exige que a soma feche — ele não tem premiação", () => {
+    // A soma é conferida na criação, onde os dois números existem. Exigir aqui
+    // impediria de salvar qualquer divisão, já que o campeonato ainda não
+    // existe. O app fecha a brecha do outro lado: aplicar um preset põe a soma
+    // das posições como premiação.
+    const result = checkPreset(base);
+    assert.equal(result.ok, true);
   });
 
   it("recusa o nome antes de olhar a pontuação", () => {

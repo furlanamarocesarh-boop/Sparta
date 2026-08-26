@@ -11,14 +11,20 @@
  * distribution lives on the tournament and applies whether there is one match
  * or twelve; `matchesCount: 1` is a normal tournament, not a special case.
  *
- * SHARES, NOT AMOUNTS. A slice is basis points of the prize, so changing the
- * prize rescales the split instead of leaving three absolute figures that no
- * longer add up. They must total EXACTLY 100 %: a distribution that quietly
- * summed to 97 % would strand money with no rule for where it went.
+ * AMOUNTS, NOT SHARES. A slice is the money that position receives, in integer
+ * centavos, exactly as the creator typed it. This was basis points first, and
+ * the round trip was the problem: R$ 3,00 split as R$ 1,00 / R$ 1,00 / R$ 1,00
+ * is 3333 bps three times, which is 9999 — so one slice had to be nudged to
+ * 3334, and first place got R$ 1,02 for a split the creator wrote as equal.
+ * Storing what was typed means the payout IS what was typed, and it deletes
+ * the remainder rule instead of documenting it.
+ *
+ * THE SUM MUST EQUAL THE PRIZE EXACTLY, which is the same guarantee 100 % gave
+ * and is checked where both numbers exist — at creation. A split totalling less
+ * than the prize would strand money with no rule for where it went; more would
+ * promise money the tournament never collected.
  *
  * EVERY NUMBER IS AN INTEGER. Points are whole; money is integer centavos.
- * Nothing here divides money without deciding, explicitly, who gets the
- * remainder — see `splitPrize`.
  */
 
 /** Ceilings. Not capacity plans — bounds that keep a hostile payload finite. */
@@ -27,7 +33,15 @@ export const MAX_KILL_POINTS = 1_000;
 export const MAX_PLACEMENT_POINTS = 10_000;
 export const MAX_RANKED_PLACEMENTS = 100;
 export const MAX_PRIZE_SLICES = 50;
-export const BPS_TOTAL = 10_000;
+
+/**
+ * The most one position may be configured to receive, in centavos.
+ *
+ * The tournament's own prize already bounds a real split — the sum has to
+ * equal it. This ceiling is for the case where there IS no prize to bound
+ * against: a saved preset, which carries amounts and no tournament.
+ */
+export const MAX_SLICE_CENTAVOS = 100_000_000;
 
 /** What a kill and a finishing position are worth. */
 export interface PointsConfig {
@@ -46,8 +60,9 @@ export interface PointsConfig {
 export interface PrizeSlice {
   /** 1-based finishing position in the FINAL standings. */
   readonly position: number;
-  /** Share of the prize, in basis points. */
-  readonly shareBps: number;
+  /** What that position receives, in integer centavos. Never zero: a position
+   * that receives nothing is not a paying position. */
+  readonly centavos: number;
 }
 
 export type ConfigRefusal =
@@ -59,7 +74,7 @@ export type ConfigRefusal =
   | "bad-slice"
   | "duplicate-position"
   | "non-consecutive-positions"
-  | "shares-must-total-100"
+  | "must-total-prize"
   | "too-many-slices";
 
 export type ConfigCheck =
@@ -101,13 +116,17 @@ export function checkPointsConfig(
 }
 
 /**
- * Whether a prize distribution is usable.
+ * Whether a distribution's SHAPE is usable, ignoring the total.
+ *
+ * Separate from the total on purpose: a saved preset carries amounts and no
+ * tournament, so there is no prize to check the sum against. Everything that
+ * can be judged without one is judged here.
  *
  * POSITIONS MUST BE 1..N WITH NO GAPS. Paying 1st and 3rd but not 2nd is not a
  * split anybody means to configure — it is a typo, and one that a player would
  * discover by not being paid.
  */
-export function checkPrizeDistribution(
+export function checkPrizeSlices(
   slices: readonly PrizeSlice[]
 ): ConfigCheck {
   if (!Array.isArray(slices) || slices.length === 0) {
@@ -118,11 +137,10 @@ export function checkPrizeDistribution(
   }
 
   const seen = new Set<number>();
-  let total = 0;
   for (const slice of slices) {
     if (
       !isWholeInRange(slice?.position, 1, MAX_PRIZE_SLICES) ||
-      !isWholeInRange(slice?.shareBps, 1, BPS_TOTAL)
+      !isWholeInRange(slice?.centavos, 1, MAX_SLICE_CENTAVOS)
     ) {
       return { ok: false, reason: "bad-slice" };
     }
@@ -130,7 +148,6 @@ export function checkPrizeDistribution(
       return { ok: false, reason: "duplicate-position" };
     }
     seen.add(slice.position);
-    total += slice.shareBps;
   }
 
   for (let position = 1; position <= slices.length; position += 1) {
@@ -139,8 +156,36 @@ export function checkPrizeDistribution(
     }
   }
 
-  if (total !== BPS_TOTAL) {
-    return { ok: false, reason: "shares-must-total-100" };
+  return { ok: true };
+}
+
+/** What a distribution pays in total, in centavos. */
+export function totalDistributed(slices: readonly PrizeSlice[]): number {
+  return slices.reduce(
+    (sum, slice) => sum + (Number.isInteger(slice?.centavos) ? slice.centavos : 0),
+    0
+  );
+}
+
+/**
+ * Whether a distribution is usable FOR A GIVEN PRIZE.
+ *
+ * The sum has to match to the centavo. Less would strand money with no rule
+ * for where it went; more would promise money the tournament never collected —
+ * and the settlement would discover that with a player already told they won.
+ */
+export function checkPrizeDistribution(
+  slices: readonly PrizeSlice[],
+  prizeCentavos: number
+): ConfigCheck {
+  const shape = checkPrizeSlices(slices);
+  if (!shape.ok) return shape;
+
+  if (
+    !Number.isInteger(prizeCentavos) ||
+    totalDistributed(slices) !== prizeCentavos
+  ) {
+    return { ok: false, reason: "must-total-prize" };
   }
   return { ok: true };
 }
@@ -278,14 +323,13 @@ export interface PrizeSplit {
 }
 
 /**
- * Splits the prize across the standings.
+ * Hands each position what it was configured to receive.
  *
- * THE REMAINDER GOES TO FIRST PLACE, deterministically. Basis points of an odd
- * number of centavos never divide evenly — 100 centavos split 1/3 leaves one
- * over — and the alternatives are worse: dropping it loses money from the pool
- * every settlement, and spreading it needs a second rule nobody can predict.
- * One documented recipient means the sum ALWAYS equals the prize exactly, which
- * is the property that lets a settlement be checked.
+ * NO ARITHMETIC ON MONEY. The amounts were decided when the tournament was
+ * created and checked against the prize then; here they are only routed to
+ * whoever finished in each place. That is the point of storing amounts instead
+ * of percentages — there is no division, so there is no remainder, so there is
+ * no rule about who gets it. What the creator typed is what gets paid.
  */
 export function splitPrize(
   prizeCentavos: number,
@@ -295,7 +339,7 @@ export function splitPrize(
   if (
     !Number.isInteger(prizeCentavos) ||
     prizeCentavos < 0 ||
-    checkPrizeDistribution(slices).ok === false
+    checkPrizeDistribution(slices, prizeCentavos).ok === false
   ) {
     return { awards: [], paidCentavos: 0, unclaimedCentavos: 0 };
   }
@@ -303,33 +347,19 @@ export function splitPrize(
   const ordered = [...slices].sort((a, b) => a.position - b.position);
 
   const awards: PrizeAward[] = [];
-  let assigned = 0;
   let unclaimed = 0;
 
   for (const slice of ordered) {
-    const centavos = Math.floor((prizeCentavos * slice.shareBps) / BPS_TOTAL);
-    assigned += centavos;
     const winner = standings[slice.position - 1];
     if (winner === undefined) {
-      unclaimed += centavos;
+      unclaimed += slice.centavos;
       continue;
     }
-    awards.push({ uid: winner.uid, position: slice.position, centavos });
-  }
-
-  // The floors leave a remainder. It belongs to first place if first place was
-  // actually claimed; otherwise it joins the unclaimed money rather than being
-  // invented onto somebody else.
-  const remainder = prizeCentavos - assigned;
-  if (remainder > 0) {
-    if (awards.length > 0 && awards[0].position === 1) {
-      awards[0] = {
-        ...awards[0],
-        centavos: awards[0].centavos + remainder,
-      };
-    } else {
-      unclaimed += remainder;
-    }
+    awards.push({
+      uid: winner.uid,
+      position: slice.position,
+      centavos: slice.centavos,
+    });
   }
 
   const paid = awards.reduce((sum, award) => sum + award.centavos, 0);

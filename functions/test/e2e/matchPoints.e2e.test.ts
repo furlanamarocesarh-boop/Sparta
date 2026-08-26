@@ -92,9 +92,9 @@ describe("E2E — campeonato de várias partidas", () => {
       kill_points: 1,
       placement_points: [12, 9, 8, 7, 6],
       prize_distribution: [
-        { position: 1, share_bps: 5000 },
-        { position: 2, share_bps: 3000 },
-        { position: 3, share_bps: 2000 },
+        { position: 1, amount_centavos: 5000 },
+        { position: 2, amount_centavos: 3000 },
+        { position: 3, amount_centavos: 2000 },
       ],
     });
 
@@ -103,9 +103,9 @@ describe("E2E — campeonato de várias partidas", () => {
     assert.equal(doc.get("kill_points"), 1);
     assert.deepEqual(doc.get("placement_points"), [12, 9, 8, 7, 6]);
     assert.deepEqual(doc.get("prize_distribution"), [
-      { position: 1, share_bps: 5000 },
-      { position: 2, share_bps: 3000 },
-      { position: 3, share_bps: 2000 },
+      { position: 1, amount_centavos: 5000 },
+      { position: 2, amount_centavos: 3000 },
+      { position: 3, amount_centavos: 2000 },
     ]);
   });
 
@@ -123,8 +123,8 @@ describe("E2E — campeonato de várias partidas", () => {
     // A opção vale sempre, não só em multi-partida.
     const { id } = await create({
       prize_distribution: [
-        { position: 1, share_bps: 7000 },
-        { position: 2, share_bps: 3000 },
+        { position: 1, amount_centavos: 7000 },
+        { position: 2, amount_centavos: 3000 },
       ],
     });
     const doc = await db.collection("tournaments").doc(id!).get();
@@ -132,18 +132,62 @@ describe("E2E — campeonato de várias partidas", () => {
     assert.equal((doc.get("prize_distribution") as unknown[]).length, 2);
   });
 
-  it("uma divisão que não soma 100% é RECUSADA na criação", async () => {
+  it("uma divisão que não fecha com a premiação é RECUSADA na criação", async () => {
     // Um torneio criado com divisão quebrada seria impossível de liquidar
-    // depois — a recusa tem que vir antes de ele existir.
+    // depois — a recusa tem que vir antes de ele existir. Premiação de R$ 100
+    // são 10.000 centavos; R$ 50 + R$ 40 deixa R$ 10 sem destino.
     await assert.rejects(
       () =>
         create({
           prize_distribution: [
-            { position: 1, share_bps: 5000 },
-            { position: 2, share_bps: 4000 },
+            { position: 1, amount_centavos: 5000 },
+            { position: 2, amount_centavos: 4000 },
           ],
         }),
-      /100%/
+      /exatamente o valor da premiação/
+    );
+    // E para mais também: prometeria dinheiro que o campeonato não arrecadou.
+    await assert.rejects(
+      () =>
+        create({
+          prize_distribution: [
+            { position: 1, amount_centavos: 6000 },
+            { position: 2, amount_centavos: 5000 },
+          ],
+        }),
+      /exatamente o valor da premiação/
+    );
+  });
+
+  it("UM CENTAVO a menos já é recusado", async () => {
+    // É o ponto de guardar valor em vez de percentual: não existe "quase".
+    await assert.rejects(
+      () =>
+        create({
+          prize_distribution: [
+            { position: 1, amount_centavos: 5000 },
+            { position: 2, amount_centavos: 4999 },
+          ],
+        }),
+      /exatamente o valor da premiação/
+    );
+  });
+
+  it("uma divisão IGUAL em três é gravada igual — sem centavo sobrando", async () => {
+    // Em pontos-base, R$ 33,33 três vezes somava 9999 e o centavo que faltava
+    // ia para o primeiro lugar. Aqui o criador escolhe onde ele fica.
+    const { id } = await create({
+      prize: 99.99,
+      prize_distribution: [
+        { position: 1, amount_centavos: 3333 },
+        { position: 2, amount_centavos: 3333 },
+        { position: 3, amount_centavos: 3333 },
+      ],
+    });
+    const doc = await db.collection("tournaments").doc(id!).get();
+    assert.deepEqual(
+      (doc.get("prize_distribution") as any[]).map((s) => s.amount_centavos),
+      [3333, 3333, 3333]
     );
   });
 
@@ -152,8 +196,8 @@ describe("E2E — campeonato de várias partidas", () => {
       () =>
         create({
           prize_distribution: [
-            { position: 1, share_bps: 5000 },
-            { position: 3, share_bps: 5000 },
+            { position: 1, amount_centavos: 5000 },
+            { position: 3, amount_centavos: 5000 },
           ],
         }),
       /pular posições/
@@ -166,7 +210,7 @@ describe("E2E — campeonato de várias partidas", () => {
         create({
           prize: 0,
           kill_prize: 1,
-          prize_distribution: [{ position: 1, share_bps: 10000 }],
+          prize_distribution: [{ position: 1, amount_centavos: 10000 }],
         }),
       /valor de premiação/
     );
@@ -191,8 +235,8 @@ describe("E2E — campeonato de várias partidas", () => {
         kill_points: 1,
         placement_points: [12, 9, 8],
         prize_distribution: [
-          { position: 1, share_bps: 6000 },
-          { position: 2, share_bps: 4000 },
+          { position: 1, amount_centavos: 6000 },
+          { position: 2, amount_centavos: 4000 },
         ],
       });
       id = made.id!;
@@ -351,7 +395,7 @@ describe("E2E — campeonato de várias partidas", () => {
 
     it("sem partida lançada, não liquida", async () => {
       const vazio = await create({
-        prize_distribution: [{ position: 1, share_bps: 10000 }],
+        prize_distribution: [{ position: 1, amount_centavos: 10000 }],
       });
       await assert.rejects(
         () => settleByPoints({ tournamentid: vazio.id }, ctx()),

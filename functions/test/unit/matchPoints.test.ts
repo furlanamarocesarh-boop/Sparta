@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
-  BPS_TOTAL,
   checkPointsConfig,
   checkPrizeDistribution,
+  checkPrizeSlices,
   computeStandings,
   MAX_MATCHES,
   placementPointsFor,
   splitPrize,
+  totalDistributed,
   type MatchResult,
   type PointsConfig,
   type PrizeSlice,
@@ -175,52 +176,64 @@ describe("a configuração é recusada quando não fecha", () => {
 });
 
 describe("a divisão do prêmio é do criador, e tem que fechar", () => {
+  // R$ 1.000,00 repartidos em 500 / 300 / 200.
   const split3: PrizeSlice[] = [
-    { position: 1, shareBps: 5000 },
-    { position: 2, shareBps: 3000 },
-    { position: 3, shareBps: 2000 },
+    { position: 1, centavos: 50_000 },
+    { position: 2, centavos: 30_000 },
+    { position: 3, centavos: 20_000 },
   ];
 
-  it("aceita uma divisão que soma 100%", () => {
-    assert.deepEqual(checkPrizeDistribution(split3), { ok: true });
+  it("aceita uma divisão que soma exatamente a premiação", () => {
+    assert.deepEqual(checkPrizeDistribution(split3, 100_000), { ok: true });
   });
 
   it("vencedor único é uma divisão de uma fatia", () => {
     assert.deepEqual(
-      checkPrizeDistribution([{ position: 1, shareBps: BPS_TOTAL }]),
+      checkPrizeDistribution([{ position: 1, centavos: 100_000 }], 100_000),
       { ok: true }
     );
   });
 
-  it("RECUSA se não somar exatamente 100%", () => {
-    // Uma divisão que somasse 90% deixaria dinheiro parado sem regra nenhuma
-    // dizendo para onde ele vai.
-    assert.equal(
-      refusal(
-        checkPrizeDistribution([
-          { position: 1, shareBps: 5_000 },
-          { position: 2, shareBps: 4_000 },
-        ])
+  it("RECUSA se a soma não bater com a premiação, para menos ou para mais", () => {
+    // Para menos deixaria dinheiro parado sem regra nenhuma dizendo para onde
+    // ele vai; para mais prometeria dinheiro que o campeonato não arrecadou.
+    assert.equal(refusal(checkPrizeDistribution(split3, 100_001)), "must-total-prize");
+    assert.equal(refusal(checkPrizeDistribution(split3, 99_999)), "must-total-prize");
+    assert.equal(refusal(checkPrizeDistribution(split3, 0)), "must-total-prize");
+  });
+
+  it("UM CENTAVO de diferença já recusa", () => {
+    // É o ponto de guardar valor em vez de percentual: não existe "quase".
+    const off: PrizeSlice[] = [
+      { position: 1, centavos: 3_333 },
+      { position: 2, centavos: 3_333 },
+      { position: 3, centavos: 3_333 },
+    ];
+    assert.equal(refusal(checkPrizeDistribution(off, 10_000)), "must-total-prize");
+    assert.deepEqual(
+      checkPrizeDistribution(
+        [
+          { position: 1, centavos: 3_334 },
+          { position: 2, centavos: 3_333 },
+          { position: 3, centavos: 3_333 },
+        ],
+        10_000
       ),
-      "shares-must-total-100"
-    );
-    assert.equal(
-      refusal(
-        checkPrizeDistribution([
-          { position: 1, shareBps: 6_000 },
-          { position: 2, shareBps: 5_000 },
-        ])
-      ),
-      "shares-must-total-100"
+      { ok: true }
     );
   });
 
-  it("uma fatia sozinha acima de 100% é fatia malformada, não soma errada", () => {
-    // A ordem importa: o formato da fatia é checado antes da soma, porque
-    // "esta fatia é impossível" é uma mensagem mais útil do que "o total não
-    // fecha" quando o erro está numa linha só.
+  it("A FORMA é checada antes da soma", () => {
+    // "esta linha é impossível" é mais útil do que "o total não fecha" quando
+    // o erro está numa linha só.
     assert.equal(
-      refusal(checkPrizeDistribution([{ position: 1, shareBps: 10_100 }])),
+      refusal(checkPrizeDistribution([{ position: 1, centavos: 0 }], 0)),
+      "bad-slice"
+    );
+    assert.equal(
+      refusal(
+        checkPrizeDistribution([{ position: 1, centavos: 1.5 }], 100)
+      ),
       "bad-slice"
     );
   });
@@ -229,41 +242,59 @@ describe("a divisão do prêmio é do criador, e tem que fechar", () => {
     // Pagar 1º e 3º sem 2º não é divisão que alguém configura de propósito —
     // é erro de digitação, e o jogador descobriria não sendo pago.
     assert.equal(
-      refusal(checkPrizeDistribution([
-        { position: 1, shareBps: 5000 },
-        { position: 3, shareBps: 5000 },
-      ])),
+      refusal(
+        checkPrizeDistribution(
+          [
+            { position: 1, centavos: 50_000 },
+            { position: 3, centavos: 50_000 },
+          ],
+          100_000
+        )
+      ),
       "non-consecutive-positions"
     );
   });
 
   it("recusa posição repetida, fatia zerada e lista vazia", () => {
     assert.equal(
-      refusal(checkPrizeDistribution([
-        { position: 1, shareBps: 5000 },
-        { position: 1, shareBps: 5000 },
-      ])),
+      refusal(
+        checkPrizeDistribution(
+          [
+            { position: 1, centavos: 50_000 },
+            { position: 1, centavos: 50_000 },
+          ],
+          100_000
+        )
+      ),
       "duplicate-position"
     );
     assert.equal(
-      refusal(checkPrizeDistribution([{ position: 1, shareBps: 0 }])),
+      refusal(checkPrizeDistribution([{ position: 1, centavos: 0 }], 0)),
       "bad-slice"
     );
-    assert.equal(refusal(checkPrizeDistribution([])), "empty-distribution");
+    assert.equal(refusal(checkPrizeDistribution([], 0)), "empty-distribution");
+  });
+
+  it("a FORMA sozinha não exige premiação — é o que um preset consegue conferir", () => {
+    // Um formato salvo carrega valores e nenhum campeonato; exigir a soma aqui
+    // impediria de salvar qualquer divisão.
+    assert.deepEqual(checkPrizeSlices(split3), { ok: true });
+    assert.equal(refusal(checkPrizeSlices([])), "empty-distribution");
+    assert.equal(totalDistributed(split3), 100_000);
   });
 });
 
 describe("dividindo o prêmio", () => {
   const split3: PrizeSlice[] = [
-    { position: 1, shareBps: 5000 },
-    { position: 2, shareBps: 3000 },
-    { position: 3, shareBps: 2000 },
+    { position: 1, centavos: 50_000 },
+    { position: 2, centavos: 30_000 },
+    { position: 3, centavos: 20_000 },
   ];
   const podium = computeStandings(CONFIG, [
     match(1, [["ouro", 10, 1], ["prata", 5, 2], ["bronze", 1, 3]]),
   ]);
 
-  it("cada posição recebe a fatia dela", () => {
+  it("cada posição recebe EXATAMENTE o que foi configurado", () => {
     const out = splitPrize(100_000, split3, podium);
     assert.deepEqual(
       out.awards.map((a) => [a.uid, a.centavos]),
@@ -272,24 +303,26 @@ describe("dividindo o prêmio", () => {
   });
 
   it("O TOTAL PAGO É EXATAMENTE O PRÊMIO, sempre", () => {
-    // Pontos-base de um número ímpar de centavos nunca dividem redondo. O
-    // resto vai para o primeiro lugar, por regra escrita, para que a soma
-    // possa ser conferida.
-    for (const prize of [100, 101, 999, 1, 7, 123_457]) {
-      const out = splitPrize(prize, split3, podium);
-      assert.equal(
-        out.paidCentavos + out.unclaimedCentavos,
-        prize,
-        `prêmio ${prize}`
-      );
-    }
+    assert.equal(
+      splitPrize(100_000, split3, podium).paidCentavos +
+        splitPrize(100_000, split3, podium).unclaimedCentavos,
+      100_000
+    );
   });
 
-  it("o resto vai para o primeiro lugar", () => {
-    // 100 dividido em 50/30/20 dá 50/30/20; 101 dá 50/30/20 e sobra 1.
-    const out = splitPrize(101, split3, podium);
-    assert.equal(out.awards[0].centavos, 51);
-    assert.equal(out.paidCentavos, 101);
+  it("uma divisão igual em três é paga igual — sem sobra para ninguém", () => {
+    // O caso que motivou trocar percentual por valor: em pontos-base, R$ 1,00
+    // três vezes virava 3333 bps três vezes, que dá 9999, e o centavo que
+    // faltava ia para o primeiro lugar. Quem digitou três valores iguais via o
+    // campeão receber mais.
+    const equal: PrizeSlice[] = [
+      { position: 1, centavos: 100 },
+      { position: 2, centavos: 100 },
+      { position: 3, centavos: 100 },
+    ];
+    const out = splitPrize(300, equal, podium);
+    assert.deepEqual(out.awards.map((a) => a.centavos), [100, 100, 100]);
+    assert.equal(out.paidCentavos, 300);
   });
 
   it("posição sem jogador NÃO é redistribuída", () => {
@@ -309,15 +342,9 @@ describe("dividindo o prêmio", () => {
     assert.equal(out.unclaimedCentavos, 100_000);
   });
 
-  it("prêmio zero paga zero, sem quebrar", () => {
-    const out = splitPrize(0, split3, podium);
-    assert.equal(out.paidCentavos, 0);
-    assert.equal(out.awards.every((a) => a.centavos === 0), true);
-  });
-
-  it("uma divisão inválida não paga NADA", () => {
+  it("uma divisão que não fecha com o prêmio não paga NADA", () => {
     // Falha fechada: dividir com regra quebrada é a forma de pagar errado.
-    const out = splitPrize(100_000, [{ position: 1, shareBps: 9_000 }], podium);
+    const out = splitPrize(100_000, [{ position: 1, centavos: 90_000 }], podium);
     assert.deepEqual(out.awards, []);
     assert.equal(out.paidCentavos, 0);
   });
