@@ -395,3 +395,34 @@ describe("backend path — Admin SDK bypassa as Rules", () => {
     await assertSucceeds(asOwner().doc("tournaments/t-open").get());
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (28) Configurações salvas de pontuação — fechadas nos dois sentidos.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("scoring_presets — validação server-side, sem porta lateral", () => {
+  it("(28) nem o dono nem o admin leem ou escrevem direto", async () => {
+    // Não é sigilo: é que as regras que fazem uma configuração VÁLIDA —
+    // pontos inteiros, posições sem buraco, percentuais somando exatamente
+    // 100% — moram no servidor. Uma escrita direta passaria por fora delas, e
+    // a configuração inválida não falharia aqui: falharia semanas depois, no
+    // campeonato que ela configurou.
+    const path = `scoring_presets/admin-client/presets/squad-6`;
+    await assertFails(asAdmin().doc(path).get());
+    await assertFails(asAdmin().doc(path).set({ name: "Squad 6" }));
+    await assertFails(asAdmin().collection("scoring_presets/admin-client/presets").get());
+
+    await assertFails(asOwner().doc(`scoring_presets/${OWNER}/presets/meu`).get());
+    await assertFails(
+      asOwner().doc(`scoring_presets/${OWNER}/presets/meu`).set({ name: "Meu" })
+    );
+    await assertFails(asOwner().doc(`scoring_presets/${OWNER}`).get());
+  });
+
+  it("(28) e um estranho não alcança as de outro criador", async () => {
+    await assertFails(asOther().doc(`scoring_presets/${OWNER}/presets/meu`).get());
+    await assertFails(
+      asOther().collection(`scoring_presets/${OWNER}/presets`).get()
+    );
+  });
+});

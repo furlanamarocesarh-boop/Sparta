@@ -300,6 +300,26 @@ service cloud.firestore {
       allow create, update, delete: if false;
     }
 
+    // CONFIGURAÇÕES SALVAS DE PONTUAÇÃO — a tabela de pontos e a divisão da
+    // premiação que um criador guarda para reusar.
+    //
+    // NINGUÉM LÊ OU ESCREVE DIRETO, o próprio dono incluído. Não é sigilo: é
+    // que a validação — pontos inteiros, posições sem buraco, percentuais que
+    // somam exatamente 100% — mora no servidor, e uma escrita direta passaria
+    // por fora dela. Uma configuração inválida não falha aqui; falha semanas
+    // depois, no campeonato que ela configurou.
+    //
+    // Servido pelas callables saveScoringPreset / listScoringPresets /
+    // deleteScoringPreset, que rodam pelo Admin SDK e ignoram as Rules, e cada
+    // uma delas tira o uid do token verificado — nunca do payload.
+    match /scoring_presets/{ownerUid} {
+      allow read, write: if false;
+
+      match /presets/{presetId} {
+        allow read, write: if false;
+      }
+    }
+
     // Bloqueia qualquer collection não prevista.
     match /{document=**} {
       allow read, write: if false;

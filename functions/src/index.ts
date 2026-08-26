@@ -216,6 +216,12 @@ import {
   type PrizeSlice,
 } from "./domain/matchPoints.js";
 import {
+  checkPreset,
+  checkPresetId,
+  MAX_PRESETS_PER_OWNER,
+  presetMessage,
+} from "./domain/scoringPreset.js";
+import {
   aggregateToCentavos,
   KNOWN_CATEGORIES,
   rollUpByEconomy,
@@ -5472,6 +5478,276 @@ export const settleTournamentByPointsHandler = async (
 
 export const settleTournamentByPoints = central.https.onCall(
   settleTournamentByPointsHandler
+);
+
+/**
+ * CONFIGURAÇÕES SALVAS DE PONTUAÇÃO.
+ *
+ * O PROBLEMA QUE ISTO RESOLVE. Quem organiza a mesma liga toda semana digita a
+ * mesma tabela toda semana — partidas, pontos por abate, pontos por colocação e
+ * a divisão da premiação. Errar um número não é um erro que o criador vê: é um
+ * pagamento que outra pessoa descobre. Uma configuração salva é essa tabela,
+ * nomeada e guardada uma vez.
+ *
+ * NO SERVIDOR, NÃO NO APARELHO. A tabela é trabalho de verdade do criador;
+ * limpar o navegador não pode perdê-la, e a mesma conta no celular tem que
+ * encontrar as mesmas configurações.
+ *
+ * O NOME É A IDENTIDADE. O id sai do nome, então salvar "Squad 6 partidas" duas
+ * vezes SUBSTITUI em vez de deixar duas linhas iguais para o criador distinguir
+ * — que é o que um botão de salvar significa em qualquer outro lugar, e de
+ * quebra torna o salvamento idempotente: dois toques não criam duas.
+ */
+const SCORING_PRESETS_COLLECTION = "scoring_presets";
+const SCORING_PRESETS_SUBCOLLECTION = "presets";
+
+/** As configurações de UM dono. Nunca recebe uid vindo do payload. */
+function presetsOf(uid: string): CollectionReference {
+  return db
+    .collection(SCORING_PRESETS_COLLECTION)
+    .doc(uid)
+    .collection(SCORING_PRESETS_SUBCOLLECTION);
+}
+
+/**
+ * As recusas que vêm DESTE módulo. As outras — pontuação e divisão — são as
+ * mesmas de `createTournament` e usam a mesma frase, de propósito: o operador
+ * lê o mesmo texto salvando um preset ou criando um campeonato.
+ */
+const PRESET_OWN_REASONS: ReadonlySet<string> = new Set([
+  "bad-name",
+  "name-too-short",
+  "name-too-long",
+  "name-has-no-letters",
+  "bad-preset-id",
+  "too-many-presets",
+]);
+
+function presetRefusalMessage(reason: string): string {
+  return PRESET_OWN_REASONS.has(reason)
+    ? presetMessage(reason)
+    : pointsConfigMessage(reason);
+}
+
+/**
+ * A projeção de uma configuração — construída chave por chave.
+ *
+ * `owner_uid` está guardado no documento e NUNCA sai: a resposta é sempre para
+ * o próprio dono, que já sabe quem é, e um campo a mais aqui é um uid a mais
+ * circulando por nada.
+ */
+function projectPreset(
+  presetId: string,
+  data: Record<string, any>
+): Record<string, unknown> {
+  const distribution = Array.isArray(data.prize_distribution)
+    ? data.prize_distribution.map((slice: any) => ({
+        position: Number(slice?.position),
+        share_bps: Number(slice?.share_bps),
+      }))
+    : null;
+
+  return {
+    preset_id: presetId,
+    name: String(data.name ?? ""),
+    matches_count: Number(data.matches_count ?? 1),
+    kill_points: Number(data.kill_points ?? 0),
+    placement_points: Array.isArray(data.placement_points)
+      ? data.placement_points.map((p: unknown) => Number(p))
+      : [],
+    prize_distribution: distribution,
+  };
+}
+
+const SAVE_PRESET_KEYS = [
+  "name",
+  "matches_count",
+  "kill_points",
+  "placement_points",
+  "prize_distribution",
+] as const;
+
+/**
+ * Salva uma configuração. Cria ou substitui — o id vem do nome.
+ *
+ * VALIDA COM AS MESMAS FUNÇÕES DA CRIAÇÃO. Uma configuração que salvasse limpa
+ * e depois falhasse ao criar o campeonato seria pior do que não ter
+ * configuração nenhuma, então não existe uma segunda regra aqui.
+ */
+export const saveScoringPresetHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertAdmin(
+      context,
+      "Você precisa estar logado para salvar uma configuração.",
+      "Apenas admin pode salvar configurações de campeonato."
+    );
+
+    assertExactPayload(data, SAVE_PRESET_KEYS);
+
+    const check = checkPreset({
+      name: data.name,
+      matchesCount: data.matches_count,
+      killPoints: data.kill_points,
+      placementPoints: data.placement_points,
+      prizeDistribution: data.prize_distribution,
+    });
+    if (!check.ok) {
+      throw new DomainError(
+        "invalid-argument",
+        presetRefusalMessage(String(check.reason))
+      );
+    }
+
+    const preset = check.preset;
+    const ref = presetsOf(callerAuth.uid).doc(preset.presetId);
+
+    await db.runTransaction(async (tx) => {
+      const existing = await tx.get(ref);
+
+      // O TETO SÓ VALE PARA UMA NOVA. Substituir uma que já existe nunca pode
+      // esbarrar no limite — seria impossível corrigir a última configuração
+      // salva sem antes apagar outra.
+      if (!existing.exists) {
+        const current = await tx.get(
+          presetsOf(callerAuth.uid).limit(MAX_PRESETS_PER_OWNER + 1)
+        );
+        if (current.size >= MAX_PRESETS_PER_OWNER) {
+          throw new DomainError(
+            "failed-precondition",
+            presetMessage("too-many-presets")
+          );
+        }
+      }
+
+      const body: Record<string, unknown> = {
+        owner_uid: callerAuth.uid,
+        name: preset.name,
+        matches_count: preset.matchesCount,
+        kill_points: preset.killPoints,
+        placement_points: [...preset.placementPoints],
+        // SEMPRE ESCRITO, inclusive como null. Gravar só quando existe deixaria
+        // a divisão anterior colada numa configuração que o criador acabou de
+        // mudar para "só o campeão".
+        prize_distribution:
+          preset.prizeDistribution === null
+            ? null
+            : preset.prizeDistribution.map((slice) => ({
+                position: slice.position,
+                share_bps: slice.shareBps,
+              })),
+        updated_at: FieldValue.serverTimestamp(),
+      };
+      if (!existing.exists) body.created_at = FieldValue.serverTimestamp();
+
+      tx.set(ref, body, { merge: true });
+    });
+
+    return {
+      saved: true,
+      preset: projectPreset(preset.presetId, {
+        name: preset.name,
+        matches_count: preset.matchesCount,
+        kill_points: preset.killPoints,
+        placement_points: preset.placementPoints,
+        prize_distribution:
+          preset.prizeDistribution === null
+            ? null
+            : preset.prizeDistribution.map((slice) => ({
+                position: slice.position,
+                share_bps: slice.shareBps,
+              })),
+      }),
+    };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const saveScoringPreset = central.https.onCall(saveScoringPresetHandler);
+
+/**
+ * As configurações do próprio criador.
+ *
+ * ORDENADAS EM CÓDIGO, não pelo Firestore. A ordenação do banco é por bytes, o
+ * que joga "Ápice" depois de "Zebra"; com teto de vinte itens, ordenar aqui com
+ * as regras do português custa nada e é o que a pessoa espera ler.
+ */
+export const listScoringPresetsHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertAdmin(
+      context,
+      "Você precisa estar logado para ver suas configurações.",
+      "Apenas admin pode ver configurações de campeonato."
+    );
+
+    assertExactPayload(data ?? {}, []);
+
+    const snapshot = await presetsOf(callerAuth.uid)
+      .limit(MAX_PRESETS_PER_OWNER)
+      .get();
+
+    const presets = snapshot.docs
+      .map((doc) => projectPreset(doc.id, doc.data() ?? {}))
+      .sort((a, b) =>
+        String(a.name).localeCompare(String(b.name), "pt-BR", {
+          sensitivity: "base",
+        })
+      );
+
+    return { presets };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const listScoringPresets = central.https.onCall(
+  listScoringPresetsHandler
+);
+
+/**
+ * Apaga uma configuração.
+ *
+ * APAGAR O QUE NÃO EXISTE NÃO É ERRO. Um segundo toque, ou um toque num item
+ * que outra aba já apagou, chega aqui e o resultado desejado — a configuração
+ * não existe mais — já é verdade. Responder erro faria a tela mostrar uma
+ * falha para algo que deu certo.
+ */
+export const deleteScoringPresetHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertAdmin(
+      context,
+      "Você precisa estar logado para apagar uma configuração.",
+      "Apenas admin pode apagar configurações de campeonato."
+    );
+
+    assertExactPayload(data, ["preset_id"]);
+
+    const idCheck = checkPresetId(data.preset_id);
+    if (!idCheck.ok) {
+      throw new DomainError("invalid-argument", presetMessage(idCheck.reason));
+    }
+
+    const ref = presetsOf(callerAuth.uid).doc(String(data.preset_id));
+    const existing = await ref.get();
+    if (existing.exists) await ref.delete();
+
+    return { deleted: existing.exists };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const deleteScoringPreset = central.https.onCall(
+  deleteScoringPresetHandler
 );
 
 /**

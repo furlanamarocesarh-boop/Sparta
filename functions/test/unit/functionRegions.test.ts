@@ -115,6 +115,9 @@ const AUTHORIZED_FUNCTIONS: Readonly<Record<string, string>> = {
   getMyProfile: CENTRAL,
   applyForPartner: CENTRAL,
   reviewPartnerApplication: CENTRAL,
+  saveScoringPreset: CENTRAL,
+  listScoringPresets: CENTRAL,
+  deleteScoringPreset: CENTRAL,
 };
 
 /**
