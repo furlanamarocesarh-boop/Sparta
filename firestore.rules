@@ -320,6 +320,22 @@ service cloud.firestore {
       }
     }
 
+    // CHAVEAMENTO DA COPA — quem enfrenta quem, e quem passou.
+    //
+    // LEGÍVEL POR QUEM ESTÁ LOGADO, pela mesma razão dos resultados de partida
+    // logo acima: uma chave que o jogador não consegue ver é uma chave que ele
+    // não consegue conferir, e o caminho até a final é a informação central de
+    // um mata-mata.
+    //
+    // NINGUÉM ESCREVE. O sorteio e cada resultado passam por drawCupBracket e
+    // declareCupMatch, que rodam pelo Admin SDK. Uma escrita direta aqui
+    // promoveria alguém para uma chave que ele não disputou — e a premiação é
+    // paga pela classificação que sai daqui.
+    match /tournaments/{tournamentId}/bracket/{document} {
+      allow read: if signedIn();
+      allow create, update, delete: if false;
+    }
+
     // Bloqueia qualquer collection não prevista.
     match /{document=**} {
       allow read, write: if false;

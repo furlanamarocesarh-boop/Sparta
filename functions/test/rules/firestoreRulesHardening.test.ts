@@ -426,3 +426,38 @@ describe("scoring_presets — validação server-side, sem porta lateral", () =>
     );
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (29) Chaveamento da Copa — legível, jamais escrito por cliente.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("bracket da Copa — leitura aberta, escrita fechada", () => {
+  it("(29) qualquer logado LÊ a chave", async () => {
+    // Uma chave que o jogador não consegue ver é uma chave que ele não
+    // consegue conferir, e o caminho até a final é o centro de um mata-mata.
+    await assertSucceeds(asOwner().doc("tournaments/t-open/bracket/state").get());
+    await assertSucceeds(asOther().doc("tournaments/t-open/bracket/state").get());
+  });
+
+  it("(29) NINGUÉM escreve, admin incluído", async () => {
+    // Uma escrita direta promoveria alguém para uma chave que não disputou — e
+    // a premiação é paga pela classificação que sai daqui.
+    for (const db of [asOwner(), asOther(), asAdmin()]) {
+      await assertFails(
+        db.doc("tournaments/t-open/bracket/state").set({ matches: [] })
+      );
+      await assertFails(
+        db.doc("tournaments/t-open/bracket/state").update({ matches: [] })
+      );
+      await assertFails(db.doc("tournaments/t-open/bracket/state").delete());
+    }
+  });
+
+  it("(29) deslogado não lê", async () => {
+    await assertFails(
+      testEnv.unauthenticatedContext().firestore()
+        .doc("tournaments/t-open/bracket/state")
+        .get()
+    );
+  });
+});

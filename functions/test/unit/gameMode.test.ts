@@ -3,6 +3,10 @@ import { describe, it } from "node:test";
 
 import {
   BATTLE_ROYALE_LOBBY,
+  CUP_TEAM_SIZES,
+  cupSpec,
+  MAX_CUP_TEAMS,
+  resolveGameMode,
   capacityMessage,
   capacitySummary,
   checkPlayerCount,
@@ -25,13 +29,14 @@ const refusal = (check: ReturnType<typeof checkPlayerCount>): CapacityRefusal =>
   check.ok ? ("nenhuma" as CapacityRefusal) : check.reason;
 
 describe("os modos que existem", () => {
-  it("são exatamente cinco, com as chaves que o cliente manda", () => {
+  it("são exatamente seis, com as chaves que o cliente manda", () => {
     assert.deepEqual(GAME_MODES.map((m) => m.key), [
       "solo",
       "duo",
       "squad",
       "2v2",
       "4v4",
+      "copa",
     ]);
   });
 
@@ -45,6 +50,75 @@ describe("os modos que existem", () => {
     for (const bad of ["", "trio", "5v5", "battle", null, 7, {}]) {
       assert.equal(gameModeSpec(bad as unknown), null, String(bad));
     }
+  });
+});
+
+describe("Copa — o criador escolhe o tamanho da equipe", () => {
+  it("aceita 1, 2 e 4, e nada mais", () => {
+    for (const size of CUP_TEAM_SIZES) {
+      assert.equal(cupSpec(size)!.teamSize, size);
+    }
+    for (const bad of [0, 3, 5, 8, -1, 1.5]) {
+      assert.equal(cupSpec(bad), null, String(bad));
+    }
+  });
+
+  it("o rótulo diz o formato do confronto", () => {
+    assert.equal(cupSpec(1)!.label, "Copa");
+    assert.equal(cupSpec(2)!.label, "Copa 2v2");
+    assert.equal(cupSpec(4)!.label, "Copa 4v4");
+  });
+
+  it("NÃO é um lobby: o teto é o chaveamento, não a sala", () => {
+    // Os confrontos são jogados separadamente, então 48 não tem nada a ver.
+    assert.equal(cupSpec(1)!.maxPlayers, MAX_CUP_TEAMS);
+    assert.equal(cupSpec(4)!.maxPlayers, MAX_CUP_TEAMS * 4);
+    assert.equal(checkPlayerCount(cupSpec(4)!, 256).ok, true);
+    assert.equal(
+      refusal(checkPlayerCount(cupSpec(4)!, 260)),
+      "above-maximum"
+    );
+  });
+
+  it("equipe pela metade continua recusada", () => {
+    assert.equal(refusal(checkPlayerCount(cupSpec(2)!, 7)), "partial-team");
+    assert.equal(checkPlayerCount(cupSpec(2)!, 8).ok, true);
+  });
+
+  it("duas equipes é o mínimo", () => {
+    assert.equal(refusal(checkPlayerCount(cupSpec(4)!, 4)), "below-minimum");
+    assert.equal(checkPlayerCount(cupSpec(4)!, 8).ok, true);
+  });
+
+  it("qualquer número de equipes serve — o bye resolve o resto", () => {
+    // É a diferença para o lobby: 12, 20, 33 equipes são chaveamentos legítimos.
+    for (const teams of [2, 3, 5, 12, 20, 33, 64]) {
+      assert.equal(
+        checkPlayerCount(cupSpec(2)!, teams * 2).ok,
+        true,
+        `${teams} equipes`
+      );
+    }
+  });
+});
+
+describe("o tamanho da equipe vindo do cliente", () => {
+  it("só a Copa lê — nos outros ele é consequência do modo", () => {
+    assert.equal(resolveGameMode("squad", undefined)!.teamSize, 4);
+    assert.equal(resolveGameMode("squad", 4)!.teamSize, 4);
+    assert.equal(resolveGameMode("copa", 4)!.teamSize, 4);
+    assert.equal(resolveGameMode("copa", undefined)!.teamSize, 1);
+  });
+
+  it("um tamanho que CONTRADIZ o modo é recusado, não ignorado", () => {
+    // Aceitar em silêncio gravaria um torneio cujo team_size discorda do modo.
+    assert.equal(resolveGameMode("squad", 2), null);
+    assert.equal(resolveGameMode("2v2", 4), null);
+  });
+
+  it("um tamanho impossível de Copa é recusado", () => {
+    assert.equal(resolveGameMode("copa", 3), null);
+    assert.equal(resolveGameMode("copa", 0), null);
   });
 });
 

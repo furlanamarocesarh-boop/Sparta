@@ -215,6 +215,7 @@ import {
   type MatchResult,
   type PointsConfig,
   type PrizeSlice,
+  type Standing,
 } from "./domain/matchPoints.js";
 import {
   checkPreset,
@@ -225,9 +226,21 @@ import {
 import {
   capacityMessage,
   checkPlayerCount,
+  CUP_TEAM_SIZES,
   gameModeKeys,
   gameModeSpec,
+  resolveGameMode,
 } from "./domain/gameMode.js";
+import {
+  champion,
+  checkEntrants,
+  cupMessage,
+  cupStandings,
+  declareWinner,
+  drawBracket,
+  isComplete,
+  type Bracket,
+} from "./domain/cup.js";
 import {
   aggregateToCentavos,
   KNOWN_CATEGORIES,
@@ -1627,11 +1640,13 @@ export const createTournamentHandler = async (
      * ficou de fora — por isso a contagem tem que ser um número inteiro de
      * equipes.
      */
-    const modeSpec = gameModeSpec(gameMode);
+    const modeSpec = resolveGameMode(gameMode, data.team_size);
     if (modeSpec === null) {
       throw new DomainError(
         "invalid-argument",
-        `Modo de jogo inválido. Use ${gameModeKeys().join(", ")}.`
+        gameModeSpec(gameMode) === null
+          ? `Modo de jogo inválido. Use ${gameModeKeys().join(", ")}.`
+          : `O tamanho da equipe precisa ser ${CUP_TEAM_SIZES.join(", ")}.`
       );
     }
 
@@ -5287,25 +5302,61 @@ export const settleTournamentByPointsHandler = async (
         );
       }
 
-      // ── The standings, from the matches actually reported ───────────────
-      const config: PointsConfig = {
-        killPoints: Number(tournamentData.kill_points ?? 0),
-        placementPoints: Array.isArray(tournamentData.placement_points)
-          ? tournamentData.placement_points.map((p: unknown) => Number(p))
-          : [],
-      };
-      const matches: MatchResult[] = matchesSnap.docs.map((doc) => ({
-        matchNumber: Number(doc.get("match_number") ?? 0),
-        entries: Array.isArray(doc.get("entries")) ? doc.get("entries") : [],
-      }));
-      if (matches.length === 0) {
-        throw new DomainError(
-          "failed-precondition",
-          "Nenhuma partida foi lançada neste campeonato."
-        );
-      }
+      /**
+       * ── A CLASSIFICAÇÃO ─────────────────────────────────────────────────
+       *
+       * DUAS ORIGENS, UM PAGAMENTO. A pontuação vem da soma das partidas; a
+       * Copa vem do chaveamento. Daqui para baixo é tudo idêntico — caixa,
+       * solvência, carteiras, razão — porque quem paga não precisa saber COMO
+       * a ordem foi decidida, só qual é. Duplicar a liquidação por formato
+       * seria duplicar o caminho do dinheiro.
+       */
+      const isCup = String(tournamentData.format_type ?? "") === "cup";
+      let standings: Standing[];
 
-      const standings = computeStandings(config, matches);
+      if (isCup) {
+        const bracketSnap = await transaction.get(bracketRef(tournamentid));
+        if (!bracketSnap.exists) {
+          throw new DomainError(
+            "failed-precondition",
+            "O chaveamento ainda não foi sorteado."
+          );
+        }
+        const bracket = readBracket(bracketSnap.data() ?? {});
+        if (!isComplete(bracket)) {
+          throw new DomainError(
+            "failed-precondition",
+            "A Copa ainda tem confrontos sem resultado."
+          );
+        }
+        // A Copa decide ORDEM, não pontos: os campos de pontuação existem só
+        // porque a classificação é a mesma estrutura nos dois formatos.
+        standings = cupStandings(bracket).map((uid, index) => ({
+          uid,
+          points: 0,
+          kills: 0,
+          bestPlacement: index + 1,
+          matchesPlayed: 0,
+        }));
+      } else {
+        const config: PointsConfig = {
+          killPoints: Number(tournamentData.kill_points ?? 0),
+          placementPoints: Array.isArray(tournamentData.placement_points)
+            ? tournamentData.placement_points.map((p: unknown) => Number(p))
+            : [],
+        };
+        const matches: MatchResult[] = matchesSnap.docs.map((doc) => ({
+          matchNumber: Number(doc.get("match_number") ?? 0),
+          entries: Array.isArray(doc.get("entries")) ? doc.get("entries") : [],
+        }));
+        if (matches.length === 0) {
+          throw new DomainError(
+            "failed-precondition",
+            "Nenhuma partida foi lançada neste campeonato."
+          );
+        }
+        standings = computeStandings(config, matches);
+      }
 
       // ── Only who paid in may be paid out ────────────────────────────────
       const pool = poolFromRegistrations(
@@ -5331,7 +5382,9 @@ export const settleTournamentByPointsHandler = async (
       if (split.awards.length === 0) {
         throw new DomainError(
           "failed-precondition",
-          "Nenhum jogador inscrito pontuou neste campeonato."
+          isCup
+            ? "Nenhum inscrito da Copa chegou a uma posição pagante."
+            : "Nenhum jogador inscrito pontuou neste campeonato."
         );
       }
 
@@ -5455,9 +5508,11 @@ export const settleTournamentByPointsHandler = async (
       transaction.update(tournamentRef, {
         status: "completed",
         result: {
-          mode: "points",
+          // O FORMATO FICA GRAVADO no resultado: quem for ler depois precisa
+          // saber se aquela ordem veio de pontos somados ou de chaveamento.
+          mode: isCup ? "cup" : "points",
           economy_type: economy,
-          matches_reported: matches.length,
+          matches_reported: isCup ? 0 : matchesSnap.size,
           /**
            * The whole final table is stored, not just who was paid. It is what
            * a player will be shown, and recomputing it later would depend on a
@@ -5502,6 +5557,277 @@ export const settleTournamentByPointsHandler = async (
 export const settleTournamentByPoints = central.https.onCall(
   settleTournamentByPointsHandler
 );
+
+/**
+ * A COPA, do sorteio ao campeão.
+ *
+ * POR QUE NÃO PASSA PELO `startTournament`. Aquele caminho exige uma sala
+ * publicada — id e senha de um lobby onde todo mundo cai junto. Uma Copa não
+ * tem isso: são confrontos jogados separadamente, e cada um teria a sua sala.
+ * Enfiar a Copa lá dentro relaxaria uma precondição que existe para proteger o
+ * formato que a usa.
+ *
+ * O SORTEIO É A LARGADA. `drawCupBracket` fecha as inscrições, monta o
+ * chaveamento e move o campeonato para `in_progress` — as três coisas na mesma
+ * transação, porque um chaveamento sorteado sobre uma lista que ainda aceita
+ * inscrição é um chaveamento errado no instante seguinte.
+ */
+const BRACKET_SUBCOLLECTION = "bracket";
+const BRACKET_DOC = "state";
+
+function bracketRef(tournamentId: string) {
+  return db
+    .collection("tournaments")
+    .doc(tournamentId)
+    .collection(BRACKET_SUBCOLLECTION)
+    .doc(BRACKET_DOC);
+}
+
+/** O chaveamento gravado, no formato do domínio. */
+function readBracket(data: Record<string, any>): Bracket {
+  return {
+    size: Number(data.size ?? 0),
+    rounds: Number(data.rounds ?? 0),
+    entrants: Array.isArray(data.entrants) ? data.entrants.map(String) : [],
+    matches: Array.isArray(data.matches)
+      ? data.matches.map((m: any) => ({
+          matchNumber: Number(m?.match_number),
+          round: Number(m?.round),
+          slot: Number(m?.slot),
+          home: typeof m?.home === "string" ? m.home : null,
+          away: typeof m?.away === "string" ? m.away : null,
+          winner: typeof m?.winner === "string" ? m.winner : null,
+          bye: m?.bye === true,
+        }))
+      : [],
+  };
+}
+
+/** O chaveamento como documento. `snake_case` como todo o resto do banco. */
+function writeBracket(bracket: Bracket): Record<string, unknown> {
+  return {
+    size: bracket.size,
+    rounds: bracket.rounds,
+    entrants: [...bracket.entrants],
+    matches: bracket.matches.map((m) => ({
+      match_number: m.matchNumber,
+      round: m.round,
+      slot: m.slot,
+      home: m.home,
+      away: m.away,
+      winner: m.winner,
+      bye: m.bye,
+    })),
+  };
+}
+
+/**
+ * Fecha as inscrições e sorteia o chaveamento.
+ *
+ * A SEMENTE É A ORDEM DE INSCRIÇÃO: quem entrou primeiro é o cabeça 1, e é daí
+ * que sai quem passa de bye. É a única régua verificável hoje — cada inscrição
+ * tem carimbo de tempo e o jogador consegue conferir a própria — e não depende
+ * do ranking, que ainda não abriu.
+ *
+ * IDEMPOTENTE. Sortear de novo devolve o mesmo chaveamento em vez de embaralhar
+ * um torneio que já começou: um segundo toque não pode redesenhar chaves que
+ * jogadores já viram.
+ */
+export const drawCupBracketHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    assertAdmin(
+      context,
+      "Você precisa estar logado para sortear o chaveamento.",
+      "Apenas admin pode sortear o chaveamento."
+    );
+
+    assertExactPayload(data, ["tournamentid"]);
+    const tournamentid = normalizeTournamentId(data.tournamentid);
+
+    const tournamentRef = db.collection("tournaments").doc(tournamentid);
+
+    const result = await db.runTransaction(async (transaction) => {
+      const tournamentSnap = await transaction.get(tournamentRef);
+      if (!tournamentSnap.exists) {
+        throw new DomainError("not-found", "Campeonato não encontrado.");
+      }
+      const tournamentData = tournamentSnap.data() ?? {};
+
+      if (String(tournamentData.format_type ?? "") !== "cup") {
+        throw new DomainError(
+          "failed-precondition",
+          "Este campeonato não é uma Copa."
+        );
+      }
+
+      const status = String(tournamentData.status || "").trim().toLowerCase();
+      if (status === "completed" || status === "cancelled") {
+        throw new DomainError(
+          "failed-precondition",
+          status === "completed"
+            ? "Este campeonato já foi encerrado."
+            : "Este campeonato foi cancelado."
+        );
+      }
+
+      const existing = await transaction.get(bracketRef(tournamentid));
+      if (existing.exists) {
+        // JÁ SORTEADO. Devolve o que existe; redesenhar apagaria chaves que os
+        // jogadores já viram.
+        const bracket = readBracket(existing.data() ?? {});
+        return { idempotent: true, bracket };
+      }
+
+      const registrations = await transaction.get(
+        db
+          .collection("registrations")
+          .where("tournament_ref", "==", tournamentRef)
+      );
+
+      const entrants = registrations.docs
+        .filter((doc) => String(doc.get("status") ?? "") === "registered")
+        .map((doc) => ({
+          uid: uidFromUserRefPath(documentPath(doc.get("user_ref"))),
+          at: doc.get("created_at"),
+        }))
+        .filter((row): row is { uid: string; at: unknown } => row.uid !== null)
+        .sort((a, b) => {
+          // Sem carimbo é inscrição antiga: vai para o fim, em ordem de uid,
+          // para que a semeadura continue determinística.
+          const timeA = a.at instanceof Timestamp ? a.at.toMillis() : Number.MAX_SAFE_INTEGER;
+          const timeB = b.at instanceof Timestamp ? b.at.toMillis() : Number.MAX_SAFE_INTEGER;
+          if (timeA !== timeB) return timeA - timeB;
+          return a.uid < b.uid ? -1 : a.uid > b.uid ? 1 : 0;
+        })
+        .map((row) => row.uid);
+
+      const check = checkEntrants(entrants);
+      if (!check.ok) {
+        throw new DomainError("failed-precondition", cupMessage(check.reason));
+      }
+
+      const bracket = drawBracket(entrants);
+
+      transaction.set(bracketRef(tournamentid), {
+        ...writeBracket(bracket),
+        drawn_at: FieldValue.serverTimestamp(),
+        tournament_ref: tournamentRef,
+      });
+      transaction.update(tournamentRef, {
+        status: "in_progress",
+        updated_at: FieldValue.serverTimestamp(),
+      });
+
+      return { idempotent: false, bracket };
+    });
+
+    return {
+      success: true,
+      idempotent: result.idempotent,
+      size: result.bracket.size,
+      rounds: result.bracket.rounds,
+      entrants: result.bracket.entrants.length,
+      byes: result.bracket.matches.filter((m) => m.bye).length,
+    };
+  } catch (error) {
+    console.error("drawCupBracket error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const drawCupBracket = central.https.onCall(drawCupBracketHandler);
+
+/**
+ * Lança o vencedor de UM confronto e o sobe para a rodada seguinte.
+ *
+ * O VENCEDOR PRECISA ESTAR NO CONFRONTO, e o confronto precisa ter os dois
+ * lados. Não há como promover alguém para uma chave que ele não disputou.
+ */
+export const declareCupMatchHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    assertAdmin(
+      context,
+      "Você precisa estar logado para lançar um confronto.",
+      "Apenas admin pode lançar um confronto."
+    );
+
+    assertExactPayload(data, ["tournamentid", "match_number", "winner_uid"]);
+    const tournamentid = normalizeTournamentId(data.tournamentid);
+    const matchNumber = Number(data.match_number);
+    const winnerUid = normalizeWinnerUid(data.winner_uid);
+
+    if (!Number.isSafeInteger(matchNumber) || matchNumber < 1) {
+      throw new DomainError(
+        "invalid-argument",
+        "O número do confronto precisa ser um inteiro positivo."
+      );
+    }
+
+    const tournamentRef = db.collection("tournaments").doc(tournamentid);
+
+    const result = await db.runTransaction(async (transaction) => {
+      const tournamentSnap = await transaction.get(tournamentRef);
+      if (!tournamentSnap.exists) {
+        throw new DomainError("not-found", "Campeonato não encontrado.");
+      }
+      const status = String(tournamentSnap.get("status") ?? "")
+        .trim()
+        .toLowerCase();
+      if (status === "completed" || status === "cancelled") {
+        throw new DomainError(
+          "failed-precondition",
+          status === "completed"
+            ? "Este campeonato já foi encerrado."
+            : "Este campeonato foi cancelado."
+        );
+      }
+
+      const snap = await transaction.get(bracketRef(tournamentid));
+      if (!snap.exists) {
+        throw new DomainError(
+          "failed-precondition",
+          "O chaveamento ainda não foi sorteado."
+        );
+      }
+
+      const outcome = declareWinner(
+        readBracket(snap.data() ?? {}),
+        matchNumber,
+        winnerUid
+      );
+      if (!outcome.ok) {
+        throw new DomainError(
+          "failed-precondition",
+          cupMessage(outcome.reason)
+        );
+      }
+
+      transaction.update(bracketRef(tournamentid), {
+        ...writeBracket(outcome.bracket),
+        updated_at: FieldValue.serverTimestamp(),
+      });
+
+      return outcome.bracket;
+    });
+
+    return {
+      success: true,
+      complete: isComplete(result),
+      champion: champion(result),
+    };
+  } catch (error) {
+    console.error("declareCupMatch error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const declareCupMatch = central.https.onCall(declareCupMatchHandler);
 
 /**
  * CONFIGURAÇÕES SALVAS DE PONTUAÇÃO.

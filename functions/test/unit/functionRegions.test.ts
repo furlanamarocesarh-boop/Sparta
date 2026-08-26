@@ -118,6 +118,8 @@ const AUTHORIZED_FUNCTIONS: Readonly<Record<string, string>> = {
   saveScoringPreset: CENTRAL,
   listScoringPresets: CENTRAL,
   deleteScoringPreset: CENTRAL,
+  drawCupBracket: CENTRAL,
+  declareCupMatch: CENTRAL,
 };
 
 /**

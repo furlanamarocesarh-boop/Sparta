@@ -28,7 +28,19 @@
  */
 export const BATTLE_ROYALE_LOBBY = 48;
 
-export type FormatType = "battle_royale" | "versus";
+export type FormatType = "battle_royale" | "versus" | "cup";
+
+/**
+ * Os tamanhos de equipe que uma Copa aceita.
+ *
+ * A Copa é o único modo em que o criador escolhe o tamanho: um mata-mata pode
+ * ser individual, de duplas ou de squads, e as três coisas são a mesma
+ * estrutura de chaveamento com participantes de tamanhos diferentes.
+ */
+export const CUP_TEAM_SIZES = [1, 2, 4] as const;
+
+/** Quantas equipes cabem numa Copa. Espelha MAX_CUP_ENTRANTS em cup.ts. */
+export const MAX_CUP_TEAMS = 64;
 
 export interface GameModeSpec {
   /** Exactly what the client sends and what is stored. Never re-cased. */
@@ -77,6 +89,30 @@ function versus(key: string, label: string, teamSize: number): GameModeSpec {
   };
 }
 
+/**
+ * A Copa, para um tamanho de equipe.
+ *
+ * NÃO É UM LOBBY. Os confrontos são jogados separadamente, um contra um, então
+ * o teto não é quanta gente senta na sala — é quantas equipes o chaveamento
+ * comporta.
+ */
+export function cupSpec(teamSize: number): GameModeSpec | null {
+  if (!CUP_TEAM_SIZES.includes(teamSize as (typeof CUP_TEAM_SIZES)[number])) {
+    return null;
+  }
+  return {
+    key: CUP_KEY,
+    label: teamSize === 1 ? "Copa" : `Copa ${teamSize}v${teamSize}`,
+    formatType: "cup",
+    teamSize,
+    minPlayers: teamSize * 2,
+    maxPlayers: teamSize * MAX_CUP_TEAMS,
+    fixedCount: false,
+  };
+}
+
+export const CUP_KEY = "copa";
+
 /** Every mode the platform knows, in the order an operator picks from. */
 export const GAME_MODES: readonly GameModeSpec[] = [
   battleRoyale("solo", "Solo", 1),
@@ -84,7 +120,32 @@ export const GAME_MODES: readonly GameModeSpec[] = [
   battleRoyale("squad", "Squad", 4),
   versus("2v2", "2v2", 2),
   versus("4v4", "4v4", 4),
+  cupSpec(1)!,
 ];
+
+/**
+ * O modo com o tamanho de equipe RESOLVIDO.
+ *
+ * Só a Copa lê `teamSize`; nos outros modos ele é consequência do modo e um
+ * valor divergente vindo do cliente é recusado em vez de ignorado — aceitar
+ * em silêncio gravaria um torneio cujo `team_size` contradiz o próprio modo.
+ */
+export function resolveGameMode(
+  key: unknown,
+  teamSize: unknown
+): GameModeSpec | null {
+  const base = gameModeSpec(key);
+  if (base === null) return null;
+
+  if (base.formatType !== "cup") {
+    if (teamSize === undefined || teamSize === null) return base;
+    return Number(teamSize) === base.teamSize ? base : null;
+  }
+
+  // Ausente é Copa individual — o mata-mata mais simples, e o padrão.
+  const size = teamSize === undefined || teamSize === null ? 1 : Number(teamSize);
+  return cupSpec(size);
+}
 
 /** The spec for a mode key, or null when the key is not one we run. */
 export function gameModeSpec(key: unknown): GameModeSpec | null {
@@ -169,12 +230,14 @@ export function capacityMessage(
         `duas ${teamWord(spec.teamSize)}s de ${spec.teamSize}.`
       );
     case "above-maximum":
-      return (
-        `${spec.label} cabe no máximo ${spec.maxPlayers} jogadores` +
-        (spec.teamSize > 1
-          ? `, ou seja ${teamsFor(spec, spec.maxPlayers)} equipes de ${spec.teamSize}.`
-          : ".")
-      );
+      return spec.formatType === "cup"
+        ? `Uma ${spec.label} comporta no máximo ${MAX_CUP_TEAMS} ` +
+            `${spec.teamSize === 1 ? "jogadores" : "equipes"} — ` +
+            `${spec.maxPlayers} jogadores.`
+        : `${spec.label} cabe no máximo ${spec.maxPlayers} jogadores` +
+            (spec.teamSize > 1
+              ? `, ou seja ${teamsFor(spec, spec.maxPlayers)} equipes de ${spec.teamSize}.`
+              : ".");
     case "partial-team":
       return (
         `Em ${spec.label} as equipes são de ${spec.teamSize}, então o número ` +
