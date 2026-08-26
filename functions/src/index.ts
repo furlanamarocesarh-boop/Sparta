@@ -223,6 +223,12 @@ import {
   presetMessage,
 } from "./domain/scoringPreset.js";
 import {
+  capacityMessage,
+  checkPlayerCount,
+  gameModeKeys,
+  gameModeSpec,
+} from "./domain/gameMode.js";
+import {
   aggregateToCentavos,
   KNOWN_CATEGORIES,
   rollUpByEconomy,
@@ -1601,13 +1607,6 @@ export const createTournamentHandler = async (
 
     const maxPlayers = Number(data.max_players);
 
-    if (!Number.isSafeInteger(maxPlayers) || maxPlayers <= 0) {
-      throw new DomainError(
-        "invalid-argument",
-        "O número máximo de jogadores precisa ser maior que zero."
-      );
-    }
-
     const scheduledStart = parseScheduledStart(data.starts_at);
 
     const gameMode = String(data.game_mode || "")
@@ -1615,36 +1614,38 @@ export const createTournamentHandler = async (
       .toLowerCase()
       .replace(/\s+/g, "");
 
-    let teamSize = 0;
-    let gameModeLabel = "";
-    let formatType = "";
-
-    if (gameMode === "solo") {
-      teamSize = 1;
-      gameModeLabel = "Solo";
-      formatType = "battle_royale";
-    } else if (gameMode === "duo") {
-      teamSize = 2;
-      gameModeLabel = "Duo";
-      formatType = "battle_royale";
-    } else if (gameMode === "squad") {
-      teamSize = 4;
-      gameModeLabel = "Squad";
-      formatType = "battle_royale";
-    } else if (gameMode === "2v2") {
-      teamSize = 2;
-      gameModeLabel = "2v2";
-      formatType = "versus";
-    } else if (gameMode === "4v4") {
-      teamSize = 4;
-      gameModeLabel = "4v4";
-      formatType = "versus";
-    } else {
+    /**
+     * O MODO DECIDE QUANTA GENTE CABE, e isso é regra, não sugestão.
+     *
+     * Um 2v2 são duas equipes de dois. Um torneio criado como 2v2 com cinquenta
+     * vagas não é um 2v2 grande: é um torneio que não tem como ser jogado — e
+     * produção tem alguns assim, criados antes desta checagem, que é
+     * justamente a prova de que uma caixa de texto livre era o controle errado.
+     *
+     * Vinte e três num lobby de duo são onze duplas e uma pessoa sem parceiro.
+     * Ninguém configura isso de propósito, e quem descobre é o jogador que
+     * ficou de fora — por isso a contagem tem que ser um número inteiro de
+     * equipes.
+     */
+    const modeSpec = gameModeSpec(gameMode);
+    if (modeSpec === null) {
       throw new DomainError(
         "invalid-argument",
-        "Modo de jogo inválido. Use solo, duo, squad, 2v2 ou 4v4."
+        `Modo de jogo inválido. Use ${gameModeKeys().join(", ")}.`
       );
     }
+
+    const capacity = checkPlayerCount(modeSpec, maxPlayers);
+    if (!capacity.ok) {
+      throw new DomainError(
+        "invalid-argument",
+        capacityMessage(modeSpec, capacity.reason)
+      );
+    }
+
+    const teamSize = modeSpec.teamSize;
+    const gameModeLabel = modeSpec.label;
+    const formatType = modeSpec.formatType;
 
     const userRef = db.collection("users").doc(uid);
     const userSnap = await userRef.get();

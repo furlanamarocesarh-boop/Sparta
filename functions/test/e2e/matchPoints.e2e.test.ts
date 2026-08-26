@@ -216,6 +216,69 @@ describe("E2E — campeonato de várias partidas", () => {
     );
   });
 
+  it("o MODO decide quantos cabem — 2v2 são exatamente 4", async () => {
+    // Produção tem torneios criados como 2v2 com cinquenta vagas. Não são
+    // 2v2 grandes: são torneios que não têm como ser jogados.
+    await assert.rejects(
+      () => create({ game_mode: "2v2", max_players: 50 }),
+      /exatamente 4 jogadores/
+    );
+    await assert.rejects(
+      () => create({ game_mode: "2v2", max_players: 2 }),
+      /exatamente 4 jogadores/
+    );
+    const { id } = await create({ game_mode: "2v2", max_players: 4 });
+    const doc = await db.collection("tournaments").doc(id!).get();
+    assert.equal(doc.get("team_size"), 2);
+    assert.equal(doc.get("format_type"), "versus");
+  });
+
+  it("o lobby de battle royale para em 48", async () => {
+    await assert.rejects(
+      () => create({ game_mode: "squad", max_players: 50 }),
+      /no máximo 48/
+    );
+    const { id } = await create({ game_mode: "squad", max_players: 48 });
+    assert.equal(
+      (await db.collection("tournaments").doc(id!).get()).get("max_players"),
+      48
+    );
+  });
+
+  it("equipe pela metade é recusada", async () => {
+    // 23 num lobby de duo são onze duplas e uma pessoa sem parceiro.
+    await assert.rejects(
+      () => create({ game_mode: "duo", max_players: 23 }),
+      /múltiplo de 2/
+    );
+    await assert.rejects(
+      () => create({ game_mode: "squad", max_players: 10 }),
+      /múltiplo de 4/
+    );
+    assert.equal(
+      typeof (await create({ game_mode: "duo", max_players: 24 })).id,
+      "string"
+    );
+  });
+
+  it("menos de duas equipes não é disputa", async () => {
+    await assert.rejects(
+      () => create({ game_mode: "squad", max_players: 4 }),
+      /pelo menos 8 jogadores/
+    );
+    await assert.rejects(
+      () => create({ game_mode: "solo", max_players: 1 }),
+      /pelo menos 2 jogadores/
+    );
+  });
+
+  it("modo que não existe é recusado nomeando os que existem", async () => {
+    await assert.rejects(
+      () => create({ game_mode: "5v5", max_players: 10 }),
+      /solo, duo, squad, 2v2, 4v4/
+    );
+  });
+
   it("quantidade de partidas impossível é recusada", async () => {
     for (const bad of [0, -1, 1.5, 999]) {
       await assert.rejects(
