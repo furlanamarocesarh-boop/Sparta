@@ -7791,9 +7791,20 @@ async function purgeTournament(
   tournamentRef: FirebaseFirestore.DocumentReference,
   tournamentData: Record<string, unknown>
 ): Promise<void> {
-  // O EXTRATO SOBREVIVE, O VÍNCULO NÃO. Sem isto, cada linha da carteira de
-  // quem pagou ficaria apontando para um documento inexistente — e o extrato é
-  // justamente o que precisa continuar legível depois que o torneio some.
+  // O EXTRATO SOBREVIVE INTEIRO, INCLUSIVE A REFERÊNCIA.
+  //
+  // A tentação é anular `tournament_ref` para que nada aponte para um
+  // documento morto. Seria um erro: o reconciliador da carteira RECUSA um
+  // reembolso sem essa referência — "reembolso sem as referências
+  // obrigatórias" (audit/reconcile.ts) — e casa a cobrança com o reembolso
+  // comparando justamente esse caminho. Anular condenaria toda carteira
+  // reembolsada a falhar a auditoria para sempre.
+  //
+  // Uma referência pendurada é um valor válido no Firestore, e nenhum leitor
+  // desta base a desreferencia: a auditoria compara caminhos como texto e o
+  // extrato do app só pergunta se o campo É uma referência, para decidir um
+  // rótulo. O que faltava não era desligar o vínculo — era o NOME, que depois
+  // da exclusão não tem mais de onde ser derivado.
   const título = String(tournamentData.title ?? "").trim();
   const ledger = await db
     .collection("transactions")
@@ -7802,10 +7813,7 @@ async function purgeTournament(
   await commitInChunks(
     ledger.docs.map((doc) => (batch: FirebaseFirestore.WriteBatch) => {
       batch.update(doc.ref, {
-        tournament_ref: null,
         tournament_deleted: true,
-        // O nome vira TEXTO porque, depois da exclusão, não há mais de onde
-        // derivá-lo — e "Taxa de inscrição" sem dizer de quê não é extrato.
         tournament_title: título === "" ? "Campeonato apagado" : título,
       });
     })

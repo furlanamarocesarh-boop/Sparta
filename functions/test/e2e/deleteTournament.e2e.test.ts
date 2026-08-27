@@ -203,11 +203,43 @@ describe("E2E — apagar devolvendo o dinheiro", () => {
     assert.equal(tx.exists, true, "o extrato foi apagado");
     assert.equal(tx.get("amount"), 10);
 
-    // E não aponta mais para um documento que não existe.
-    assert.equal(tx.get("tournament_ref"), null);
+    // A REFERÊNCIA CONTINUA LÁ, de propósito. O reconciliador da carteira
+    // recusa um reembolso sem ela e casa cobrança com reembolso comparando
+    // esse caminho — anular condenaria toda carteira reembolsada a falhar a
+    // auditoria para sempre. Uma referência pendurada é um valor válido, e
+    // nenhum leitor desta base a desreferencia.
+    assert.notEqual(tx.get("tournament_ref"), null, "o vínculo foi anulado");
     assert.equal(tx.get("tournament_deleted"), true);
+    // O que faltava era o NOME: depois da exclusão não há de onde derivá-lo,
+    // e "Taxa de inscrição" sem dizer de quê não é extrato.
     assert.equal(tx.get("tournament_title"), "Copa Para Apagar");
   });
+
+  it("o REEMBOLSO mantém as três referências que a auditoria exige",
+    async () => {
+      // audit/reconcile.ts recusa o reembolso que não carregue
+      // tournament_ref, registration_ref e entry_transaction_ref. As três
+      // precisam sobreviver à exclusão, ainda que os documentos apontados não.
+      const refunds = await db
+        .collection("transactions")
+        .where("category", "==", "beta_refund")
+        .get();
+      const meu = refunds.docs.find(
+        (d) => d.get("registration_ref")?.id === `${JOGADOR}_${T}`
+      );
+      assert.notEqual(meu, undefined, "o reembolso sumiu");
+      for (const campo of [
+        "tournament_ref",
+        "registration_ref",
+        "entry_transaction_ref",
+      ]) {
+        assert.notEqual(
+          meu!.get(campo) ?? null,
+          null,
+          `o reembolso perdeu ${campo} e a carteira falharia a auditoria`
+        );
+      }
+    });
 
   it("apagar de novo é sucesso e NÃO reembolsa outra vez", async () => {
     const carteiraAntes = (
