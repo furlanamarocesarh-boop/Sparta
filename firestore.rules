@@ -320,6 +320,38 @@ service cloud.firestore {
       }
     }
 
+    // CAIXA DE AVISOS — o dono LÊ, e ninguém escreve pelo cliente.
+    //
+    // A leitura é direta de propósito, em vez de passar por uma callable: é
+    // isso que faz o aviso aparecer no instante em que ele é escrito, sem o
+    // app ficar perguntando. Nada aqui é sigiloso — o aviso diz que a sala
+    // abriu e NUNCA carrega o ID nem a senha, que continuam saindo só do
+    // `getTournamentRoom`, que confere a inscrição antes de entregar.
+    //
+    // A escrita é server-only inclusive para o próprio dono: `read_at` é
+    // marcado por `markNotificationsRead`. Deixar o cliente escrever aqui
+    // permitiria fabricar um aviso na própria caixa, que é uma superfície sem
+    // nenhuma utilidade.
+    match /notifications/{ownerUid} {
+      allow read: if isOwnerByUid(ownerUid);
+      allow write: if false;
+
+      match /items/{notificationId} {
+        allow read: if isOwnerByUid(ownerUid);
+        allow write: if false;
+      }
+    }
+
+    // TOKENS DE APARELHO — fechados dos dois lados.
+    //
+    // Nem leitura: o documento liga um token de push a um uid, então poder
+    // lê-lo daria a lista de aparelhos de uma conta. Servido por
+    // registerDeviceToken / unregisterDeviceToken, que tiram o uid do token
+    // verificado e nunca do payload.
+    match /device_tokens/{token} {
+      allow read, write: if false;
+    }
+
     // CHAVEAMENTO DA COPA — quem enfrenta quem, e quem passou.
     //
     // LEGÍVEL POR QUEM ESTÁ LOGADO, pela mesma razão dos resultados de partida

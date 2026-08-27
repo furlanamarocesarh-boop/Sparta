@@ -25,11 +25,23 @@ import {
   type Query,
   Timestamp,
 } from "firebase-admin/firestore";
+import { getMessaging } from "firebase-admin/messaging";
 import { https, region } from "firebase-functions/v1";
 
 import { assertAdmin, assertSignedIn } from "./domain/adminAuth.js";
-import { assertDemoProject } from "./domain/demoProject.js";
+import {
+  assertDemoProject,
+  decideDemoProject,
+} from "./domain/demoProject.js";
 import { DomainError } from "./domain/errors.js";
+import {
+  checkDeviceToken,
+  checkPlatform,
+  NOTIFICATION_ROOM_OPEN,
+  notificationIdFor,
+  roomOpenNotification,
+  uidFromRegistrationId,
+} from "./domain/notification.js";
 import {
   decideRoomAccess,
   registrationId,
@@ -932,6 +944,153 @@ export const jointournament = central.https.onCall(async (data, context) => {
  * Exported for behavioral tests; a plain function with no trigger metadata is
  * NOT a deployable endpoint.
  */
+/**
+ * Avisa cada inscrito de que a sala do torneio abriu.
+ *
+ * RODA FORA DA TRANSAÇÃO, E NUNCA PODE DERRUBÁ-LA. O torneio já começou quando
+ * esta função é chamada; um push que falha não pode transformar um começo bem
+ * sucedido num erro para o criador, então tudo aqui é engolido e registrado.
+ * O preço é que uma entrega pode se perder — e é por isso que a REPETIÇÃO de
+ * `startTournament` também chama esta função: o id do aviso é derivado do
+ * torneio, então reiniciar reescreve o mesmo documento e vira o conserto.
+ *
+ * O CORPO NÃO LEVA A CREDENCIAL. O aviso diz que a sala abriu; o ID e a senha
+ * continuam saindo só do `getTournamentRoom`, que confere a inscrição. O
+ * porquê inteiro está no topo de `domain/notification.ts`.
+ */
+async function deliverRoomOpen(
+  tournamentid: string,
+  tournamentData: Record<string, unknown>
+): Promise<void> {
+  try {
+    const tournamentRef = db.collection("tournaments").doc(tournamentid);
+    const registrations = await db
+      .collection("registrations")
+      .where("tournament_ref", "==", tournamentRef)
+      .get();
+
+    const uids: string[] = [];
+    for (const doc of registrations.docs) {
+      // Só quem continua inscrito. Um reembolsado saiu do torneio, e avisar
+      // que "a sala está aberta" mandaria a pessoa para uma sala em que ela
+      // não tem vaga.
+      if (String(doc.get("status") ?? "") !== "registered") continue;
+      const userRef = doc.get("user_ref");
+      const uid =
+        userRef && typeof userRef.id === "string" && userRef.id !== ""
+          ? userRef.id
+          : uidFromRegistrationId(doc.id, tournamentid);
+      if (uid !== null && !uids.includes(uid)) uids.push(uid);
+    }
+
+    if (uids.length === 0) return;
+
+    const body = roomOpenNotification(tournamentData.title);
+    const notificationId = notificationIdFor(
+      NOTIFICATION_ROOM_OPEN,
+      tournamentid
+    );
+
+    // A CAIXA PRIMEIRO, O PUSH DEPOIS. A caixa é o registro durável: se o push
+    // falhar, o jogador ainda encontra o aviso ao abrir o app. Na ordem
+    // inversa, um push entregue e uma caixa vazia dariam uma notificação que
+    // some quando a pessoa vai procurar de novo.
+    for (let i = 0; i < uids.length; i += FIRESTORE_BATCH_LIMIT) {
+      const batch = db.batch();
+      for (const uid of uids.slice(i, i + FIRESTORE_BATCH_LIMIT)) {
+        batch.set(inboxOf(uid).doc(notificationId), {
+          kind: NOTIFICATION_ROOM_OPEN,
+          title: body.title,
+          body: body.body,
+          tournament_id: tournamentid,
+          created_at: FieldValue.serverTimestamp(),
+          read_at: null,
+        });
+      }
+      await batch.commit();
+    }
+
+    await pushToUsers(uids, body.title, body.body, {
+      kind: NOTIFICATION_ROOM_OPEN,
+      tournament_id: tournamentid,
+    });
+  } catch (error) {
+    // Engolido de propósito: ver o cabeçalho.
+    console.error("deliverRoomOpen error:", tournamentid, error);
+  }
+}
+
+/**
+ * Manda o push para todos os aparelhos das contas dadas.
+ *
+ * Tokens inválidos são APAGADOS na hora. Um token morto que fica no banco é
+ * cobrado em toda entrega futura e ainda enche o log de erro — e o FCM só
+ * conta o que está morto na resposta, então este é o único momento em que dá
+ * para saber.
+ */
+async function pushToUsers(
+  uids: readonly string[],
+  title: string,
+  body: string,
+  data: Record<string, string>
+): Promise<void> {
+  const tokens: string[] = [];
+
+  // `in` aceita no máximo trinta valores por consulta, então a lista de
+  // inscritos vira várias consultas em vez de uma que o Firestore recusaria.
+  for (let i = 0; i < uids.length; i += FIRESTORE_IN_LIMIT) {
+    const slice = uids.slice(i, i + FIRESTORE_IN_LIMIT);
+    const snap = await db
+      .collection(DEVICE_TOKENS_COLLECTION)
+      .where("uid", "in", slice)
+      .get();
+    for (const doc of snap.docs) tokens.push(doc.id);
+  }
+
+  if (tokens.length === 0) return;
+
+  // NÃO SAI DAQUI NUM PROJETO DEMO. O FCM não tem emulador, então uma função
+  // rodando contra o emulador alcançaria o serviço de PRODUÇÃO com a credencial
+  // local da máquina — foi o que a suíte e2e fez até esta guarda existir. Não é
+  // conveniência de teste: um ambiente que não é produção não pode empurrar
+  // notificação para aparelho nenhum, e a única resposta honesta quando não dá
+  // para provar em que projeto se está é não mandar.
+  if (decideDemoProject(effectiveProjectCandidates()).kind === "allowed") {
+    console.info("push suprimido: projeto demo", tokens.length);
+    return;
+  }
+
+  for (let i = 0; i < tokens.length; i += FCM_MULTICAST_LIMIT) {
+    const slice = tokens.slice(i, i + FCM_MULTICAST_LIMIT);
+    const response = await getMessaging().sendEachForMulticast({
+      tokens: slice,
+      notification: { title, body },
+      data,
+    });
+
+    const dead: string[] = [];
+    response.responses.forEach((result, index) => {
+      if (result.success) return;
+      const code = String((result.error as any)?.code ?? "");
+      if (
+        code === "messaging/registration-token-not-registered" ||
+        code === "messaging/invalid-registration-token" ||
+        code === "messaging/invalid-argument"
+      ) {
+        dead.push(slice[index]);
+      }
+    });
+
+    if (dead.length > 0) {
+      const batch = db.batch();
+      for (const token of dead) {
+        batch.delete(db.collection(DEVICE_TOKENS_COLLECTION).doc(token));
+      }
+      await batch.commit();
+    }
+  }
+}
+
 export const startTournamentHandler = async (
   data: any,
   context: any
@@ -950,7 +1109,7 @@ export const startTournamentHandler = async (
     const tournamentRef = db.collection("tournaments").doc(tournamentid);
     const roomRef = db.collection("tournament_rooms").doc(tournamentid);
 
-    await db.runTransaction(async (transaction) => {
+    const started = await db.runTransaction(async (transaction) => {
       // Reads first — every read before any write.
       const tournamentSnap = await transaction.get(tournamentRef);
       const roomSnap = await transaction.get(roomRef);
@@ -997,7 +1156,7 @@ export const startTournamentHandler = async (
       // Idempotent replay: already in_progress and still structurally valid.
       // Return success WITHOUT rewriting any field — no timestamp churn.
       if (gate.kind === "replay") {
-        return;
+        return tournamentData;
       }
 
       // First execution: open -> in_progress. Only status + updated_at move;
@@ -1006,7 +1165,16 @@ export const startTournamentHandler = async (
         status: "in_progress",
         updated_at: FieldValue.serverTimestamp(),
       });
+
+      return tournamentData;
     });
+
+    // DEPOIS do commit, e também na repetição. O torneio já está em andamento
+    // quando esta linha roda; a entrega é um efeito, não uma condição. Repetir
+    // `startTournament` reentrega — o id do aviso vem do torneio, então a
+    // segunda passada reescreve o mesmo documento em vez de duplicar, e vira
+    // o conserto de uma entrega que se perdeu.
+    await deliverRoomOpen(tournamentid, started ?? {});
 
     return { success: true };
   } catch (error) {
@@ -7326,4 +7494,170 @@ export const fundHouse = central.https.onCall(fundHouseHandler);
 
 export const declareTournamentResultWithKills = central.https.onCall(
   declareTournamentResultWithKillsHandler
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AVISOS AO JOGADOR
+//
+// A caixa de entrada é `notifications/{uid}/items/{id}`: o dono LÊ pelas regras
+// e nunca escreve. Os tokens de aparelho são `device_tokens/{token}`, com o uid
+// dentro — a chave é o token de propósito, porque um aparelho pertence a UMA
+// conta por vez e trocar de usuário no mesmo celular tem que trocar o dono do
+// token, não acumular dois.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Quantos avisos uma chamada marca como lidos.
+ *
+ * Um batch do Firestore aceita 500 escritas, então este é o teto real e não
+ * uma escolha de gosto. Uma caixa maior que isso é marcada em duas aberturas —
+ * preferível a uma chamada que estoura e não marca nada.
+ */
+const MAX_INBOX_MARK = 500;
+
+/** Escritas por batch do Firestore. É limite do banco, não escolha. */
+const FIRESTORE_BATCH_LIMIT = 500;
+
+/** Valores por cláusula `in`. Também limite do banco. */
+const FIRESTORE_IN_LIMIT = 30;
+
+/** Tokens por chamada de multicast do FCM. Limite do serviço. */
+const FCM_MULTICAST_LIMIT = 500;
+
+const NOTIFICATIONS_COLLECTION = "notifications";
+const NOTIFICATION_ITEMS = "items";
+const DEVICE_TOKENS_COLLECTION = "device_tokens";
+
+/** A caixa de entrada de uma conta. */
+function inboxOf(uid: string) {
+  return db
+    .collection(NOTIFICATIONS_COLLECTION)
+    .doc(uid)
+    .collection(NOTIFICATION_ITEMS);
+}
+
+/**
+ * Registra o token de push do aparelho que está chamando.
+ *
+ * QUALQUER CONTA LOGADA, não só admin: quem precisa do aviso de sala é o
+ * jogador. E a escrita é server-only justamente para que ninguém consiga
+ * apontar o token de outra pessoa para a própria conta — o uid vem do token de
+ * autenticação, nunca do payload.
+ */
+export const registerDeviceTokenHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const auth = assertSignedIn(
+      context,
+      "Entre na sua conta para receber avisos."
+    );
+
+    assertExactPayload(data, ["token", "platform"]);
+
+    const check = checkDeviceToken(data.token);
+    if (!check.ok) {
+      throw new DomainError("invalid-argument", "Token de aparelho inválido.");
+    }
+    const platform = checkPlatform(data.platform);
+    if (platform === null) {
+      throw new DomainError("invalid-argument", "Plataforma desconhecida.");
+    }
+
+    // `set` sem merge: registrar SUBSTITUI o dono. Se o aparelho trocou de
+    // conta, o uid antigo tem que sair junto — um merge deixaria o registro
+    // anterior vivo e a conta antiga continuaria recebendo aviso no celular
+    // de outra pessoa.
+    await db.collection(DEVICE_TOKENS_COLLECTION).doc(check.token).set({
+      uid: auth.uid,
+      platform,
+      updated_at: FieldValue.serverTimestamp(),
+    });
+
+    return { success: true };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const registerDeviceToken = central.https.onCall(
+  registerDeviceTokenHandler
+);
+
+/**
+ * Esquece o token do aparelho — chamado ao sair da conta.
+ *
+ * Sem isto, sair não pararia os avisos: o token continuaria apontando para a
+ * conta que saiu, e o próximo aviso dela chegaria num aparelho que ela não
+ * está mais usando.
+ */
+export const unregisterDeviceTokenHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const auth = assertSignedIn(context, "Entre na sua conta.");
+    assertExactPayload(data, ["token"]);
+
+    const check = checkDeviceToken(data.token);
+    if (!check.ok) {
+      throw new DomainError("invalid-argument", "Token de aparelho inválido.");
+    }
+
+    const ref = db.collection(DEVICE_TOKENS_COLLECTION).doc(check.token);
+    const snap = await ref.get();
+
+    // SÓ O DONO APAGA. Sem esta conferência, qualquer conta logada removeria o
+    // token de qualquer aparelho e silenciaria os avisos de outra pessoa —
+    // apagar é destrutivo e o id é adivinhável por quem já viu um token.
+    if (snap.exists && snap.get("uid") === auth.uid) {
+      await ref.delete();
+    }
+
+    return { success: true };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const unregisterDeviceToken = central.https.onCall(
+  unregisterDeviceTokenHandler
+);
+
+/**
+ * Marca como lidos os avisos da própria caixa.
+ *
+ * Sem id nenhum no payload: abrir a caixa é o gesto que lê tudo o que estava
+ * nela. Marcar um a um exigiria o cliente mandar ids, e um id de outra pessoa
+ * no payload é uma superfície que não precisa existir.
+ */
+export const markNotificationsReadHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const auth = assertSignedIn(context, "Entre na sua conta.");
+    assertExactPayload(data, []);
+
+    const unread = await inboxOf(auth.uid)
+      .where("read_at", "==", null)
+      .limit(MAX_INBOX_MARK)
+      .get();
+
+    if (unread.empty) return { success: true, marked: 0 };
+
+    const batch = db.batch();
+    const stamped = FieldValue.serverTimestamp();
+    for (const doc of unread.docs) batch.update(doc.ref, { read_at: stamped });
+    await batch.commit();
+
+    return { success: true, marked: unread.size };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const markNotificationsRead = central.https.onCall(
+  markNotificationsReadHandler
 );
