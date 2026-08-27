@@ -85,6 +85,7 @@ const AUTHORIZED_FUNCTIONS: Readonly<Record<string, string>> = {
   createTournament: CENTRAL,
   createtournament: CENTRAL,
   setTournamentRoom: CENTRAL,
+  deleteTournament: CENTRAL,
   registerDeviceToken: CENTRAL,
   unregisterDeviceToken: CENTRAL,
   markNotificationsRead: CENTRAL,

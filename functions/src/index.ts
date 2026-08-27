@@ -33,6 +33,10 @@ import {
   assertDemoProject,
   decideDemoProject,
 } from "./domain/demoProject.js";
+import {
+  decideDeletion,
+  deletionMessage,
+} from "./domain/deletion.js";
 import { DomainError } from "./domain/errors.js";
 import {
   checkDeviceToken,
@@ -7661,3 +7665,213 @@ export const markNotificationsReadHandler = async (
 export const markNotificationsRead = central.https.onCall(
   markNotificationsReadHandler
 );
+
+// ─────────────────────────────────────────────────────────────────────────────
+// APAGAR UM CAMPEONATO
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Apaga o campeonato PARA SEMPRE, devolvendo o dinheiro antes.
+ *
+ * COMPÕE COM O CANCELAMENTO EM VEZ DE REIMPLEMENTÁ-LO. O reembolso são ~200
+ * linhas de validação minuciosa — provar a cada inscrição contra o seu próprio
+ * lançamento original, devolver ao bolso exato que pagou, tudo numa transação
+ * só e exatamente-uma-vez. Copiar isso para cá seria criar um segundo caminho
+ * de dinheiro que precisa concordar com o primeiro para sempre. Então quando
+ * ainda há entrada retida, esta função CHAMA `cancelTournamentHandler` e só
+ * depois apaga.
+ *
+ * NÃO É ATÔMICO ENTRE AS DUAS FASES, e o modo de falhar foi escolhido: se o
+ * reembolso passa e a exclusão falha, sobra um campeonato CANCELADO — estado
+ * legítimo, com o dinheiro já de volta no lugar certo, e chamar de novo
+ * termina o serviço. O contrário nunca acontece, porque nada é apagado antes
+ * de o dinheiro ter voltado. Em toda falha possível o dinheiro está certo; o
+ * que pode ficar pela metade é só o desaparecimento.
+ *
+ * AS TRANSAÇÕES SOBREVIVEM, com o vínculo anulado. Elas não são do campeonato:
+ * são o extrato de quem pagou e de quem ganhou. Apagar o histórico financeiro
+ * de outra pessoa porque o criador desistiu do torneio seria pior do que
+ * qualquer sobra — e uma linha apontando para um documento morto é pior do que
+ * uma linha que diz de onde veio por escrito.
+ */
+export const deleteTournamentHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const callerAuth = assertAdmin(
+      context,
+      "Você precisa estar logado para apagar o campeonato.",
+      "Apenas admin pode apagar o campeonato."
+    );
+
+    assertExactPayload(data, ["tournamentid"]);
+    const tournamentid = normalizeTournamentId(data.tournamentid);
+
+    const tournamentRef = db.collection("tournaments").doc(tournamentid);
+    const tournamentSnap = await tournamentRef.get();
+
+    // JÁ NÃO EXISTE É SUCESSO. Apagar é idempotente por natureza: quem chama de
+    // novo quer o mesmo fim do mundo, e ele já está em vigor. Um not-found aqui
+    // faria a tela mostrar erro para uma operação que deu certo.
+    if (!tournamentSnap.exists) {
+      return { success: true, already_gone: true, refunded_registrations: 0 };
+    }
+
+    const tournamentData = tournamentSnap.data() ?? {};
+    const status = String(tournamentData.status || "")
+      .trim()
+      .toLowerCase();
+
+    const registrationsSnap = await db
+      .collection("registrations")
+      .where("tournament_ref", "==", tournamentRef)
+      .get();
+    const active = registrationsSnap.docs.filter(
+      (doc) => String(doc.get("status") ?? "") === "registered"
+    );
+
+    // A liquidação é um FATO, não um rótulo: um resultado persistido ou o
+    // lançamento determinístico do prêmio provam que o dinheiro já se moveu,
+    // mesmo que o status tenha sido mexido de volta para aberto.
+    const prizeTxSnap = await db
+      .collection("transactions")
+      .doc(prizeTransactionId(tournamentid))
+      .get();
+    const hasSettlement =
+      (tournamentData.result !== undefined && tournamentData.result !== null) ||
+      prizeTxSnap.exists;
+
+    const decision = decideDeletion({
+      status,
+      activeRegistrations: active.length,
+      isCreator: tournamentData.creator_uid === callerAuth.uid,
+      hasSettlement,
+    });
+
+    if (decision.kind === "refuse") {
+      throw new DomainError(
+        decision.reason === "not-creator" ? "permission-denied" : "failed-precondition",
+        deletionMessage(decision.reason)
+      );
+    }
+
+    let refunded = 0;
+    if (decision.kind === "refund-then-delete") {
+      // O DINHEIRO PRIMEIRO. Se isto lançar, nada foi apagado.
+      const cancelled = await cancelTournamentHandler({ tournamentid }, context);
+      const count = cancelled.refunded_registrations;
+      refunded = typeof count === "number" ? count : 0;
+    }
+
+    await purgeTournament(tournamentid, tournamentRef, tournamentData);
+
+    return {
+      success: true,
+      already_gone: false,
+      refunded_registrations: refunded,
+    };
+  } catch (error) {
+    console.error("deleteTournament error:", error);
+    throw toHttpsError(error);
+  }
+};
+
+export const deleteTournament = central.https.onCall(deleteTournamentHandler);
+
+/**
+ * Remove tudo que É o campeonato, e desliga o que apenas apontava para ele.
+ *
+ * Em lotes e fora de transação de propósito: o dinheiro já está resolvido
+ * quando esta função roda, então o que sobra é limpeza — e limpeza que falha
+ * pela metade é retomada na próxima chamada, porque cada passo é idempotente.
+ */
+async function purgeTournament(
+  tournamentid: string,
+  tournamentRef: FirebaseFirestore.DocumentReference,
+  tournamentData: Record<string, unknown>
+): Promise<void> {
+  // O EXTRATO SOBREVIVE, O VÍNCULO NÃO. Sem isto, cada linha da carteira de
+  // quem pagou ficaria apontando para um documento inexistente — e o extrato é
+  // justamente o que precisa continuar legível depois que o torneio some.
+  const título = String(tournamentData.title ?? "").trim();
+  const ledger = await db
+    .collection("transactions")
+    .where("tournament_ref", "==", tournamentRef)
+    .get();
+  await commitInChunks(
+    ledger.docs.map((doc) => (batch: FirebaseFirestore.WriteBatch) => {
+      batch.update(doc.ref, {
+        tournament_ref: null,
+        tournament_deleted: true,
+        // O nome vira TEXTO porque, depois da exclusão, não há mais de onde
+        // derivá-lo — e "Taxa de inscrição" sem dizer de quê não é extrato.
+        tournament_title: título === "" ? "Campeonato apagado" : título,
+      });
+    })
+  );
+
+  const registrations = await db
+    .collection("registrations")
+    .where("tournament_ref", "==", tournamentRef)
+    .get();
+
+  // Os avisos que apontavam para o campeonato. Deixá-los seria oferecer ao
+  // jogador um toque que leva a uma tela de torneio que não existe mais.
+  //
+  // POR CAMINHO EXATO, não por consulta: o id do aviso é derivado do torneio e
+  // a caixa é endereçada pelo uid, então os dois juntos dão o documento sem
+  // varrer nada. Uma busca por `tournament_id` atravessando todas as caixas
+  // exigiria um índice de grupo de coleção só para uma limpeza.
+  const notificationId = notificationIdFor(NOTIFICATION_ROOM_OPEN, tournamentid);
+  const uids = new Set<string>();
+  for (const doc of registrations.docs) {
+    const userRef = doc.get("user_ref");
+    const uid =
+      userRef && typeof userRef.id === "string" && userRef.id !== ""
+        ? userRef.id
+        : uidFromRegistrationId(doc.id, tournamentid);
+    if (uid !== null) uids.add(uid);
+  }
+  await commitInChunks(
+    [...uids].map((uid) => (batch: FirebaseFirestore.WriteBatch) => {
+      batch.delete(inboxOf(uid).doc(notificationId));
+    })
+  );
+
+  // As inscrições, a sala e as subcoleções: tudo isto É o campeonato.
+  await commitInChunks(
+    registrations.docs.map((doc) => (batch: FirebaseFirestore.WriteBatch) => {
+      batch.delete(doc.ref);
+    })
+  );
+
+  for (const sub of [BRACKET_SUBCOLLECTION, "matches"]) {
+    const docs = await tournamentRef.collection(sub).get();
+    await commitInChunks(
+      docs.docs.map((doc) => (batch: FirebaseFirestore.WriteBatch) => {
+        batch.delete(doc.ref);
+      })
+    );
+  }
+
+  await db.collection("tournament_rooms").doc(tournamentid).delete();
+
+  // O documento por ÚLTIMO. Enquanto ele existir, uma chamada interrompida
+  // encontra o campeonato e retoma a limpeza; apagá-lo primeiro deixaria os
+  // restos sem nada que os alcançasse.
+  await tournamentRef.delete();
+}
+
+/** Aplica escritas respeitando o teto de 500 por lote do Firestore. */
+async function commitInChunks(
+  writes: ReadonlyArray<(batch: FirebaseFirestore.WriteBatch) => void>
+): Promise<void> {
+  for (let i = 0; i < writes.length; i += FIRESTORE_BATCH_LIMIT) {
+    const batch = db.batch();
+    for (const write of writes.slice(i, i + FIRESTORE_BATCH_LIMIT)) {
+      write(batch);
+    }
+    await batch.commit();
+  }
+}
