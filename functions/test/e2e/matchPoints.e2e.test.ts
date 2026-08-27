@@ -446,6 +446,27 @@ describe("E2E — campeonato de várias partidas", () => {
       assert.equal(caio.get("beta_balance"), 0, "3º não estava na divisão");
     });
 
+    it("só o 1º LUGAR ganha uma vitória de vida inteira", async () => {
+      /**
+       * O defeito que este teste impede: aqui o 1º e o 2º recebem linhas de
+       * razão com a MESMA categoria, e os ids começam com `points_`, que o
+       * gatilho de ranking recusa na porta. Um contador que decidisse "venceu"
+       * por categoria contaria os dois; um que decidisse por id não contaria
+       * nenhum. Só `position === 1` responde certo.
+       */
+      const primeiro = await db.collection("users").doc(PLAYERS[1]).get();
+      const segundo = await db.collection("users").doc(PLAYERS[0]).get();
+      const terceiro = await db.collection("users").doc(PLAYERS[2]).get();
+
+      assert.equal(primeiro.get("tournaments_won"), 1);
+      assert.equal(
+        segundo.get("tournaments_won") ?? 0,
+        0,
+        "o 2º recebeu dinheiro e não venceu"
+      );
+      assert.equal(terceiro.get("tournaments_won") ?? 0, 0);
+    });
+
     it("liquidar DE NOVO é recusado", async () => {
       await assert.rejects(
         () => settleByPoints({ tournamentid: id }, ctx()),

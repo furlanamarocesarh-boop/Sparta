@@ -268,6 +268,27 @@ describe("E2E — liquidação por abate", () => {
     assert.equal((result.payouts as unknown[]).length, 2);
   });
 
+  it("o CAMPEÃO ganha uma vitória de vida inteira, os demais não", async () => {
+    /**
+     * O defeito que este teste existe para impedir: no formato por abate TODAS
+     * as linhas de razão têm categoria `kill_prize`, inclusive a do campeão.
+     * A primeira versão do contador vivia num gatilho que decidia "venceu" pela
+     * categoria — e por isso não contava vitória nenhuma aqui, nem para quem
+     * venceu. Quem paga por abate paga muita gente; vencer é uma pessoa.
+     */
+    const vencedor = await db.collection("users").doc(PLAYERS[0]).get();
+    assert.equal(vencedor.get("tournaments_won"), 1);
+
+    for (const outro of PLAYERS.slice(1)) {
+      const snap = await db.collection("users").doc(outro).get();
+      assert.equal(
+        snap.get("tournaments_won") ?? 0,
+        0,
+        `${outro} recebeu por abate e não venceu`
+      );
+    }
+  });
+
   it("grava `prize` para o app publicado, com o valor do VENCEDOR", async () => {
     // O build da loja lê result.prize e não conhece `payouts`. Sem a chave,
     // moneyFromReais(undefined) dava zero e o painel dourado dizia ao vencedor

@@ -1553,6 +1553,9 @@ export const declareTournamentResultHandler = async (
           external_id: externalId,
         });
 
+        // VENCEU: uma vitória de vida inteira. Ver `creditLifetimeWin`.
+        creditLifetimeWin(transaction, winneruid);
+
         transaction.update(tournamentRef, {
           status: "completed",
           result: {
@@ -1609,6 +1612,9 @@ export const declareTournamentResultHandler = async (
       });
 
       // 4 + 5 + 6. Persist the result, move to completed, stamp updated_at.
+      // VENCEU: uma vitória de vida inteira. Ver `creditLifetimeWin`.
+      creditLifetimeWin(transaction, winneruid);
+
       transaction.update(tournamentRef, {
         status: "completed",
         result: {
@@ -3469,39 +3475,6 @@ export const onPrizeTransactionCreatedHandler = async (
         totalScoreCentavos: parentPlan.totalScoreCentavos,
         updatedAt: stampedAt,
       });
-    }
-
-    /**
-     * O CONTADOR DE VITÓRIAS DE VIDA INTEIRA.
-     *
-     * AQUI E NÃO NA LIQUIDAÇÃO. Existem quatro caminhos que declaram um
-     * resultado — vencedor único, por abate, por pontos e a final da Copa —, e
-     * incrementar em cada um seria quatro chances de esquecer um. A transação
-     * de prêmio é o evento; este gatilho reage a ela e cobre todos.
-     *
-     * NÃO É "GANHOU DINHEIRO", É "VENCEU". `countsAsWin` vem da CATEGORIA da
-     * transação, nunca de quem chamou: um pagamento por abate soma ao valor
-     * ganho e não é vitória. É a mesma distinção que o ranking da temporada já
-     * faz, e ela é feita uma vez só, para os dois não discordarem.
-     *
-     * DENTRO DA MESMA TRANSAÇÃO DA GUARDA, e é isso que o torna idempotente de
-     * graça: a guarda é `create()` e não pode ser reescrita, então uma entrega
-     * repetida do gatilho já saiu lá em cima, por "replay", sem chegar aqui.
-     * Um contador incrementado fora desta transação contaria duas vezes na
-     * primeira reentrega — e ninguém perceberia, porque não há de onde
-     * recontar.
-     *
-     * COMEÇA QUANDO A TEMPORADA COMEÇOU. O portão de ativação lá em cima
-     * recusa prêmios anteriores à primeira temporada ativa, então este contador
-     * herda esse limite. É a verdade sobre ele: conta as vitórias desde que a
-     * plataforma passou a contar, não desde sempre.
-     */
-    if (event.countsAsWin) {
-      transaction.set(
-        db.collection("users").doc(uid),
-        { tournaments_won: FieldValue.increment(1) },
-        { merge: true }
-      );
     }
 
     // create() and nothing else: the guard is written once and can never be
@@ -5765,6 +5738,13 @@ export const settleTournamentByPointsHandler = async (
             status: "completed",
           }
         );
+
+        // SÓ O PRIMEIRO. Segundo e terceiro receberam dinheiro e não venceram
+        // — e é justamente esta linha que o gatilho de ranking não conseguia
+        // escrever, porque a categoria de todos eles é a mesma.
+        if (award.position === 1) {
+          creditLifetimeWin(transaction, award.uid);
+        }
       });
 
       transaction.set(
@@ -6501,6 +6481,42 @@ export const getPublicProfile = central.https.onCall(getPublicProfileHandler);
  * two drift, the app shows the owner one thing and hands strangers another.
  * Sharing the loader makes the preview true by construction.
  */
+/**
+ * Soma UMA vitória ao contador de vida inteira de quem venceu.
+ *
+ * NA LIQUIDAÇÃO, E NÃO NUM GATILHO. A primeira versão disto pendurava o
+ * contador no gatilho da transação de prêmio, com o argumento de que quatro
+ * caminhos de liquidação seriam quatro chances de esquecer um. O argumento
+ * estava certo e a conclusão estava errada: o gatilho cobria UM dos quatro.
+ * Ele recusa na porta os ids que não começam com `prize_` — o que derruba
+ * pontos e Copa, que gravam `points_{torneio}_{uid}` — e a categoria
+ * `kill_prize` não conta como vitória, o que derruba o campeão de um torneio
+ * por abate junto com os outros premiados. O contador teria ficado em zero
+ * para três formatos, sem ninguém perceber.
+ *
+ * Aqui, cada chamador SABE quem venceu, sem inferir de categoria nem de id.
+ *
+ * EXATAMENTE UMA VEZ, por construção. Todo caminho de liquidação roda numa
+ * transação que cria linhas de razão com id determinístico via `create()`, e
+ * um campeonato só sai de `in_progress` uma vez. Uma repetição falha alto na
+ * criação da linha, antes de este incremento existir.
+ *
+ * VENCER NÃO É SER PREMIADO. Quem chama é responsável por passar só o primeiro
+ * colocado: em pontos, `position === 1`; nos demais, o `winner_uid` que o
+ * próprio resultado grava. Segundo e terceiro lugares recebem dinheiro e não
+ * venceram.
+ */
+function creditLifetimeWin(
+  transaction: FirebaseFirestore.Transaction,
+  winnerUid: string
+): void {
+  transaction.set(
+    db.collection("users").doc(winnerUid),
+    { tournaments_won: FieldValue.increment(1) },
+    { merge: true }
+  );
+}
+
 async function loadPublicProfile(
   uid: string,
   publicPlayerId: string
@@ -7461,6 +7477,11 @@ export const declareTournamentResultWithKillsHandler = async (
           status: "completed",
         }
       );
+
+      // VENCEU. No formato por abate TODAS as linhas de razão têm categoria
+      // `kill_prize`, inclusive a do campeão — então não há como um gatilho
+      // distinguir o vencedor pela categoria. Aqui o `winneruid` é sabido.
+      creditLifetimeWin(transaction, winneruid);
 
       transaction.update(tournamentRef, {
         status: "completed",
