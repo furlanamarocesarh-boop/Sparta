@@ -320,6 +320,38 @@ service cloud.firestore {
       }
     }
 
+    // ORGANIZAÇÕES — o cartão de visita é público, o resto não.
+    //
+    // `organizations` guarda NOME e LOGO, e eles aparecem ao lado do
+    // campeonato, então qualquer conta logada lê. O telefone do dono NÃO mora
+    // aqui, e é por isso que este documento pode ser lido: dado pessoal não
+    // viaja de carona num documento que existe para ser mostrado.
+    match /organizations/{orgId} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
+    // O TELEFONE DO DONO. Fechado dos dois lados, para todo cliente, inclusive
+    // o próprio dono: ele foi pedido para contato, não para ser devolvido, e um
+    // campo que nunca sai é um campo que nunca vaza.
+    match /organization_private/{orgId} {
+      allow read, write: if false;
+    }
+
+    // A ASSOCIAÇÃO. Ler é saber quem administra o quê; escrever seria entrar
+    // sozinho numa organização alheia. As duas coisas passam por callable, que
+    // tira o uid do token verificado e nunca do payload.
+    match /organization_members/{membershipId} {
+      allow read, write: if false;
+    }
+
+    // OS CONVITES. Ler um convite é TER a chave — o token é o id do documento,
+    // então poder lê-los seria poder listá-los e virar administrador de
+    // qualquer organização. Negado a todo cliente, sem exceção.
+    match /organization_invites/{token} {
+      allow read, write: if false;
+    }
+
     // CAIXA DE AVISOS — o dono LÊ, e ninguém escreve pelo cliente.
     //
     // A leitura é direta de propósito, em vez de passar por uma callable: é

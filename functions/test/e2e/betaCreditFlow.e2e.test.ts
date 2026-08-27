@@ -5,6 +5,7 @@ import { before, describe, it } from "node:test";
 import * as admin from "firebase-admin";
 
 import { assertEmulatorOnly } from "../support/emulatorGuard.js";
+import { seedOrganization } from "../support/orgSeed.js";
 import { fetchWithTimeout } from "../support/httpTimeout.js";
 import { seedHouse } from "../support/houseFunding.js";
 import {
@@ -313,6 +314,10 @@ describe("BETA E2E — grant → join → start → prize; join → cancel → r
     requestwithdrawalRun = (d, c) => mod.requestwithdrawal.run(d, c);
 
     db = admin.firestore();
+
+
+    // Criar campeonato agora exige ORGANIZAÇÃO, não a claim de plataforma.
+    await seedOrganization(db, ADMIN.uid);
 
     // O caixa precisa cobrir prêmios acima do arrecadado — a mesma coisa que
     // o operador terá de fazer em produção antes de garantir premiação.

@@ -39,6 +39,25 @@ import {
 } from "./domain/deletion.js";
 import { DomainError } from "./domain/errors.js";
 import {
+  assertOrgMember,
+  assertOrgOwner,
+  checkOrgName,
+  checkOwnerPhone,
+  decideInviteAccept,
+  INVITE_TOKEN_BYTES,
+  inviteExpiryMs,
+  inviteMessage,
+  isValidInviteToken,
+  MAX_ORG_ADMINS,
+  MAX_ORG_MEMBERS,
+  ORG_INVITES_COLLECTION,
+  ORGANIZATIONS_COLLECTION,
+  orgNameMessage,
+  ROLE_ADMIN,
+  ROLE_OWNER,
+  type OrgRole,
+} from "./domain/organization.js";
+import {
   checkDeviceToken,
   checkPlatform,
   NOTIFICATION_ROOM_OPEN,
@@ -1652,13 +1671,32 @@ export const createTournamentHandler = async (
     // email grants nothing, and `admin` must be boolean true. An unauthenticated
     // caller gets `unauthenticated`; an authenticated non-admin gets
     // `permission-denied` — both before the handler touches Firestore.
-    const callerAuth = assertAdmin(
+    // ORGANIZAR DEIXOU DE SER PRIVILÉGIO DE PLATAFORMA.
+    //
+    // Antes esta chamada exigia a claim `admin: true`, que hoje pertence a UMA
+    // conta e é concedida por uma ferramenta local — não havia como um segundo
+    // organizador existir. Agora quem autoriza é a ASSOCIAÇÃO a uma
+    // organização, que é o ponto da feature: o dono convida ajudantes e eles
+    // criam campeonatos sem ganhar a chave do caixa da plataforma.
+    //
+    // A claim continua guardando o que é da PLATAFORMA — Créditos Beta e o
+    // caixa da casa —, e por isso não some daqui: ela apenas deixou de ser a
+    // pergunta certa PARA ESTA chamada.
+    const callerAuth = assertSignedIn(
       context,
-      "Você precisa estar logado para criar um campeonato.",
-      "Apenas admin pode criar campeonatos."
+      "Você precisa estar logado para criar um campeonato."
     );
 
     const uid = callerAuth.uid;
+
+    const organizationId = await organizationOf(uid);
+    if (organizationId === null) {
+      throw new DomainError(
+        "failed-precondition",
+        "Crie uma organização para poder criar campeonatos."
+      );
+    }
+    assertOrgMember(await roleInOrg(uid, organizationId));
 
     const name = String(data.name || "").trim();
     const description = String(data.description || "").trim();
@@ -1856,6 +1894,10 @@ export const createTournamentHandler = async (
     await tournamentRef.set({
       name,
       description,
+      // DE QUEM É O CAMPEONATO. Sem isto a contabilidade da organização não
+      // teria como somar nada, e o histórico anterior — criado antes de
+      // organizações existirem — fica sem o campo, que é a verdade sobre ele.
+      organization_id: organizationId,
 
       entry_fee: centavosToReais(entryFeeCentavos),
       prize: centavosToReais(prizeCentavos),
@@ -7883,3 +7925,469 @@ async function commitInChunks(
     await batch.commit();
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ORGANIZAÇÕES
+//
+// TRÊS COLEÇÕES, E A SEPARAÇÃO ENTRE ELAS É A DECISÃO QUE IMPORTA:
+//
+//  - `organizations/{orgId}` guarda o que é PÚBLICO — nome e logo. Ele aparece
+//    ao lado do campeonato, então qualquer pessoa logada precisa poder lê-lo.
+//  - `organization_private/{orgId}` guarda o TELEFONE do dono. Dado pessoal não
+//    pode viajar de carona num documento que existe para ser mostrado, e a
+//    única forma de garantir isso é ele não estar lá.
+//  - `organization_members/{uid}_{orgId}` é a associação, com id determinístico
+//    como o das inscrições: "estou nesta organização?" é uma leitura de
+//    documento com id conhecido, e "de quais faço parte?" é uma consulta por
+//    igualdade — nenhuma das duas precisa de índice composto.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A logo entra como ENDEREÇO, não como arquivo.
+ *
+ * Aceitar upload exigiria o Storage inteiro — dependência no app, regras
+ * próprias, entrada no firebase.json, limites de tamanho e tipo — e é uma
+ * superfície nova só para guardar uma imagem. Um endereço https resolve o mesmo
+ * hoje e não fecha a porta: no dia em que o upload existir, ele grava aqui a
+ * URL que produzir, e nada mais muda.
+ *
+ * Só https, e só o que cabe num campo. `http` simples faria a logo virar um
+ * pedido inseguro dentro de uma tela autenticada.
+ */
+function checkLogoUrl(value: unknown): string | null {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value !== "string") {
+    throw new DomainError("invalid-argument", "Endereço da logo inválido.");
+  }
+  const url = value.trim();
+  if (url.length > 500 || !url.startsWith("https://")) {
+    throw new DomainError(
+      "invalid-argument",
+      "A logo precisa de um endereço https."
+    );
+  }
+  return url;
+}
+
+const ORG_PRIVATE_COLLECTION = "organization_private";
+const ORG_MEMBERS_COLLECTION = "organization_members";
+
+/** O id determinístico da associação. */
+function membershipId(uid: string, orgId: string): string {
+  return `${uid}_${orgId}`;
+}
+
+/**
+ * A organização de alguém, ou null.
+ *
+ * UMA POR PESSOA, por enquanto — ter várias é a aba que o pedido chama de "em
+ * desenvolvimento". Quando ela existir, esta função vira "a organização
+ * escolhida" e o resto do caminho não muda.
+ */
+async function organizationOf(uid: string): Promise<string | null> {
+  const snap = await db
+    .collection(ORG_MEMBERS_COLLECTION)
+    .where("uid", "==", uid)
+    .limit(1)
+    .get();
+  if (snap.empty) return null;
+  const orgId = String(snap.docs[0].get("org_id") ?? "");
+  return orgId === "" ? null : orgId;
+}
+
+/** O papel de alguém numa organização, ou null quando não é membro. */
+async function roleInOrg(uid: string, orgId: string): Promise<OrgRole | null> {
+  const snap = await db
+    .collection(ORG_MEMBERS_COLLECTION)
+    .doc(membershipId(uid, orgId))
+    .get();
+  if (!snap.exists) return null;
+  const role = snap.get("role");
+  return role === ROLE_OWNER || role === ROLE_ADMIN ? role : null;
+}
+
+/**
+ * Cria a organização de quem chama.
+ *
+ * UMA POR DONO, POR ENQUANTO. Ter várias é a aba que o próprio pedido chama de
+ * "em desenvolvimento", então recusar a segunda agora é honesto: melhor uma
+ * recusa clara do que deixar criar o que a tela ainda não sabe mostrar.
+ *
+ * NÃO EXIGE A CLAIM DE ADMIN. Organizar campeonatos deixou de ser privilégio de
+ * plataforma — é isso que a feature inteira significa. A claim continua
+ * guardando o que é da PLATAFORMA: o caixa da casa e os Créditos Beta.
+ */
+export const createOrganizationHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const auth = assertSignedIn(
+      context,
+      "Entre na sua conta para criar uma organização."
+    );
+
+    assertExactPayload(data, ["name", "phone", "logo_url"]);
+
+    const nameCheck = checkOrgName(data.name);
+    if (!nameCheck.ok) {
+      throw new DomainError("invalid-argument", orgNameMessage(nameCheck.reason));
+    }
+    const phoneCheck = checkOwnerPhone(data.phone);
+    if (!phoneCheck.ok) {
+      throw new DomainError(
+        "invalid-argument",
+        "Informe um telefone válido com DDD."
+      );
+    }
+    const logoUrl = checkLogoUrl(data.logo_url);
+
+    const existing = await db
+      .collection(ORG_MEMBERS_COLLECTION)
+      .where("uid", "==", auth.uid)
+      .where("role", "==", ROLE_OWNER)
+      .limit(1)
+      .get();
+    if (!existing.empty) {
+      throw new DomainError(
+        "failed-precondition",
+        "Você já tem uma organização. Ter mais de uma está em desenvolvimento."
+      );
+    }
+
+    const orgRef = db.collection(ORGANIZATIONS_COLLECTION).doc();
+    const stampedAt = FieldValue.serverTimestamp();
+
+    const batch = db.batch();
+    batch.set(orgRef, {
+      name: nameCheck.name,
+      logo_url: logoUrl,
+      owner_uid: auth.uid,
+      created_at: stampedAt,
+    });
+    // O TELEFONE MORA À PARTE. Ver o cabeçalho da seção.
+    batch.set(db.collection(ORG_PRIVATE_COLLECTION).doc(orgRef.id), {
+      owner_phone: phoneCheck.digits,
+      updated_at: stampedAt,
+    });
+    batch.set(
+      db.collection(ORG_MEMBERS_COLLECTION).doc(membershipId(auth.uid, orgRef.id)),
+      {
+        uid: auth.uid,
+        org_id: orgRef.id,
+        role: ROLE_OWNER,
+        joined_at: stampedAt,
+      }
+    );
+    await batch.commit();
+
+    return { success: true, organization_id: orgRef.id, name: nameCheck.name };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const createOrganization = central.https.onCall(
+  createOrganizationHandler
+);
+
+/**
+ * A organização de quem chama, com o papel dela.
+ *
+ * O TELEFONE NÃO ENTRA NA RESPOSTA, nem para o dono. Ele foi pedido no cadastro
+ * para contato, não para ser devolvido — e um campo que nunca sai é um campo
+ * que nunca vaza.
+ */
+export const getMyOrganizationHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const auth = assertSignedIn(context, "Entre na sua conta.");
+    assertExactPayload(data, []);
+
+    const memberships = await db
+      .collection(ORG_MEMBERS_COLLECTION)
+      .where("uid", "==", auth.uid)
+      .limit(1)
+      .get();
+    if (memberships.empty) return { organization: null };
+
+    const membership = memberships.docs[0];
+    const orgId = String(membership.get("org_id") ?? "");
+    const orgSnap = await db
+      .collection(ORGANIZATIONS_COLLECTION)
+      .doc(orgId)
+      .get();
+    if (!orgSnap.exists) return { organization: null };
+
+    const role = membership.get("role");
+    const members = await db
+      .collection(ORG_MEMBERS_COLLECTION)
+      .where("org_id", "==", orgId)
+      .limit(MAX_ORG_MEMBERS + 1)
+      .get();
+
+    return {
+      organization: {
+        id: orgId,
+        name: orgSnap.get("name") ?? "",
+        logo_url: orgSnap.get("logo_url") ?? null,
+        role,
+        admin_count: members.docs.filter((d) => d.get("role") === ROLE_ADMIN)
+          .length,
+        max_admins: MAX_ORG_ADMINS,
+      },
+    };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const getMyOrganization = central.https.onCall(
+  getMyOrganizationHandler
+);
+
+/**
+ * Gera um link de convite para administrador.
+ *
+ * SÓ O DONO GERA, e quantas vezes quiser. Gerar é barato e não muda nada
+ * sozinho — quem muda a organização é o ACEITE, e esse é de uso único e tem
+ * teto. Limitar a geração só faria o dono ficar sem link quando precisasse.
+ *
+ * O TOKEN É A CHAVE E NUNCA É DERIVADO. Ele é o id do documento, sorteado com
+ * 32 bytes de `randomBytes`. Derivá-lo do uid ou da organização deixaria quem
+ * conhece um convite calcular os outros.
+ */
+export const createOrgInviteHandler = async (
+  data: any,
+  context: any,
+  options: { readonly nowMs?: number; readonly entropy?: () => Uint8Array } = {}
+): Promise<Record<string, unknown>> => {
+  try {
+    const auth = assertSignedIn(context, "Entre na sua conta.");
+    assertExactPayload(data, ["organization_id"]);
+
+    const orgId = String(data.organization_id ?? "").trim();
+    if (orgId === "" || orgId.includes("/")) {
+      throw new DomainError("invalid-argument", "Organização inválida.");
+    }
+
+    assertOrgOwner(await roleInOrg(auth.uid, orgId));
+
+    // O teto é conferido AQUI TAMBÉM, e não só no aceite: gerar um link para
+    // uma organização cheia é prometer uma vaga que não existe, e quem recebe
+    // só descobriria ao tentar entrar.
+    const members = await db
+      .collection(ORG_MEMBERS_COLLECTION)
+      .where("org_id", "==", orgId)
+      .limit(MAX_ORG_MEMBERS + 1)
+      .get();
+    const admins = members.docs.filter((d) => d.get("role") === ROLE_ADMIN);
+    if (admins.length >= MAX_ORG_ADMINS) {
+      throw new DomainError("failed-precondition", inviteMessage("org-full"));
+    }
+
+    const nowMs = options.nowMs ?? Date.now();
+    const bytes = (options.entropy ?? (() => randomBytes(INVITE_TOKEN_BYTES)))();
+    const token = Buffer.from(bytes).toString("base64url");
+    if (!isValidInviteToken(token)) {
+      throw new DomainError("internal", "Não foi possível gerar o convite.");
+    }
+
+    await db.collection(ORG_INVITES_COLLECTION).doc(token).create({
+      org_id: orgId,
+      created_by: auth.uid,
+      created_at: FieldValue.serverTimestamp(),
+      expires_at: Timestamp.fromMillis(inviteExpiryMs(nowMs)),
+      used_by: null,
+      used_at: null,
+      revoked: false,
+    });
+
+    return { success: true, token, expires_at_ms: inviteExpiryMs(nowMs) };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const createOrgInvite = central.https.onCall(createOrgInviteHandler);
+
+/**
+ * Aceita um convite e vira administrador.
+ *
+ * TUDO NUMA TRANSAÇÃO. Dois aceites simultâneos do mesmo link, ou dois aceites
+ * de links diferentes disputando a última vaga, precisam serializar — senão o
+ * uso único e o teto viram sugestões. A transação lê o convite, a organização e
+ * a contagem de membros antes de escrever qualquer coisa.
+ */
+export const acceptOrgInviteHandler = async (
+  data: any,
+  context: any,
+  options: { readonly nowMs?: number } = {}
+): Promise<Record<string, unknown>> => {
+  try {
+    const auth = assertSignedIn(
+      context,
+      "Entre na sua conta para aceitar o convite."
+    );
+    assertExactPayload(data, ["token"]);
+
+    if (!isValidInviteToken(data.token)) {
+      throw new DomainError("invalid-argument", inviteMessage("malformed"));
+    }
+    const token: string = data.token;
+    const nowMs = options.nowMs ?? Date.now();
+    const inviteRef = db.collection(ORG_INVITES_COLLECTION).doc(token);
+
+    const orgId = await db.runTransaction(async (tx) => {
+      const inviteSnap = await tx.get(inviteRef);
+      if (!inviteSnap.exists) {
+        throw new DomainError("not-found", inviteMessage("not-found"));
+      }
+
+      const invitedOrgId = String(inviteSnap.get("org_id") ?? "");
+      const orgSnap = await tx.get(
+        db.collection(ORGANIZATIONS_COLLECTION).doc(invitedOrgId)
+      );
+      if (!orgSnap.exists) {
+        throw new DomainError("not-found", inviteMessage("not-found"));
+      }
+
+      const memberRef = db
+        .collection(ORG_MEMBERS_COLLECTION)
+        .doc(membershipId(auth.uid, invitedOrgId));
+      const memberSnap = await tx.get(memberRef);
+      const members = await tx.get(
+        db.collection(ORG_MEMBERS_COLLECTION).where("org_id", "==", invitedOrgId)
+      );
+
+      const expiresAt = inviteSnap.get("expires_at");
+      const decision = decideInviteAccept(
+        {
+          exists: true,
+          usedByUid: (inviteSnap.get("used_by") as string | null) ?? null,
+          revoked: inviteSnap.get("revoked") === true,
+          expiresAtMs:
+            expiresAt instanceof Timestamp ? expiresAt.toMillis() : null,
+        },
+        {
+          nowMs,
+          uid: auth.uid,
+          ownerUid: String(orgSnap.get("owner_uid") ?? ""),
+          alreadyMember: memberSnap.exists,
+          currentAdmins: members.docs.filter((d) => d.get("role") === ROLE_ADMIN)
+            .length,
+        }
+      );
+      if (!decision.ok) {
+        throw new DomainError(
+          decision.reason === "not-found" ? "not-found" : "failed-precondition",
+          inviteMessage(decision.reason)
+        );
+      }
+
+      const stampedAt = FieldValue.serverTimestamp();
+      // O convite é QUEIMADO na mesma transação em que a associação nasce.
+      // Separá-los abriria a janela em que o link vale duas vezes.
+      tx.update(inviteRef, { used_by: auth.uid, used_at: stampedAt });
+      tx.set(memberRef, {
+        uid: auth.uid,
+        org_id: invitedOrgId,
+        role: ROLE_ADMIN,
+        joined_at: stampedAt,
+      });
+
+      return invitedOrgId;
+    });
+
+    const orgSnap = await db
+      .collection(ORGANIZATIONS_COLLECTION)
+      .doc(orgId)
+      .get();
+    return { success: true, organization_id: orgId, name: orgSnap.get("name") ?? "" };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const acceptOrgInvite = central.https.onCall(acceptOrgInviteHandler);
+
+/**
+ * Revoga um convite ainda não usado.
+ *
+ * É O QUE O DONO FAZ QUANDO DESCOBRE QUE O LINK VAZOU, e por isso revogado
+ * ganha de tudo na decisão de aceite — inclusive de um convite no prazo.
+ */
+export const revokeOrgInviteHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const auth = assertSignedIn(context, "Entre na sua conta.");
+    assertExactPayload(data, ["token"]);
+
+    if (!isValidInviteToken(data.token)) {
+      throw new DomainError("invalid-argument", inviteMessage("malformed"));
+    }
+
+    const inviteRef = db.collection(ORG_INVITES_COLLECTION).doc(data.token);
+    const snap = await inviteRef.get();
+    // Já não existe é sucesso: revogar é idempotente por natureza.
+    if (!snap.exists) return { success: true };
+
+    assertOrgOwner(await roleInOrg(auth.uid, String(snap.get("org_id") ?? "")));
+
+    await inviteRef.update({ revoked: true });
+    return { success: true };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const revokeOrgInvite = central.https.onCall(revokeOrgInviteHandler);
+
+/**
+ * Remove um administrador.
+ *
+ * O DONO NUNCA SE REMOVE. Uma organização sem dono não teria quem revogasse
+ * convite, removesse gente ou visse a contabilidade — e não existe caminho
+ * para criar um dono novo.
+ */
+export const removeOrgAdminHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const auth = assertSignedIn(context, "Entre na sua conta.");
+    assertExactPayload(data, ["organization_id", "uid"]);
+
+    const orgId = String(data.organization_id ?? "").trim();
+    const targetUid = String(data.uid ?? "").trim();
+    if (orgId === "" || targetUid === "") {
+      throw new DomainError("invalid-argument", "Dados inválidos.");
+    }
+
+    assertOrgOwner(await roleInOrg(auth.uid, orgId));
+
+    const targetRef = db
+      .collection(ORG_MEMBERS_COLLECTION)
+      .doc(membershipId(targetUid, orgId));
+    const target = await targetRef.get();
+    if (!target.exists) return { success: true };
+
+    if (target.get("role") === ROLE_OWNER) {
+      throw new DomainError(
+        "failed-precondition",
+        "O dono não pode sair da própria organização."
+      );
+    }
+
+    await targetRef.delete();
+    return { success: true };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const removeOrgAdmin = central.https.onCall(removeOrgAdminHandler);

@@ -3,6 +3,8 @@ import { before, beforeEach, describe, it } from "node:test";
 
 import * as admin from "firebase-admin";
 
+import { seedOrganization } from "../support/orgSeed.js";
+
 /**
  * Behavioral (execution) tests for the tournament ECONOMY ROUTING —
  * createTournament + jointournament + startTournament +
@@ -202,6 +204,10 @@ before(async () => {
   jointournamentRun = (data, context) => mod.jointournament.run(data, context);
   payprizeRun = (data, context) => mod.payprize.run(data, context);
   db = admin.firestore();
+
+    // Criar campeonato agora exige ORGANIZAÇÃO, não a claim de plataforma.
+    await seedOrganization(db, ADMIN_UID);
+
 });
 
 beforeEach(clearAll);

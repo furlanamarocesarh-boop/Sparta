@@ -3,6 +3,8 @@ import { after, before, describe, it } from "node:test";
 
 import * as admin from "firebase-admin";
 
+import { seedOrganization } from "../support/orgSeed.js";
+
 import { MAX_PRESETS_PER_OWNER } from "../../src/domain/scoringPreset.js";
 import { assertEmulatorOnly } from "../support/emulatorGuard.js";
 
@@ -57,6 +59,10 @@ describe("E2E — configurações salvas de pontuação", () => {
     process.env.GCLOUD_PROJECT = PROJECT_ID;
     if (admin.apps.length === 0) admin.initializeApp();
     db = admin.firestore();
+
+
+    // Criar campeonato agora exige ORGANIZAÇÃO, não a claim de plataforma.
+    await seedOrganization(db, ME);
 
     const mod = await import("../../src/index.js");
     save = (mod as any).saveScoringPresetHandler;

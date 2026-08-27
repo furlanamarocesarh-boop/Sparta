@@ -4,6 +4,7 @@ import { after, before, describe, it } from "node:test";
 import * as admin from "firebase-admin";
 
 import { assertEmulatorOnly } from "../support/emulatorGuard.js";
+import { seedOrganization } from "../support/orgSeed.js";
 
 /**
  * A COPA CONTRA UM FIRESTORE DE VERDADE, do sorteio ao pagamento.
@@ -87,6 +88,10 @@ describe("E2E — Copa", () => {
     process.env.GCLOUD_PROJECT = PROJECT_ID;
     if (admin.apps.length === 0) admin.initializeApp();
     db = admin.firestore();
+
+
+    // Criar campeonato agora exige ORGANIZAÇÃO, não a claim de plataforma.
+    await seedOrganization(db, ADMIN);
 
     const mod = await import("../../src/index.js");
     createTournament = (mod as any).createTournamentHandler;

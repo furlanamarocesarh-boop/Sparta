@@ -3,19 +3,23 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import { ADMIN_ACCOUNT_UID } from "../../src/adminclaim/target.js";
-
 /**
  * Authorization tests for `createTournamentHandler` (shared by the
  * `createTournament` and `createtournament` callables).
  *
  * These are BEHAVIORAL: they invoke the real handler with a forged callable
- * context and assert the HttpsError CODE it produces. The security property is
- * that admin authorization runs FIRST — before any payload validation, document
- * read, or write. Every case here throws before the handler ever touches
- * Firestore, so no emulator or credentials are needed: a case that reached
- * Firestore would fail with a connection error, not the authorization code
- * asserted below.
+ * context and assert the HttpsError CODE it produces.
+ *
+ * O CONTRATO MUDOU COM AS ORGANIZAÇÕES, e este arquivo mudou junto. Criar
+ * campeonato exigia a claim `admin: true`, que pertence a UMA conta e é
+ * concedida por uma ferramenta local — não havia como um segundo organizador
+ * existir. Agora quem autoriza é a ASSOCIAÇÃO a uma organização.
+ *
+ * A consequência para ESTES testes é que a autorização deixou de ser
+ * respondível sem banco: saber se alguém é membro é uma leitura. Então aqui
+ * fica só o que continua sendo decidido antes de qualquer leitura — a ausência
+ * de sessão — e a recusa de quem não tem organização é provada no e2e, contra
+ * o emulador, onde ela pode ser provada de verdade.
  */
 
 type Handler = (data: unknown, context: unknown) => Promise<unknown>;
@@ -69,67 +73,12 @@ describe("createTournamentHandler — unauthenticated", () => {
   });
 });
 
-describe("createTournamentHandler — authenticated but not admin", () => {
-  it("rejects a signed-in user with no claim as permission-denied", async () => {
-    assert.equal(await codeOf({}, { auth: { uid: "player-1" } }), "permission-denied");
-  });
-
-  it("rejects admin: false / missing / null as permission-denied", async () => {
-    assert.equal(
-      await codeOf({}, { auth: { uid: "u", token: { admin: false } } }),
-      "permission-denied"
-    );
-    assert.equal(
-      await codeOf({}, { auth: { uid: "u", token: {} } }),
-      "permission-denied"
-    );
-    assert.equal(
-      await codeOf({}, { auth: { uid: "u", token: { admin: null } } }),
-      "permission-denied"
-    );
-  });
-
-  it("rejects the string \"true\" (truthy non-boolean) as permission-denied", async () => {
-    assert.equal(
-      await codeOf({}, { auth: { uid: "u", token: { admin: "true" } } }),
-      "permission-denied"
-    );
-  });
-
-  it("rejects the historical admin uid WITHOUT the claim as permission-denied", async () => {
-    assert.equal(
-      await codeOf({}, { auth: { uid: ADMIN_ACCOUNT_UID } }),
-      "permission-denied"
-    );
-  });
-
-  it("rejects a non-admin BEFORE validation — empty payload is permission-denied, not invalid-argument", async () => {
-    // This is the ordering guarantee: authorization precedes name validation.
-    assert.equal(await codeOf({}, { auth: { uid: "player-1" } }), "permission-denied");
-  });
-
-  it("rejects a non-admin with a VALID payload before any read or write", async () => {
-    // A valid payload would otherwise reach the Firestore write. It does not:
-    // the code is the authorization code, and no Firestore call is made.
-    assert.equal(
-      await codeOf(VALID_PAYLOAD, { auth: { uid: "player-1" } }),
-      "permission-denied"
-    );
-  });
-});
-
-describe("createTournamentHandler — admin passes authorization", () => {
-  it("lets ANY uid with admin: true boolean through the auth gate", async () => {
-    // Past authorization, an empty payload fails validation (name required) with
-    // invalid-argument — proving the admin cleared the gate, and that an admin's
-    // empty payload writes nothing.
-    for (const uid of ["some-admin", ADMIN_ACCOUNT_UID, "another"]) {
-      assert.equal(
-        await codeOf({}, { auth: { uid, token: { admin: true } } }),
-        "invalid-argument",
-        `uid ${uid} with admin:true should clear auth and hit validation`
-      );
-    }
+describe("createTournamentHandler — sem sessão, antes de qualquer leitura", () => {
+  it("payload VÁLIDO sem sessão continua sendo unauthenticated", async () => {
+    // A única recusa que ainda acontece sem tocar no banco, e continua vindo
+    // antes de qualquer validação. As outras — não tem organização, não é
+    // membro dela — dependem de uma leitura e são provadas no e2e.
+    assert.equal(await codeOf(VALID_PAYLOAD, { auth: null }), "unauthenticated");
   });
 });
 
@@ -146,6 +95,16 @@ describe("createTournamentHandler — structural guarantees", () => {
   const indexSrc = (): string =>
     readFileSync(join(functionsDir(), "src", "index.ts"), "utf8");
 
+  it("a criação exige ORGANIZAÇÃO, não a claim de plataforma", () => {
+    // A troca de porteiro é o coração da feature: a claim continua guardando o
+    // caixa da casa e os Créditos Beta, e deixou de guardar esta chamada.
+    const src = indexSrc();
+    const handler = src.slice(src.indexOf("createTournamentHandler"));
+    const corpo = handler.slice(0, handler.indexOf("export const createTournament "));
+    assert.match(corpo, /assertOrgMember\(/);
+    assert.match(corpo, /Crie uma organização/);
+  });
+
   it("both callables wrap the same guarded handler", () => {
     const src = indexSrc();
     assert.match(
@@ -158,31 +117,52 @@ describe("createTournamentHandler — structural guarantees", () => {
     );
   });
 
-  it("assertAdmin appears before any Firestore access in the handler", () => {
+  it("a sessão é exigida ANTES de qualquer leitura", () => {
+    // A garantia mudou de nome, não de força. Antes era "a claim vem antes do
+    // banco"; agora a claim não é mais a pergunta certa, e o que não pode
+    // acontecer é uma leitura em nome de quem não provou quem é.
     const src = indexSrc();
     const start = src.indexOf("createTournamentHandler = async");
-    assert.ok(start !== -1, "handler not found");
-    // Bound to the handler body only (up to its onCall export), so later
-    // handlers in the file are not scanned.
+    assert.ok(start !== -1, "handler não encontrado");
     const end = src.indexOf("export const createTournament =", start);
     const body = src.slice(start, end === -1 ? undefined : end);
-    const idxAdmin = body.indexOf("assertAdmin(");
-    const firstDb = ["db.collection", "db.doc", "db.runTransaction", ".set(", ".get("]
+
+    const idxAuth = body.indexOf("assertSignedIn(");
+    const firstDb = ["db.collection", "db.doc", "db.runTransaction"]
       .map((token) => body.indexOf(token))
       .filter((i) => i !== -1)
       .reduce((min, i) => Math.min(min, i), Number.POSITIVE_INFINITY);
-    assert.ok(idxAdmin !== -1, "assertAdmin not called in the handler");
-    assert.ok(
-      idxAdmin < firstDb,
-      "assertAdmin must precede every Firestore access"
-    );
+
+    assert.ok(idxAuth !== -1, "o handler não exige sessão");
+    assert.ok(idxAuth < firstDb, "leu o banco antes de saber quem chamou");
   });
 
-  it("the handler does not call assertSignedIn (admin gate replaced it)", () => {
+  it("a associação é conferida ANTES de qualquer escrita", () => {
+    // Ler para descobrir se a pessoa é membro é inevitável — decidir isso é
+    // uma leitura. O que não pode é ESCREVER antes de a resposta chegar.
     const src = indexSrc();
     const start = src.indexOf("createTournamentHandler = async");
     const end = src.indexOf("export const createTournament =", start);
     const body = src.slice(start, end === -1 ? undefined : end);
-    assert.equal(body.includes("assertSignedIn("), false);
+
+    const idxMember = body.indexOf("assertOrgMember(");
+    const firstWrite = [".set(", ".create(", ".update(", "batch.commit("]
+      .map((token) => body.indexOf(token))
+      .filter((i) => i !== -1)
+      .reduce((min, i) => Math.min(min, i), Number.POSITIVE_INFINITY);
+
+    assert.ok(idxMember !== -1, "o handler não confere a associação");
+    assert.ok(idxMember < firstWrite, "escreveu antes de autorizar");
+  });
+
+  it("a claim de plataforma NÃO guarda mais esta chamada", () => {
+    // Ela continua guardando o caixa da casa e os Créditos Beta. Se voltar a
+    // aparecer aqui, um administrador convidado deixa de conseguir criar
+    // campeonato — que é justamente o ponto da feature.
+    const src = indexSrc();
+    const start = src.indexOf("createTournamentHandler = async");
+    const end = src.indexOf("export const createTournament =", start);
+    const body = src.slice(start, end === -1 ? undefined : end);
+    assert.equal(body.includes("assertAdmin("), false);
   });
 });

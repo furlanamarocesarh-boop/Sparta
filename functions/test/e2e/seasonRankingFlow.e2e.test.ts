@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 
 import * as admin from "firebase-admin";
+
+import { seedOrganization } from "../support/orgSeed.js";
 import { Timestamp } from "firebase-admin/firestore";
 
 import { ECONOMY_BETA_CREDIT, ECONOMY_CASH } from "../../src/domain/economy.js";
@@ -531,6 +533,10 @@ before(async () => {
   process.env.GCLOUD_PROJECT = PROJECT_ID;
   if (admin.apps.length === 0) admin.initializeApp();
   db = admin.firestore();
+
+
+    // Criar campeonato agora exige ORGANIZAÇÃO, não a claim de plataforma.
+    await seedOrganization(db, OPERATOR.uid);
 
     // O caixa precisa cobrir prêmios acima do arrecadado — a mesma coisa que
     // o operador terá de fazer em produção antes de garantir premiação.
