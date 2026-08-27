@@ -72,8 +72,16 @@ export const INVITE_TOKEN_BYTES = 32;
 export const INVITE_TOKEN_LENGTH = 43;
 const INVITE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
-/** Quantos dias um convite vale. */
-export const INVITE_TTL_DAYS = 7;
+/**
+ * Quantos minutos um convite vale.
+ *
+ * TRINTA, e é curto de propósito. Um link de uso único que nunca vence continua
+ * sendo uma chave viva num grupo de mensagens meses depois; meia hora é o tempo
+ * de mandar para alguém e a pessoa aceitar. Gerar de novo não custa nada e não
+ * tem limite, então o prazo curto não atrapalha quem está do lado certo — só
+ * quem encontrou o link velho.
+ */
+export const INVITE_TTL_MINUTES = 30;
 
 export type NameRefusal = "empty" | "too-short" | "too-long" | "malformed";
 
@@ -270,5 +278,5 @@ export function assertOrgOwner(role: OrgRole | null): void {
 
 /** Quando um convite criado agora expira. */
 export function inviteExpiryMs(nowMs: number): number {
-  return nowMs + INVITE_TTL_DAYS * 24 * 60 * 60 * 1000;
+  return nowMs + INVITE_TTL_MINUTES * 60 * 1000;
 }
