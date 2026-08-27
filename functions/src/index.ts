@@ -3471,6 +3471,39 @@ export const onPrizeTransactionCreatedHandler = async (
       });
     }
 
+    /**
+     * O CONTADOR DE VITÓRIAS DE VIDA INTEIRA.
+     *
+     * AQUI E NÃO NA LIQUIDAÇÃO. Existem quatro caminhos que declaram um
+     * resultado — vencedor único, por abate, por pontos e a final da Copa —, e
+     * incrementar em cada um seria quatro chances de esquecer um. A transação
+     * de prêmio é o evento; este gatilho reage a ela e cobre todos.
+     *
+     * NÃO É "GANHOU DINHEIRO", É "VENCEU". `countsAsWin` vem da CATEGORIA da
+     * transação, nunca de quem chamou: um pagamento por abate soma ao valor
+     * ganho e não é vitória. É a mesma distinção que o ranking da temporada já
+     * faz, e ela é feita uma vez só, para os dois não discordarem.
+     *
+     * DENTRO DA MESMA TRANSAÇÃO DA GUARDA, e é isso que o torna idempotente de
+     * graça: a guarda é `create()` e não pode ser reescrita, então uma entrega
+     * repetida do gatilho já saiu lá em cima, por "replay", sem chegar aqui.
+     * Um contador incrementado fora desta transação contaria duas vezes na
+     * primeira reentrega — e ninguém perceberia, porque não há de onde
+     * recontar.
+     *
+     * COMEÇA QUANDO A TEMPORADA COMEÇOU. O portão de ativação lá em cima
+     * recusa prêmios anteriores à primeira temporada ativa, então este contador
+     * herda esse limite. É a verdade sobre ele: conta as vitórias desde que a
+     * plataforma passou a contar, não desde sempre.
+     */
+    if (event.countsAsWin) {
+      transaction.set(
+        db.collection("users").doc(uid),
+        { tournaments_won: FieldValue.increment(1) },
+        { merge: true }
+      );
+    }
+
     // create() and nothing else: the guard is written once and can never be
     // overwritten, so its presence always means a completed application.
     transaction.create(guardRef, {
@@ -6481,15 +6514,80 @@ async function loadPublicProfile(
   }
   const userData = userSnap.data() ?? {};
 
+  /**
+   * A CARTEIRA SÓ É LIDA COM A PORTA ABERTA.
+   *
+   * Não é economia de leitura — é onde a decisão fica visível. Um perfil
+   * fechado não faz o servidor nem tocar no documento que tem o número, então
+   * não existe caminho em que ele escape por um erro de projeção mais adiante.
+   */
+  const earningsPublic = userData.earnings_public === true;
+  let lifetimeWonCentavos: number | null = null;
+  if (earningsPublic) {
+    const walletSnap = await db.collection("wallets").doc(uid).get();
+    // `inspectReais` e não `toCentavos`: um valor corrompido na carteira de
+    // alguém não pode derrubar a página de perfil dele. Vira "sem número".
+    const won = inspectReais(walletSnap.get("total_won"), { allowZero: true });
+    lifetimeWonCentavos = won.ok ? won.centavos : null;
+  }
+
   return projectPublicProfile({
     publicPlayerId,
     username: userData.username,
     badges: userData.badges,
     tournamentsPlayed: userData.tournaments_played,
     tournamentsCreated: createdSnap.data().count,
+    tournamentsWon: userData.tournaments_won,
     createdAt: userData.created_at ?? userData.createdAt,
+    earningsPublic: userData.earnings_public,
+    lifetimeWonCentavos,
   });
 }
+
+/**
+ * ABRE OU FECHA o total de prêmios do próprio perfil.
+ *
+ * SÓ SOBRE SI MESMO. Não há parâmetro de quem — o uid sai do token verificado,
+ * então não existe forma de escrever a configuração de outra pessoa.
+ *
+ * FECHADO É O PADRÃO e continua sendo: quem nunca chamar isto fica exatamente
+ * como estava, com número nenhum saindo. Este callable existe para que abrir
+ * seja um ato, e não efeito colateral de alguma outra coisa.
+ */
+export const setEarningsVisibilityHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const auth = assertSignedIn(context, "Entre na sua conta.");
+    assertExactPayload(data, ["public"]);
+
+    // BOOLEANO DE VERDADE, e nada mais. Aceitar `"true"` ou `1` faria um erro
+    // de cliente virar consentimento — e o consentimento aqui é sobre dinheiro.
+    if (typeof data.public !== "boolean") {
+      throw new DomainError("invalid-argument", "Escolha inválida.");
+    }
+
+    const userRef = db.collection("users").doc(auth.uid);
+    const snap = await userRef.get();
+    if (!snap.exists) {
+      throw new DomainError("not-found", "Sua conta não foi encontrada.");
+    }
+
+    await userRef.update({
+      earnings_public: data.public,
+      updated_at: FieldValue.serverTimestamp(),
+    });
+
+    return { success: true, public: data.public };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const setEarningsVisibility = central.https.onCall(
+  setEarningsVisibilityHandler
+);
 
 /**
  * The caller's OWN profile — and the pseudonym that addresses it.

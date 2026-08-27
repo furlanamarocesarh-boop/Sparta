@@ -26,10 +26,12 @@ const ctx = (uid: string) => ({ auth: { uid, token: {} } });
 
 let db: admin.firestore.Firestore;
 let getProfile: (d: unknown, c: unknown) => Promise<any>;
+let setVisibility: (d: unknown, c: unknown) => Promise<any>;
 
 async function cleanup(): Promise<void> {
   await Promise.all([
     db.collection("users").doc(OWNER).delete(),
+    db.collection("wallets").doc(OWNER).delete(),
     db.collection(PUBLIC_PLAYER_ID_INDEX_COLLECTION).doc(PSEUDO).delete(),
   ]);
 }
@@ -43,6 +45,7 @@ describe("E2E — perfil público", () => {
 
     const mod = await import("../../src/index.js");
     getProfile = (mod as any).getPublicProfileHandler;
+    setVisibility = (mod as any).setEarningsVisibilityHandler;
 
     await cleanup();
     await db.collection("users").doc(OWNER).set({
@@ -246,5 +249,127 @@ describe("E2E — meu próprio perfil", () => {
     // Sem isto, `{ public_player_id: <de outro> }` passaria despercebido e a
     // função pareceria aceitar um alvo que ela nunca honra.
     await assert.rejects(() => getMine({ public_player_id: PSEUDO }, ctx(ME)), /.+/);
+  });
+});
+
+/**
+ * A PORTA DO TOTAL DE PRÊMIOS, contra um Firestore real.
+ *
+ * O que só o emulador prova: que o padrão é FECHADO num documento que nunca
+ * ouviu falar do campo, que abrir e fechar valem no instante seguinte, e que
+ * o saldo — que mora na MESMA carteira de onde o total sai — não vem junto.
+ */
+describe("E2E — a porta do total de prêmios", () => {
+  // SEMEIA POR CONTA PRÓPRIA. O bloco de cima apaga a conta no `after` dele,
+  // e um teste que depende da ordem dos blocos quebra no dia em que alguém
+  // reordena o arquivo.
+  before(async () => {
+    await db.collection("users").doc(OWNER).set({
+      username: "RDKILL",
+      tournaments_played: 12,
+      created_at: admin.firestore.Timestamp.fromDate(
+        new Date(Date.UTC(2026, 7, 3))
+      ),
+    });
+    await db
+      .collection(PUBLIC_PLAYER_ID_INDEX_COLLECTION)
+      .doc(PSEUDO)
+      .set({ uid: OWNER });
+    await db.collection("wallets").doc(OWNER).set({
+      total_won: 2450,
+      // Nada disto pode atravessar, nem com a porta aberta.
+      balance: 987.65,
+      total_deposited: 5000,
+      total_spent: 3210,
+      beta_balance: 700,
+    });
+  });
+
+  after(async () => {
+    await cleanup();
+  });
+
+  it("FECHADO por padrão, num documento que nunca ouviu falar do campo",
+    async () => {
+      const p = await getProfile({ public_player_id: PSEUDO }, ctx(STRANGER));
+      assert.equal(p.earningsVisible, false);
+      assert.equal(p.lifetimeWonCentavos, null);
+    });
+
+  it("o dono ABRE, e o total aparece para um estranho", async () => {
+    await setVisibility({ public: true }, ctx(OWNER));
+
+    const p = await getProfile({ public_player_id: PSEUDO }, ctx(STRANGER));
+    assert.equal(p.earningsVisible, true);
+    assert.equal(p.lifetimeWonCentavos, 245_000, "R$ 2.450,00 em centavos");
+  });
+
+  it("mesmo ABERTO, o SALDO não vem junto", async () => {
+    // O total e o saldo moram no MESMO documento. É por isso que este teste
+    // existe: a projeção precisa escolher um campo, não copiar a carteira.
+    const p = await getProfile({ public_player_id: PSEUDO }, ctx(STRANGER));
+    const json = JSON.stringify(p);
+
+    assert.equal(json.includes("98765"), false, "saldo vazou");
+    assert.equal(json.includes("987.65"), false, "saldo vazou");
+    assert.equal(json.includes("500000"), false, "total depositado vazou");
+    assert.equal(json.includes("321000"), false, "total gasto vazou");
+    assert.equal(json.includes("70000"), false, "saldo beta vazou");
+    for (const proibido of ["balance", "deposited", "spent", "beta"]) {
+      assert.equal(json.toLowerCase().includes(proibido), false, proibido);
+    }
+  });
+
+  it("o dono FECHA, e o total some no instante seguinte", async () => {
+    await setVisibility({ public: false }, ctx(OWNER));
+
+    const p = await getProfile({ public_player_id: PSEUDO }, ctx(STRANGER));
+    assert.equal(p.earningsVisible, false);
+    assert.equal(p.lifetimeWonCentavos, null);
+  });
+
+  it("ninguém abre a porta de outra pessoa", async () => {
+    // Não há parâmetro de quem: o uid sai do token. Um estranho chamando isto
+    // mexe na porta DELE, não na do dono.
+    await setVisibility({ public: true }, ctx(STRANGER)).catch(() => {});
+
+    const p = await getProfile({ public_player_id: PSEUDO }, ctx(STRANGER));
+    assert.equal(p.earningsVisible, false, "a porta do dono foi mexida");
+  });
+
+  it("deslogado não abre nada", async () => {
+    await assert.rejects(() => setVisibility({ public: true }, {}), /conta/i);
+  });
+
+  it("só booleano — texto e número são recusados", async () => {
+    for (const lixo of ["true", 1, null, "sim"]) {
+      await assert.rejects(
+        () => setVisibility({ public: lixo }, ctx(OWNER)),
+        /inválida/i,
+        String(lixo)
+      );
+    }
+  });
+
+  it("campo a mais no payload é recusado", async () => {
+    await assert.rejects(
+      () => setVisibility({ public: true, uid: OWNER }, ctx(OWNER)),
+      /./
+    );
+  });
+
+  it("as VITÓRIAS saem no perfil", async () => {
+    await db.collection("users").doc(OWNER).update({ tournaments_won: 3 });
+    const p = await getProfile({ public_player_id: PSEUDO }, ctx(STRANGER));
+    assert.equal(p.tournamentsWon, 3);
+  });
+
+  it("uma conta sem o contador lê ZERO, não quebra", async () => {
+    await db
+      .collection("users")
+      .doc(OWNER)
+      .update({ tournaments_won: admin.firestore.FieldValue.delete() });
+    const p = await getProfile({ public_player_id: PSEUDO }, ctx(STRANGER));
+    assert.equal(p.tournamentsWon, 0);
   });
 });

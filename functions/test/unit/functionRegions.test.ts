@@ -124,6 +124,7 @@ const AUTHORIZED_FUNCTIONS: Readonly<Record<string, string>> = {
   declareMatchResult: CENTRAL,
   settleTournamentByPoints: CENTRAL,
   getPublicProfile: CENTRAL,
+  setEarningsVisibility: CENTRAL,
   getMyProfile: CENTRAL,
   applyForPartner: CENTRAL,
   reviewPartnerApplication: CENTRAL,

@@ -11,7 +11,12 @@ function source(overrides: Record<string, unknown> = {}) {
     badges: ["creator_verified", "spartan_noobie"],
     tournamentsPlayed: 42,
     tournamentsCreated: 7,
+    tournamentsWon: 5,
     createdAt: new Date(Date.UTC(2026, 7, 3, 14, 32, 9)),
+    // FECHADO É O PADRÃO do fixture porque é o padrão do produto: quem nunca
+    // mexeu em configuração nenhuma não mostra número nenhum.
+    earningsPublic: undefined,
+    lifetimeWonCentavos: 245_000,
     ...overrides,
   };
 }
@@ -71,16 +76,25 @@ describe("o que o perfil público NÃO mostra", () => {
     }
   });
 
-  it("a saída tem EXATAMENTE seis chaves", () => {
+  it("a saída tem EXATAMENTE nove chaves", () => {
     // Fixa o tamanho: um campo novo em users/{uid} não aparece aqui sozinho,
     // e um campo novo NESTA projeção quebra o teste até ser decidido.
+    //
+    // ERAM SEIS. As três que entraram foram decididas, não escorregaram:
+    // `tournamentsWon` é uma contagem, da mesma natureza das duas que já
+    // estavam; `earningsVisible` e `lifetimeWonCentavos` abrem — só com o dono
+    // tendo pedido, e fechado por padrão — o total de prêmios. Saldo continua
+    // fora, e é o teste acima que garante isso.
     assert.deepEqual(Object.keys(projectPublicProfile(source())).sort(), [
       "badges",
+      "earningsVisible",
+      "lifetimeWonCentavos",
       "memberSince",
       "nickname",
       "publicPlayerId",
       "tournamentsCreated",
       "tournamentsPlayed",
+      "tournamentsWon",
     ]);
   });
 
@@ -143,5 +157,76 @@ describe("um documento incompleto não quebra a página", () => {
       projectPublicProfile(source({ createdAt: stamp })).memberSince,
       "janeiro de 2026"
     );
+  });
+});
+
+describe("o total de prêmios, e a porta que o governa", () => {
+  it("FECHADO por padrão — quem nunca mexeu não mostra nada", () => {
+    // É a regra que já valia para todo mundo, agora escrita como padrão em vez
+    // de como ausência de código.
+    const p = projectPublicProfile(source());
+    assert.equal(p.earningsVisible, false);
+    assert.equal(p.lifetimeWonCentavos, null);
+  });
+
+  it("ABERTO mostra o total, em centavos inteiros", () => {
+    const p = projectPublicProfile(source({ earningsPublic: true }));
+    assert.equal(p.earningsVisible, true);
+    assert.equal(p.lifetimeWonCentavos, 245_000);
+  });
+
+  it("SÓ o booleano verdadeiro abre", () => {
+    // Um campo corrompido não pode virar consentimento que ninguém deu.
+    for (const lixo of ["true", 1, "sim", {}, [], "TRUE"]) {
+      const p = projectPublicProfile(source({ earningsPublic: lixo }));
+      assert.equal(p.earningsVisible, false, String(lixo));
+      assert.equal(p.lifetimeWonCentavos, null, String(lixo));
+    }
+  });
+
+  it("com a porta FECHADA o número morre aqui, mesmo se for passado", () => {
+    // Defesa em profundidade: o chamador já evita ler a carteira, e ainda
+    // assim a projeção não deixa passar.
+    const p = projectPublicProfile(
+      source({ earningsPublic: false, lifetimeWonCentavos: 999_999 })
+    );
+    assert.equal(p.lifetimeWonCentavos, null);
+  });
+
+  it("um total corrompido vira ausência, não uma página quebrada", () => {
+    for (const lixo of ["2450", -1, 12.5, null, undefined, NaN]) {
+      const p = projectPublicProfile(
+        source({ earningsPublic: true, lifetimeWonCentavos: lixo })
+      );
+      assert.equal(p.lifetimeWonCentavos, null, String(lixo));
+      assert.equal(p.earningsVisible, true, "a porta continua aberta");
+    }
+  });
+
+  it("SALDO nunca sai, nem com a porta aberta", () => {
+    // "Quanto ganhou ao longo do tempo" é conquista; "quanto tem agora" é
+    // convite. A projeção não sabe representar saldo.
+    const p: any = projectPublicProfile(
+      source({ earningsPublic: true, balance: 1_000_000 } as any)
+    );
+    assert.equal(JSON.stringify(p).includes("1000000"), false);
+    assert.equal("balance" in p, false);
+    assert.equal("totalSpent" in p, false);
+  });
+});
+
+describe("vitórias de vida inteira", () => {
+  it("saem no perfil", () => {
+    assert.equal(projectPublicProfile(source()).tournamentsWon, 5);
+  });
+
+  it("uma contagem corrompida vira zero, não uma página quebrada", () => {
+    for (const lixo of ["5", -1, 2.5, null, undefined]) {
+      assert.equal(
+        projectPublicProfile(source({ tournamentsWon: lixo })).tournamentsWon,
+        0,
+        String(lixo)
+      );
+    }
   });
 });

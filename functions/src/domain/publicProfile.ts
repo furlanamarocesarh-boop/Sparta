@@ -14,10 +14,19 @@
  * every client in both directions. So a profile link identifies a player
  * without handing over the identifier that every other collection is keyed by.
  *
- * NO MONEY. Not balance, not total won, not what a tournament paid. A profile
- * is a page a player sends to strangers, and "how much money does this person
- * have" is not something a stranger should be able to ask — even where the
- * season leaderboard already publishes a score.
+ * NENHUM DINHEIRO SEM O DONO TER PEDIDO. A regra era absoluta: nem saldo, nem
+ * total ganho, nem quanto um campeonato pagou. Ela continua sendo o PADRÃO —
+ * uma conta que nunca tocou em nada não mostra número nenhum, e quem não mexe
+ * em configuração fica exatamente como estava.
+ *
+ * O que mudou é que o dono passou a poder ABRIR essa porta para o próprio
+ * perfil, e só para o total de prêmios recebidos. Três coisas fazem disso uma
+ * escolha e não um vazamento: o padrão é fechado, a decisão é de quem é dono do
+ * número, e o que sai é UM total — nunca o saldo, nunca quanto foi gasto, nunca
+ * quais campeonatos pagaram.
+ *
+ * SALDO NUNCA SAI, nem com a porta aberta. "Quanto essa pessoa ganhou ao longo
+ * do tempo" é uma conquista; "quanto essa pessoa tem agora" é um convite.
  *
  * COUNTS, NOT HISTORY. How many tournaments someone played is a fact about
  * them; WHICH tournaments, and when, is a movement pattern. The first is a
@@ -33,6 +42,36 @@ export interface PublicProfile {
   readonly badges: readonly string[];
   readonly tournamentsPlayed: number;
   readonly tournamentsCreated: number;
+
+  /**
+   * Campeonatos vencidos, de vida inteira.
+   *
+   * VENCER NÃO É GANHAR DINHEIRO: um pagamento por abate soma ao valor recebido
+   * e não é vitória. A distinção é feita uma vez só, na categoria da transação
+   * de prêmio, e serve tanto a este contador quanto ao ranking da temporada.
+   */
+  readonly tournamentsWon: number;
+
+  /**
+   * Se o dono abriu o total de prêmios para quem olha o perfil.
+   *
+   * SAI SEMPRE, verdadeiro ou falso, e isso é deliberado: quando é verdadeiro o
+   * número está logo ali de todo jeito, e quando é falso a única coisa que um
+   * estranho aprende é que existe uma configuração — que é pública por
+   * natureza. Esconder o próprio interruptor obrigaria o dono a ter um segundo
+   * caminho só para saber como ele está.
+   */
+  readonly earningsVisible: boolean;
+
+  /**
+   * O total de prêmios em DINHEIRO, em centavos — ou null quando fechado.
+   *
+   * SÓ DINHEIRO, e não é omissão: os prêmios em Créditos Beta não têm total
+   * acumulado em lugar nenhum desta base — a liquidação beta move o saldo e
+   * não mantém um "total ganho". Somar as duas economias seria proibido de
+   * qualquer forma, então este campo diz o que é: reais recebidos em prêmio.
+   */
+  readonly lifetimeWonCentavos: number | null;
   /**
    * Month and year the account was created, never the exact instant.
    *
@@ -50,7 +89,19 @@ export interface PublicProfileSource {
   readonly badges: unknown;
   readonly tournamentsPlayed: unknown;
   readonly tournamentsCreated: unknown;
+  readonly tournamentsWon: unknown;
   readonly createdAt: unknown;
+
+  /** `users/{uid}.earnings_public`. Ausente significa FECHADO. */
+  readonly earningsPublic: unknown;
+
+  /**
+   * `wallets/{uid}.total_won` já em centavos, ou null quando não foi lido.
+   *
+   * O chamador só lê a carteira quando a porta está aberta — assim um perfil
+   * fechado não custa a leitura, e o número nem chega perto desta função.
+   */
+  readonly lifetimeWonCentavos: unknown;
 }
 
 const MONTHS = [
@@ -80,14 +131,38 @@ const MONTHS = [
 export function projectPublicProfile(
   source: PublicProfileSource
 ): PublicProfile {
+  const visible = readVisibility(source.earningsPublic);
   return {
     publicPlayerId: source.publicPlayerId,
     nickname: readNickname(source.username),
     badges: readBadges(source.badges),
     tournamentsPlayed: readCount(source.tournamentsPlayed),
     tournamentsCreated: readCount(source.tournamentsCreated),
+    tournamentsWon: readCount(source.tournamentsWon),
     memberSince: readMonth(source.createdAt),
+    earningsVisible: visible,
+    // A PORTA MANDA, e o número só existe quando ela está aberta. Mesmo que o
+    // chamador passe um valor por engano com a porta fechada, ele morre aqui.
+    lifetimeWonCentavos: visible ? readCentavos(source.lifetimeWonCentavos) : null,
   };
+}
+
+/**
+ * A porta é FECHADA por padrão.
+ *
+ * Só o booleano verdadeiro abre. Ausente, nulo, `"true"` em texto ou qualquer
+ * outra coisa lê como fechado — um campo corrompido não pode virar consentimento
+ * que ninguém deu.
+ */
+function readVisibility(raw: unknown): boolean {
+  return raw === true;
+}
+
+/** Centavos inteiros e não negativos, ou null. Prêmio recebido nunca é negativo. */
+function readCentavos(raw: unknown): number | null {
+  return typeof raw === "number" && Number.isInteger(raw) && raw >= 0
+    ? raw
+    : null;
 }
 
 function readNickname(raw: unknown): string {
