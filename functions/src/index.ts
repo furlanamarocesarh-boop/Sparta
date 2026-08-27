@@ -51,10 +51,14 @@ import {
   MAX_ORG_ADMINS,
   MAX_ORG_MEMBERS,
   ORG_INVITES_COLLECTION,
+  ORG_PROFILE_READ_LIMIT,
+  ORG_PROFILE_TOURNAMENT_LIMIT,
   ORGANIZATIONS_COLLECTION,
   orgNameMessage,
   ROLE_ADMIN,
   ROLE_OWNER,
+  sortOrgMembers,
+  sortOrgTournaments,
   type OrgRole,
 } from "./domain/organization.js";
 import {
@@ -1698,6 +1702,28 @@ export const createTournamentHandler = async (
     }
     assertOrgMember(await roleInOrg(uid, organizationId));
 
+    /**
+     * O CARTÃO DE VISITA DA ORGANIZAÇÃO, COPIADO PARA DENTRO DO CAMPEONATO.
+     *
+     * A vitrine mostra "por <organização>" em cada cartão, e a vitrine lê os
+     * campeonatos direto do Firestore. Sem o nome aqui, desenhar uma lista de
+     * vinte campeonatos custaria vinte leituras extras só para escrever vinte
+     * vezes a mesma palavra — e a lista é justamente a tela de que já
+     * reclamaram por ser lenta.
+     *
+     * O ID CONTINUA SENDO A VERDADE. O nome copiado é um rótulo para desenhar;
+     * quem abre o perfil da organização lê o documento vivo, então uma
+     * renomeação futura aparece lá no mesmo instante e aqui na próxima
+     * criação. É a troca deliberada: o rótulo pode envelhecer, o vínculo não.
+     */
+    const orgSnap = await db
+      .collection(ORGANIZATIONS_COLLECTION)
+      .doc(organizationId)
+      .get();
+    const organizationName =
+      typeof orgSnap.get("name") === "string" ? orgSnap.get("name") : "";
+    const organizationLogoUrl = readLogoUrl(orgSnap.get("logo_url"));
+
     const name = String(data.name || "").trim();
     const description = String(data.description || "").trim();
 
@@ -1881,13 +1907,25 @@ export const createTournamentHandler = async (
 
     const userData = userSnap.data() ?? {};
 
-    const creatorName =
-      userData.display_name ||
-      userData.username ||
-      userData.name ||
-      userData.nickname ||
-      context.auth?.token?.email ||
-      "Criador";
+    /**
+     * O RÓTULO DE QUEM CRIOU — E O E-MAIL NÃO ENTRA NELE.
+     *
+     * A cascata terminava em `context.auth.token.email`, e `users/{uid}` nasce
+     * com `username: ""`, preenchido só quando a pessoa escolhe um apelido.
+     * Ou seja: todo campeonato criado por quem ainda não escolheu apelido ficava
+     * gravado com o E-MAIL do criador — num documento que `firestore.rules`
+     * deixa qualquer conta logada ler. Dado pessoal viajando de carona num
+     * documento que existe para ser mostrado é exatamente o que a regra das
+     * organizações diz estar evitando.
+     *
+     * Sem apelido, o rótulo é "Criador". Genérico é melhor que pessoal: o nome
+     * que responde pelo campeonato hoje é o da ORGANIZAÇÃO, e é ele que o
+     * cartão escreve.
+     *
+     * ISTO NÃO CONSERTA O QUE JÁ ESTÁ GRAVADO. Documentos antigos seguem com o
+     * valor antigo até alguém decidir reescrevê-los.
+     */
+    const creatorName = userData.username || "Criador";
 
     const tournamentRef = db.collection("tournaments").doc();
 
@@ -1898,6 +1936,10 @@ export const createTournamentHandler = async (
       // teria como somar nada, e o histórico anterior — criado antes de
       // organizações existirem — fica sem o campo, que é a verdade sobre ele.
       organization_id: organizationId,
+      // O rótulo copiado — ver a nota na leitura acima. Nunca é lido para
+      // decidir nada: autorização e contabilidade olham só `organization_id`.
+      organization_name: organizationName,
+      organization_logo_url: organizationLogoUrl,
 
       entry_fee: centavosToReais(entryFeeCentavos),
       prize: centavosToReais(prizeCentavos),
@@ -7954,6 +7996,21 @@ async function commitInChunks(
  * Só https, e só o que cabe num campo. `http` simples faria a logo virar um
  * pedido inseguro dentro de uma tela autenticada.
  */
+/**
+ * A MESMA logo, LIDA em vez de validada.
+ *
+ * `checkLogoUrl` recusa e explica, porque quem digita precisa ouvir. Aqui a
+ * logo já está gravada e só está sendo copiada para o cartão do campeonato:
+ * um valor estranho num documento antigo não pode impedir alguém de CRIAR um
+ * campeonato. Devolve null e a vida segue sem logo.
+ */
+function readLogoUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const url = value.trim();
+  if (url === "" || url.length > 500 || !url.startsWith("https://")) return null;
+  return url;
+}
+
 function checkLogoUrl(value: unknown): string | null {
   if (value === null || value === undefined || value === "") return null;
   if (typeof value !== "string") {
@@ -8527,4 +8584,209 @@ export const getOrganizationAccountingHandler = async (
 
 export const getOrganizationAccounting = central.https.onCall(
   getOrganizationAccountingHandler
+);
+
+/**
+ * O PERFIL PÚBLICO DE UMA ORGANIZAÇÃO.
+ *
+ * POR QUE ELE EXISTE. O cartão do campeonato dizia "por furlanamarocesarh" — o
+ * usuário de uma pessoa. Quem organiza é a organização, e o nome dela agora é
+ * um link: quem toca chega aqui e vê os campeonatos dela e quem a administra.
+ *
+ * ABERTO A QUALQUER CONTA LOGADA, pelo mesmo motivo de `getPublicProfile`:
+ * é uma página feita para ser mostrada. Logado, e não anônimo, porque um
+ * endereço aberto sobre um id de documento é superfície de varredura, e exigir
+ * conta põe nome em quem passeia.
+ *
+ * A PROJEÇÃO É UMA LISTA BRANCA, campo a campo. O que não está escrito aqui
+ * não sai — em particular:
+ *
+ *  - o TELEFONE do dono, que nem sequer mora nesta coleção;
+ *  - os UIDs, de ninguém. O endereço de uma pessoa é o pseudônimo público, e
+ *    é só ele que sai. Um administrador que nunca abriu o próprio perfil ainda
+ *    não tem pseudônimo: ele aparece com o apelido e SEM link, como já
+ *    acontece na tabela de criadores. Cunhar um em nome de terceiro criaria
+ *    uma identidade permanente para alguém que não pediu nada.
+ */
+const ORGANIZATION_PROFILE_KEYS = ["organization_id"] as const;
+
+export const getOrganizationProfileHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    assertSignedIn(context, "Entre na sua conta para ver organizações.");
+    assertExactPayload(data, ORGANIZATION_PROFILE_KEYS);
+
+    const orgId = String(data?.organization_id ?? "").trim();
+    if (orgId === "" || orgId.includes("/") || orgId.length > 200) {
+      throw new DomainError("invalid-argument", "Organização inválida.");
+    }
+
+    const orgSnap = await db
+      .collection(ORGANIZATIONS_COLLECTION)
+      .doc(orgId)
+      .get();
+    if (!orgSnap.exists) {
+      throw new DomainError("not-found", "Organização não encontrada.");
+    }
+
+    const ofThisOrg = db
+      .collection("tournaments")
+      .where("organization_id", "==", orgId);
+
+    const [memberSnap, tournamentSnap, countSnap] = await Promise.all([
+      db
+        .collection(ORG_MEMBERS_COLLECTION)
+        .where("org_id", "==", orgId)
+        .limit(MAX_ORG_MEMBERS + 1)
+        .get(),
+      ofThisOrg.limit(ORG_PROFILE_READ_LIMIT).get(),
+      /**
+       * O TOTAL VEM DE UMA AGREGAÇÃO, e não de contar o que foi lido.
+       *
+       * Contar a página lida faria a organização de quatrocentos campeonatos
+       * ler "de 300" — o teto de leitura virando um número apresentado como
+       * fato. A agregação conta a coleção inteira e custa uma fração de uma
+       * leitura, então o número mostrado é verdadeiro de graça.
+       */
+      ofThisOrg.count().get(),
+    ]);
+
+    // Uma leitura por membro, e o teto é nove. O apelido e o pseudônimo moram
+    // em coleções diferentes, então são dois documentos por pessoa — dezoito
+    // leituras no pior caso, para uma página que se abre por toque.
+    const members = await Promise.all(
+      memberSnap.docs.map(async (doc) => {
+        const uid = String(doc.get("uid") ?? "");
+        const role = doc.get("role");
+        if (uid === "" || (role !== ROLE_OWNER && role !== ROLE_ADMIN)) {
+          return null;
+        }
+
+        const [userSnap, identitySnap] = await Promise.all([
+          db.collection("users").doc(uid).get(),
+          db.collection(PUBLIC_PLAYER_ID_COLLECTION).doc(uid).get(),
+        ]);
+
+        const nickname =
+          typeof userSnap.get("username") === "string"
+            ? userSnap.get("username")
+            : typeof userSnap.get("display_name") === "string"
+              ? userSnap.get("display_name")
+              : "";
+
+        const storedId = identitySnap.exists
+          ? identitySnap.get("publicPlayerId")
+          : null;
+
+        const joinedAt = doc.get("joined_at");
+
+        return {
+          role: role as OrgRole,
+          nickname,
+          joinedAtMs:
+            joinedAt instanceof Timestamp ? joinedAt.toMillis() : null,
+          // O ENDEREÇO, nunca o uid. Null significa "ainda sem pseudônimo", e
+          // a tela desenha o nome sem link.
+          public_player_id: isPublicPlayerId(storedId) ? storedId : null,
+        };
+      })
+    );
+
+    const memberRows = sortOrgMembers(
+      members.filter((m): m is NonNullable<typeof m> => m !== null)
+    );
+
+    const tournamentRows = tournamentSnap.docs.map((doc) => {
+      const startsAt = doc.get("starts_at");
+      const createdAt = doc.get("created_at");
+      return {
+        id: doc.id,
+        status: String(doc.get("status") ?? ""),
+        startsAtMs: startsAt instanceof Timestamp ? startsAt.toMillis() : null,
+        createdAtMs:
+          createdAt instanceof Timestamp ? createdAt.toMillis() : null,
+        doc,
+      };
+    });
+
+    const ordered = sortOrgTournaments(tournamentRows).slice(
+      0,
+      ORG_PROFILE_TOURNAMENT_LIMIT
+    );
+    const byId = new Map(tournamentRows.map((r) => [r.id, r.doc]));
+
+    const createdAt = orgSnap.get("created_at");
+
+    return {
+      organization: {
+        id: orgId,
+        name: typeof orgSnap.get("name") === "string" ? orgSnap.get("name") : "",
+        logo_url: readLogoUrl(orgSnap.get("logo_url")),
+        created_at_ms:
+          createdAt instanceof Timestamp ? createdAt.toMillis() : null,
+        // O TOTAL VERDADEIRO — ver a agregação acima. A página mostra no
+        // máximo trinta e declara que são trinta de quantos.
+        tournament_count: countSnap.data().count,
+        admin_count: memberRows.filter((m) => m.role === ROLE_ADMIN).length,
+      },
+      members: memberRows.map((m) => ({
+        role: m.role,
+        nickname: m.nickname,
+        public_player_id: m.public_player_id,
+      })),
+      /**
+       * OS CAMPEONATOS FALAM O VOCABULÁRIO DO PRÓPRIO DOCUMENTO.
+       *
+       * As chaves abaixo são as mesmas de `tournaments/{id}` de propósito: a
+       * vitrine já sabe transformar esse formato num campeonato, e inventar um
+       * segundo formato aqui obrigaria o app a ter um segundo tradutor —
+       * dois tradutores para a mesma coisa acabam discordando, e quem descobre
+       * a discordância é o jogador, olhando um preço errado.
+       *
+       * Continua sendo lista branca: cada chave está escrita à mão, e um campo
+       * novo no documento não passa a sair daqui sozinho. As datas saem em
+       * milissegundos porque uma callable não transporta `Timestamp`.
+       */
+      tournaments: ordered.map((row) => {
+        const doc = byId.get(row.id)!;
+        const str = (key: string): string =>
+          typeof doc.get(key) === "string" ? doc.get(key) : "";
+        return {
+          id: row.id,
+          name: str("name"),
+          description: str("description"),
+          status: row.status,
+          starts_at: row.startsAtMs,
+          created_at: row.createdAtMs,
+          game_mode_label: str("game_mode_label"),
+          game_mode: str("game_mode"),
+          format_type: str("format_type"),
+          entry_fee: doc.get("entry_fee") ?? 0,
+          prize: doc.get("prize") ?? 0,
+          kill_prize: doc.get("kill_prize") ?? 0,
+          // AS DUAS ECONOMIAS NÃO SE SOMAM em lugar nenhum, e aqui elas nem se
+          // encostam: cada campeonato carrega a sua, e a tela mostra o selo.
+          economy_type: resolveTournamentEconomy(doc.data() ?? {}),
+          current_participants: Number(doc.get("current_participants") ?? 0),
+          max_participants: Number(doc.get("max_participants") ?? 0),
+          // NEM `creator_uid` NEM `creator_name`. O cartão desta página escreve
+          // "por <organização>", então o rótulo de quem criou não tem uso aqui
+          // — e ele carrega o e-mail do criador em todo documento gravado antes
+          // da correção acima. Um campo sem uso que carrega dado pessoal só
+          // pode sair.
+          organization_id: orgId,
+          organization_name:
+            typeof orgSnap.get("name") === "string" ? orgSnap.get("name") : "",
+        };
+      }),
+    };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const getOrganizationProfile = central.https.onCall(
+  getOrganizationProfileHandler
 );

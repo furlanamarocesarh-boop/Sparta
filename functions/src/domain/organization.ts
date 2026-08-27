@@ -280,3 +280,106 @@ export function assertOrgOwner(role: OrgRole | null): void {
 export function inviteExpiryMs(nowMs: number): number {
   return nowMs + INVITE_TTL_MINUTES * 60 * 1000;
 }
+
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * O PERFIL PÚBLICO DA ORGANIZAÇÃO
+ *
+ * O cartão do campeonato passou a dizer "por <organização>", e esse texto abre
+ * uma página. O que ela mostra — os campeonatos e quem administra — é ordenado
+ * AQUI, e não na tela, porque duas telas ordenando por conta própria acabam
+ * discordando sobre qual campeonato vem primeiro.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
+/** Quantos campeonatos a página devolve. */
+export const ORG_PROFILE_TOURNAMENT_LIMIT = 30;
+
+/**
+ * Quantos documentos a consulta lê antes de ordenar em memória.
+ *
+ * A consulta é só por igualdade e `limit`, SEM `orderBy`, de propósito. Somar
+ * uma ordenação exigiria índice composto — e, pior, o Firestore descarta
+ * silenciosamente todo documento que não tenha o campo ordenado, o que faria a
+ * página de uma organização antiga esconder campeonatos sem `created_at` em vez
+ * de mostrá-los. Ler um pouco a mais e ordenar aqui não mente sobre nada.
+ */
+export const ORG_PROFILE_READ_LIMIT = 300;
+
+export interface OrgTournamentRow {
+  readonly id: string;
+  readonly status: string;
+  /** Quando começa. Null quando o documento não tem data. */
+  readonly startsAtMs: number | null;
+  /** Quando foi criado. Null quando o documento é antigo demais para ter. */
+  readonly createdAtMs: number | null;
+}
+
+/**
+ * A ordem em que os campeonatos de uma organização aparecem.
+ *
+ * QUEM CHEGA AQUI VEIO DE UM CARTÃO e quer, quase sempre, jogar. Então o que
+ * ainda dá para jogar vem primeiro — abertos, depois em andamento, os dois do
+ * mais próximo para o mais distante. O que já acabou vem por último e do mais
+ * recente para o mais antigo, que é como um histórico se lê.
+ *
+ * SEM DATA NÃO VAI PARA O FIM DA FILA E SOME. Um campeonato sem `starts_at`
+ * fica atrás dos datados do mesmo grupo, mas continua no grupo dele: esconder
+ * seria a tela mentindo sobre quantos campeonatos a organização tem.
+ */
+export function sortOrgTournaments(
+  rows: readonly OrgTournamentRow[]
+): OrgTournamentRow[] {
+  const tier = (status: string): number => {
+    if (status === "open") return 0;
+    if (status === "in_progress") return 1;
+    return 2;
+  };
+
+  // `Infinity` para os sem data nos grupos jogáveis (vão para o fim do grupo)
+  // e `-Infinity` no histórico (mesma coisa, com a ordem invertida).
+  return [...rows].sort((a, b) => {
+    const ta = tier(a.status);
+    const tb = tier(b.status);
+    if (ta !== tb) return ta - tb;
+
+    if (ta === 2) {
+      const ca = a.createdAtMs ?? -Infinity;
+      const cb = b.createdAtMs ?? -Infinity;
+      if (ca !== cb) return cb - ca;
+    } else {
+      const sa = a.startsAtMs ?? Infinity;
+      const sb = b.startsAtMs ?? Infinity;
+      if (sa !== sb) return sa - sb;
+    }
+
+    // Desempate estável pelo id: sem ele, dois campeonatos com a mesma data
+    // trocariam de lugar entre uma abertura da tela e a seguinte.
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+}
+
+export interface OrgMemberRow {
+  readonly role: OrgRole;
+  readonly joinedAtMs: number | null;
+  readonly nickname: string;
+}
+
+/**
+ * A ordem em que os administradores aparecem: o DONO primeiro, sempre, e os
+ * demais pela ordem em que entraram.
+ *
+ * O dono primeiro não é hierarquia decorativa — é a informação que quem olha de
+ * fora está procurando: com quem se fala sobre esta organização.
+ */
+export function sortOrgMembers<T extends OrgMemberRow>(
+  rows: readonly T[]
+): T[] {
+  return [...rows].sort((a, b) => {
+    if (a.role !== b.role) return a.role === ROLE_OWNER ? -1 : 1;
+    const ja = a.joinedAtMs ?? Infinity;
+    const jb = b.joinedAtMs ?? Infinity;
+    if (ja !== jb) return ja - jb;
+    return a.nickname.localeCompare(b.nickname, "pt-BR");
+  });
+}

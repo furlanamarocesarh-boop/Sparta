@@ -28,6 +28,21 @@ const ESTRANHO = "e2e-org-estranho";
 
 const TELEFONE = "11988887777";
 
+/**
+ * APELIDOS QUE NÃO CONTÊM O UID.
+ *
+ * O fixture usava o próprio uid como apelido, e isso tornava impossível provar
+ * que um uid não vaza: o apelido — que SAI, e deve sair — carregava a string
+ * procurada e a asserção acusava um vazamento que não existia. Nomes distintos
+ * fazem a busca por uid significar exatamente o que ela diz.
+ */
+const APELIDO: Readonly<Record<string, string>> = {
+  [DONO]: "Cesar",
+  [CONVIDADO]: "Ajudante",
+  [OUTRO]: "Terceiro",
+  [ESTRANHO]: "Passante",
+};
+
 type Handler = (d: any, c: any, o?: any) => Promise<any>;
 
 const ctx = (uid: string, isAdmin = false) => ({
@@ -43,6 +58,7 @@ let revogar: Handler;
 let remover: Handler;
 let contabilidade: Handler;
 let criarCampeonato: Handler;
+let perfilOrg: Handler;
 
 let orgId = "";
 
@@ -77,10 +93,11 @@ before(async () => {
   remover = mod.removeOrgAdminHandler;
   contabilidade = mod.getOrganizationAccountingHandler;
   criarCampeonato = mod.createTournamentHandler;
+  perfilOrg = mod.getOrganizationProfileHandler;
 
   await limpar();
   for (const u of [DONO, CONVIDADO, OUTRO, ESTRANHO]) {
-    await db.collection("users").doc(u).set({ username: u });
+    await db.collection("users").doc(u).set({ username: APELIDO[u] });
   }
 });
 
@@ -327,6 +344,136 @@ describe("E2E — contabilidade", () => {
           ctx(ESTRANHO, true)
         ),
       /Apenas o dono/i
+    );
+  });
+});
+
+describe("E2E — a página pública da organização", () => {
+  let tournamentId = "";
+
+  before(async () => {
+    const r = await criarCampeonato(
+      {
+        name: "Copa Pública",
+        entry_fee: 10,
+        prize: 50,
+        max_players: 8,
+        game_mode: "solo",
+        economy_type: "beta_credit",
+      },
+      ctx(DONO)
+    );
+    tournamentId = r.tournament_id;
+  });
+
+  after(async () => {
+    if (tournamentId) {
+      await db.collection("tournaments").doc(tournamentId).delete();
+    }
+  });
+
+  it("o campeonato guarda o NOME da organização, e não só o id", async () => {
+    // É o que deixa a vitrine desenhar vinte cartões sem vinte leituras extras.
+    const doc = await db.collection("tournaments").doc(tournamentId).get();
+    assert.equal(doc.get("organization_id"), orgId);
+    assert.equal(doc.get("organization_name"), "Sparta Battle");
+  });
+
+  it("o rótulo de quem criou NÃO é o e-mail", async () => {
+    // A cascata terminava no e-mail do token, e `users/{uid}` nasce sem
+    // apelido — então todo campeonato de quem nunca escolheu apelido ficava
+    // gravado com o e-mail, num documento que qualquer conta logada lê.
+    const doc = await db.collection("tournaments").doc(tournamentId).get();
+    const rotulo = String(doc.get("creator_name") ?? "");
+    assert.equal(rotulo.includes("@"), false, `rótulo vazou: ${rotulo}`);
+  });
+
+  it("QUALQUER conta logada abre a página", async () => {
+    // É uma página feita para ser mostrada — como o perfil de um jogador.
+    const r = await perfilOrg({ organization_id: orgId }, ctx(ESTRANHO));
+    assert.equal(r.organization.name, "Sparta Battle");
+    assert.equal(r.organization.id, orgId);
+  });
+
+  it("deslogado NÃO abre", async () => {
+    await assert.rejects(
+      () => perfilOrg({ organization_id: orgId }, {}),
+      /conta/i
+    );
+  });
+
+  it("a resposta não carrega telefone, uid nem o rótulo de quem criou",
+    async () => {
+      const r = await perfilOrg({ organization_id: orgId }, ctx(ESTRANHO));
+      const json = JSON.stringify(r);
+
+      assert.equal(json.includes(TELEFONE), false, "telefone vazou");
+      assert.equal(json.includes(DONO), false, "uid do dono vazou");
+      assert.equal(json.includes("creator_name"), false, "rótulo vazou");
+      assert.equal(json.includes("creator_uid"), false, "uid do criador vazou");
+      assert.equal(json.includes("owner_uid"), false, "owner_uid vazou");
+    });
+
+  it("nenhum número de contabilidade atravessa", async () => {
+    // Arrecadado, pago e lucro são do dono e saem de outra callable, que
+    // recusa qualquer outro.
+    const r = await perfilOrg({ organization_id: orgId }, ctx(ESTRANHO));
+    const json = JSON.stringify(r);
+    for (const proibido of ["collected", "paid_centavos", "profit"]) {
+      assert.equal(json.includes(proibido), false, proibido);
+    }
+  });
+
+  it("os membros saem com papel e pseudônimo, o dono primeiro", async () => {
+    const r = await perfilOrg({ organization_id: orgId }, ctx(ESTRANHO));
+    assert.ok(r.members.length >= 1);
+    assert.equal(r.members[0].role, "owner");
+    assert.equal(r.members[0].nickname, APELIDO[DONO]);
+    // Ninguém neste teste abriu o próprio perfil, então ninguém tem pseudônimo
+    // — e é isso que a tela usa para não pôr um link morto.
+    assert.equal(r.members[0].public_player_id, null);
+  });
+
+  it("os campeonatos saem no vocabulário do próprio documento", async () => {
+    // O app tem UM tradutor de campeonato; um segundo formato aqui obrigaria
+    // a um segundo tradutor, e dois tradutores acabam discordando do preço.
+    const r = await perfilOrg({ organization_id: orgId }, ctx(ESTRANHO));
+    const t = r.tournaments.find((x: any) => x.id === tournamentId);
+    assert.ok(t, "o campeonato da organização não veio");
+    assert.equal(t.name, "Copa Pública");
+    assert.equal(t.status, "open");
+    assert.equal(t.entry_fee, 10);
+    assert.equal(t.economy_type, "beta_credit");
+    assert.equal(t.organization_id, orgId);
+    assert.equal(typeof t.starts_at, "object");
+  });
+
+  it("o total vem da AGREGAÇÃO, não da contagem do que foi lido", async () => {
+    const r = await perfilOrg({ organization_id: orgId }, ctx(ESTRANHO));
+    assert.equal(r.organization.tournament_count, r.tournaments.length);
+  });
+
+  it("uma organização que não existe responde não-encontrada", async () => {
+    await assert.rejects(
+      () => perfilOrg({ organization_id: "nao-existe" }, ctx(ESTRANHO)),
+      /não encontrada/i
+    );
+  });
+
+  it("um id malformado é recusado antes de qualquer leitura", async () => {
+    for (const ruim of ["", "  ", "a/b"]) {
+      await assert.rejects(
+        () => perfilOrg({ organization_id: ruim }, ctx(ESTRANHO)),
+        /inválida/i,
+        ruim
+      );
+    }
+  });
+
+  it("campo a mais no payload é recusado", async () => {
+    await assert.rejects(
+      () => perfilOrg({ organization_id: orgId, extra: 1 }, ctx(ESTRANHO)),
+      /./
     );
   });
 });
