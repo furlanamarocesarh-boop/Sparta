@@ -91,6 +91,7 @@ const AUTHORIZED_FUNCTIONS: Readonly<Record<string, string>> = {
   acceptOrgInvite: CENTRAL,
   revokeOrgInvite: CENTRAL,
   removeOrgAdmin: CENTRAL,
+  getOrganizationAccounting: CENTRAL,
   deleteTournament: CENTRAL,
   registerDeviceToken: CENTRAL,
   unregisterDeviceToken: CENTRAL,

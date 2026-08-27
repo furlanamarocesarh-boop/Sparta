@@ -7969,6 +7969,15 @@ function checkLogoUrl(value: unknown): string | null {
   return url;
 }
 
+/**
+ * Quantos campeonatos a contabilidade lê de uma vez.
+ *
+ * Alto para qualquer organização real, e finito porque uma leitura sem teto
+ * cresce para sempre — foi o que já tivemos de consertar na vitrine e no
+ * extrato.
+ */
+const ORG_ACCOUNTING_READ_LIMIT = 1000;
+
 const ORG_PRIVATE_COLLECTION = "organization_private";
 const ORG_MEMBERS_COLLECTION = "organization_members";
 
@@ -8391,3 +8400,131 @@ export const removeOrgAdminHandler = async (
 };
 
 export const removeOrgAdmin = central.https.onCall(removeOrgAdminHandler);
+
+/**
+ * A contabilidade da organização.
+ *
+ * SÓ O DONO VÊ. Um administrador convidado organiza campeonatos; quanto a
+ * operação faturou é do dono, e a separação entre os dois papéis só vale se
+ * alguma coisa de fato ficar de um lado só.
+ *
+ * O QUE CADA NÚMERO SIGNIFICA, e as definições são escolhidas para não
+ * enganar:
+ *
+ *  - ARRECADADO é o que ENTROU: a taxa de inscrição vezes quem pagou. É este o
+ *    número que o pedido chama de "reais movimentados". Somar arrecadado com
+ *    prêmios pagos daria um "volume" que conta o mesmo dinheiro duas vezes —
+ *    ele entra e sai do mesmo bolo — e um número inflado é pior do que número
+ *    nenhum.
+ *  - PRÊMIOS PAGOS é o que saiu para os jogadores.
+ *  - LUCRO é a diferença, e normalmente é zero, porque não há taxa.
+ *
+ * AS DUAS ECONOMIAS NUNCA SÃO SOMADAS. Cada número sai duas vezes, uma por
+ * economia, porque Créditos Beta e reais não são a mesma coisa e um total
+ * único seria uma mentira aritmética.
+ *
+ * A JANELA É O RECORTE DE CRIAÇÃO do campeonato. Recortar por liquidação
+ * mudaria o significado de "campeonatos criados" no mesmo cartão, e dois
+ * recortes convivendo numa tela é como se lê um número achando que é outro.
+ */
+export const getOrganizationAccountingHandler = async (
+  data: any,
+  context: any
+): Promise<Record<string, unknown>> => {
+  try {
+    const auth = assertSignedIn(context, "Entre na sua conta.");
+    assertExactPayload(data, ["organization_id", "from_ms", "to_ms"]);
+
+    const orgId = String(data.organization_id ?? "").trim();
+    if (orgId === "" || orgId.includes("/")) {
+      throw new DomainError("invalid-argument", "Organização inválida.");
+    }
+    assertOrgOwner(await roleInOrg(auth.uid, orgId));
+
+    // `null` nos dois lados quer dizer "desde sempre". Um período aberto de um
+    // lado só é aceito: "deste mês até hoje" é uma pergunta legítima.
+    const fromMs = data.from_ms === null ? null : Number(data.from_ms);
+    const toMs = data.to_ms === null ? null : Number(data.to_ms);
+    for (const v of [fromMs, toMs]) {
+      if (v !== null && !Number.isFinite(v)) {
+        throw new DomainError("invalid-argument", "Período inválido.");
+      }
+    }
+    if (fromMs !== null && toMs !== null && fromMs > toMs) {
+      throw new DomainError("invalid-argument", "O período começa depois de terminar.");
+    }
+
+    const snapshot = await db
+      .collection("tournaments")
+      .where("organization_id", "==", orgId)
+      .limit(ORG_ACCOUNTING_READ_LIMIT)
+      .get();
+
+    const zero = () => ({ collectedCentavos: 0, paidCentavos: 0, tournaments: 0 });
+    const totals: Record<string, ReturnType<typeof zero>> = {
+      cash: zero(),
+      beta_credit: zero(),
+    };
+    let undated = 0;
+
+    for (const doc of snapshot.docs) {
+      const createdAt = doc.get("created_at");
+      const createdMs =
+        createdAt instanceof Timestamp ? createdAt.toMillis() : null;
+      if (createdMs === null) {
+        // Sem data não entra em janela nenhuma — nem na de "sempre", onde
+        // entraria calado e inflaria justamente o número mais olhado.
+        undated += 1;
+        continue;
+      }
+      if (fromMs !== null && createdMs < fromMs) continue;
+      if (toMs !== null && createdMs > toMs) continue;
+
+      const economy = resolveTournamentEconomy(doc.data() ?? {});
+      const bucket = totals[economy];
+      bucket.tournaments += 1;
+
+      // `inspectReais` em vez de `toCentavos`: um valor corrompido num
+      // campeonato antigo não pode derrubar a contabilidade inteira da
+      // organização. Ele é ignorado nesta linha e a soma segue — o oposto de
+      // uma liquidação, onde um valor ruim TEM que travar tudo.
+      const entryFee = inspectReais(doc.get("entry_fee"), { allowZero: true });
+      const players = Number(doc.get("current_participants") ?? 0);
+      if (entryFee.ok && Number.isSafeInteger(players) && players > 0) {
+        bucket.collectedCentavos += entryFee.centavos * players;
+      }
+
+      const result = doc.get("result");
+      if (result && typeof result === "object") {
+        const paid = inspectReais(
+          (result as any).total_paid ?? (result as any).prize,
+          { allowZero: true }
+        );
+        if (paid.ok) bucket.paidCentavos += paid.centavos;
+      }
+    }
+
+    return {
+      organization_id: orgId,
+      from_ms: fromMs,
+      to_ms: toMs,
+      undated_tournaments: undated,
+      economies: Object.entries(totals).map(([economy, t]) => ({
+        economy,
+        tournaments: t.tournaments,
+        collected_centavos: t.collectedCentavos,
+        paid_centavos: t.paidCentavos,
+        // O lucro é derivado aqui e não no cliente: duas contas para o mesmo
+        // número acabam discordando, e a que a tela mostra tem que ser a que
+        // o servidor sabe defender.
+        profit_centavos: t.collectedCentavos - t.paidCentavos,
+      })),
+    };
+  } catch (error) {
+    throw toHttpsError(error);
+  }
+};
+
+export const getOrganizationAccounting = central.https.onCall(
+  getOrganizationAccountingHandler
+);
