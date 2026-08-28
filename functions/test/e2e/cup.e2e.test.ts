@@ -361,11 +361,14 @@ describe("E2E — Copa", () => {
     });
   });
 
-  it("um não-admin não sorteia nem lança", async () => {
+  it("quem não é da organização não sorteia nem lança", async () => {
+    // A RECUSA MUDOU DE MOTIVO, não de resultado. Antes era "não tem a claim de
+    // plataforma"; agora é "não faz parte da organização dona" — que é a
+    // pergunta certa, e a mesma que a criação já fazia.
     const player = { auth: { uid: "e2e-cup-a", token: {} } };
     await assert.rejects(
       () => drawBracket({ tournamentid: created[0] }, player),
-      /Apenas admin/
+      /não faz parte da organização/i
     );
     await assert.rejects(
       () =>
@@ -373,7 +376,7 @@ describe("E2E — Copa", () => {
           { tournamentid: created[0], match_number: 1, winner_uid: "x" },
           player
         ),
-      /Apenas admin/
+      /não faz parte da organização/i
     );
   });
 

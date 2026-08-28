@@ -179,20 +179,30 @@ describe("decideRoomAccess", () => {
 });
 
 describe("setTournamentRoom handler — auth + validation", () => {
-  it("rejects unauthenticated and non-admin callers before any write", async () => {
+  it("recusa quem não está logado ANTES de tocar no banco", async () => {
+    /**
+     * O QUE MUDOU AQUI, e por que o teste encolheu.
+     *
+     * Este teste também exigia `permission-denied` para um chamador logado sem
+     * a claim de plataforma, e conseguia afirmar isso sem Firestore porque a
+     * resposta não dependia de campeonato nenhum: bastava olhar o token.
+     *
+     * Agora quem pode publicar a sala é quem faz parte da ORGANIZAÇÃO DONA do
+     * campeonato — e essa pergunta não tem como ser respondida sem ler o
+     * campeonato. A checagem passou a precisar do banco, o que aqui, sem
+     * emulador, vira `internal`.
+     *
+     * A ordem que importa continua provada: sem sessão, a recusa vem antes de
+     * qualquer leitura ou escrita. O resto é o e2e que prova, contra um
+     * Firestore de verdade — ver `functions/test/e2e/organizations.e2e.test.ts`.
+     */
     const { set } = await handlers();
     assert.equal(await codeOf(set, VALID_SET, {}), "unauthenticated");
-    assert.equal(
-      await codeOf(set, VALID_SET, { auth: { uid: "u" } }),
-      "permission-denied"
-    );
-    assert.equal(
-      await codeOf(set, VALID_SET, { auth: { uid: "u", token: { admin: "true" } } }),
-      "permission-denied"
-    );
   });
 
-  it("an admin with an invalid payload gets invalid-argument (no write)", async () => {
+  it("payload inválido é recusado ANTES de qualquer leitura", async () => {
+    // Continua valendo, e é o que mantém um payload torto barato: a validação
+    // roda antes de o campeonato ser lido para decidir quem pode operá-lo.
     const { set } = await handlers();
     const admin = { auth: { uid: "a", token: { admin: true } } };
     assert.equal(await codeOf(set, {}, admin), "invalid-argument");

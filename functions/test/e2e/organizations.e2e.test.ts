@@ -59,6 +59,9 @@ let remover: Handler;
 let contabilidade: Handler;
 let criarCampeonato: Handler;
 let perfilOrg: Handler;
+let iniciar: Handler;
+let publicarSala: Handler;
+let cancelar: Handler;
 
 let orgId = "";
 
@@ -94,6 +97,9 @@ before(async () => {
   contabilidade = mod.getOrganizationAccountingHandler;
   criarCampeonato = mod.createTournamentHandler;
   perfilOrg = mod.getOrganizationProfileHandler;
+  iniciar = mod.startTournamentHandler;
+  publicarSala = mod.setTournamentRoomHandler;
+  cancelar = mod.cancelTournamentHandler;
 
   await limpar();
   for (const u of [DONO, CONVIDADO, OUTRO, ESTRANHO]) {
@@ -550,4 +556,121 @@ describe("E2E — a página pública da organização", () => {
       /./
     );
   });
+});
+
+/**
+ * O ADMINISTRADOR CONVIDADO CONSEGUE ORGANIZAR DE VERDADE.
+ *
+ * Era a promessa da feature inteira e ela estava quebrada: criar campeonato
+ * dependia de ser membro da organização, mas iniciar, publicar a sala,
+ * declarar resultado e cancelar continuavam exigindo a claim de plataforma —
+ * que só o dono da plataforma tem. O convidado criava um campeonato e não
+ * conseguia tocá-lo.
+ *
+ * Estes testes provam os dois lados: quem é da organização opera, e quem não é
+ * apanha na porta.
+ */
+describe("E2E — quem pode operar o campeonato", () => {
+  const AJUDANTE = "e2e-op-ajudante";
+  let tid = "";
+
+  before(async () => {
+    await db.collection("users").doc(AJUDANTE).set({ username: "Ajudante" });
+
+    // Entra na organização pelo caminho de verdade: convite de uso único.
+    const convite = await criarConvite({ organization_id: orgId }, ctx(DONO));
+    await aceitar({ token: convite.token }, ctx(AJUDANTE));
+
+    const criado = await criarCampeonato(
+      {
+        name: "Copa do Ajudante",
+        entry_fee: 10,
+        prize: 50,
+        max_players: 8,
+        game_mode: "solo",
+        economy_type: "beta_credit",
+      },
+      ctx(AJUDANTE)
+    );
+    tid = criado.tournament_id;
+  });
+
+  after(async () => {
+    if (tid) await db.collection("tournaments").doc(tid).delete();
+    await db.collection("tournament_rooms").doc(tid).delete().catch(() => {});
+    await db.collection("users").doc(AJUDANTE).delete();
+    await db
+      .collection("organization_members")
+      .doc(`${AJUDANTE}_${orgId}`)
+      .delete();
+  });
+
+  it("um ESTRANHO não publica a sala do campeonato alheio", async () => {
+    await assert.rejects(
+      () =>
+        publicarSala(
+          { tournamentid: tid, roomid: "123456", roompassword: "abc" },
+          ctx(ESTRANHO)
+        ),
+      /não faz parte da organização/i
+    );
+  });
+
+  it("nem com a claim de plataforma na conta errada... ela é ESCAPE", async () => {
+    // A claim continua abrindo, de propósito: estes campeonatos seguram
+    // dinheiro de jogador, e sem uma porta de operação um dono sumido deixaria
+    // o prêmio preso para sempre. O que ela NÃO é, é o caminho normal.
+    const r = await publicarSala(
+      { tournamentid: tid, roomid: "123456", roompassword: "abc" },
+      ctx(ESTRANHO, true)
+    );
+    assert.equal(r.success, true);
+  });
+
+  it("o ADMINISTRADOR DA ORGANIZAÇÃO publica a sala do próprio campeonato",
+    async () => {
+      const r = await publicarSala(
+        { tournamentid: tid, roomid: "654321", roompassword: "xyz" },
+        ctx(AJUDANTE)
+      );
+      assert.equal(r.success, true);
+    });
+
+  it("e INICIA o campeonato", async () => {
+    // Era exatamente isto que ele não conseguia fazer.
+    const r = await iniciar({ tournamentid: tid }, ctx(AJUDANTE));
+    assert.equal(r.success, true);
+
+    const doc = await db.collection("tournaments").doc(tid).get();
+    assert.equal(doc.get("status"), "in_progress");
+  });
+
+  it("o DONO da organização também opera o campeonato do convidado",
+    async () => {
+      // A regra é a organização, não a autoria: quem responde pelo time
+      // responde pelo que o time criou.
+      await db
+        .collection("tournaments")
+        .doc(tid)
+        .update({ status: "open", current_participants: 0 });
+
+      const r = await cancelar({ tournamentid: tid }, ctx(DONO));
+      assert.equal(r.success, true);
+    });
+
+  it("removido da organização, ele perde a operação no mesmo instante",
+    async () => {
+      // A associação é um DOCUMENTO e não uma claim justamente para isto: uma
+      // claim revogada continuaria valendo até o token seguinte.
+      await remover({ organization_id: orgId, uid: AJUDANTE }, ctx(DONO));
+
+      await assert.rejects(
+        () =>
+          publicarSala(
+            { tournamentid: tid, roomid: "111111", roompassword: "zzz" },
+            ctx(AJUDANTE)
+          ),
+        /não faz parte da organização/i
+      );
+    });
 });

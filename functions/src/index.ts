@@ -1118,20 +1118,108 @@ async function pushToUsers(
   }
 }
 
+/**
+ * QUEM PODE OPERAR ESTE CAMPEONATO.
+ *
+ * O PROBLEMA QUE ISTO RESOLVE. Criar campeonato passou a depender de ser membro
+ * de uma organização, mas TUDO o que se faz com um campeonato depois — iniciar,
+ * publicar a sala, declarar resultado, cancelar, sortear a chave, apagar —
+ * continuava exigindo a claim de plataforma, que só o dono da plataforma tem.
+ * O administrador convidado criava um campeonato e não conseguia tocá-lo. A
+ * feature de organizações inteira existe para essas pessoas, e elas não podiam
+ * organizar nada.
+ *
+ * A REGRA É A ORGANIZAÇÃO DONA. Quem opera um campeonato é quem faz parte da
+ * organização que o criou — não quem por acaso tem uma claim. É a mesma
+ * pergunta que a criação faz, e as duas concordarem é o que evita um campeonato
+ * que alguém pode criar e não pode terminar.
+ *
+ * A CLAIM CONTINUA VALENDO, COMO ESCAPE. Estes campeonatos SEGURAM DINHEIRO de
+ * jogadores: um resultado não declarado é prêmio parado, um cancelamento não
+ * feito é inscrição não devolvida. Se a organização sumir — dono inativo, conta
+ * perdida —, sem esta porta ninguém no mundo consegue destravar o dinheiro. Ela
+ * é escape de operação, não o caminho normal, e todo uso dela fica no log.
+ *
+ * CAMPEONATO SEM ORGANIZAÇÃO cai na claim, e é a única resposta possível: os
+ * criados antes desta feature não têm dona, e recusar todo mundo transformaria
+ * cada um deles num campeonato que ninguém pode encerrar.
+ */
+async function assertTournamentOperator(
+  context: any,
+  tournamentData: Record<string, unknown> | undefined,
+  deniedMessage: string
+): Promise<{ readonly uid: string }> {
+  const auth = assertSignedIn(context, "Você precisa estar logado.");
+
+  const isPlatformAdmin = context?.auth?.token?.admin === true;
+  const organizationId =
+    typeof tournamentData?.organization_id === "string" &&
+    tournamentData.organization_id !== ""
+      ? tournamentData.organization_id
+      : null;
+
+  if (organizationId === null) {
+    // Legado: sem dona, só a plataforma responde por ele.
+    if (!isPlatformAdmin) {
+      throw new DomainError("permission-denied", deniedMessage);
+    }
+    return { uid: auth.uid };
+  }
+
+  const role = await roleInOrg(auth.uid, organizationId);
+  if (role !== null) return { uid: auth.uid };
+
+  if (isPlatformAdmin) {
+    // O escape, registrado. Um acesso que não deixa rastro é um acesso que
+    // ninguém consegue auditar depois.
+    console.warn(
+      "escape de plataforma: operação em campeonato de organização alheia",
+      { uid: auth.uid, organizationId }
+    );
+    return { uid: auth.uid };
+  }
+
+  throw new DomainError("permission-denied", deniedMessage);
+}
+
+/**
+ * Lê o campeonato só para decidir quem pode operá-lo.
+ *
+ * A SESSÃO É CONFERIDA ANTES DA LEITURA, e não é detalhe. Sem esta linha, um
+ * chamador sem sessão fazia o servidor ir ao banco antes de descobrir que não
+ * tinha nem por onde começar — e a recusa saía como erro interno em vez de
+ * "entre na sua conta". Autenticação primeiro, sempre: é o que mantém a recusa
+ * barata e a mensagem verdadeira.
+ */
+async function assertOperatorOfTournament(
+  context: any,
+  tournamentId: string,
+  deniedMessage: string
+): Promise<{ readonly uid: string }> {
+  assertSignedIn(context, "Você precisa estar logado.");
+
+  const snap = await db.collection("tournaments").doc(tournamentId).get();
+  if (!snap.exists) {
+    throw new DomainError("not-found", "Torneio não encontrado.");
+  }
+  return assertTournamentOperator(context, snap.data(), deniedMessage);
+}
+
 export const startTournamentHandler = async (
   data: any,
   context: any
 ): Promise<Record<string, unknown>> => {
   try {
-    assertAdmin(
-      context,
-      "Você precisa estar logado para iniciar o torneio.",
-      "Apenas admin pode iniciar o torneio."
-    );
-
     // Exactly `{ tournamentid }`; any extra key is invalid-argument.
     assertExactPayload(data, ["tournamentid"]);
     const tournamentid = normalizeTournamentId(data.tournamentid);
+
+    // QUEM OPERA É A ORGANIZAÇÃO DONA. Ver `assertTournamentOperator`.
+    await assertOperatorOfTournament(
+      context,
+      tournamentid,
+      "Você não faz parte da organização deste campeonato."
+    );
 
     const tournamentRef = db.collection("tournaments").doc(tournamentid);
     const roomRef = db.collection("tournament_rooms").doc(tournamentid);
@@ -1232,16 +1320,19 @@ export const declareTournamentResultHandler = async (
   context: any
 ): Promise<Record<string, unknown>> => {
   try {
-    assertAdmin(
-      context,
-      "Você precisa estar logado para declarar o resultado.",
-      "Apenas admin pode declarar o resultado."
-    );
+    assertSignedIn(context, "Você precisa estar logado.");
 
     // Exactly `{ tournamentid, winneruid }`. amount/externalid/prize/
     // transactionid/status/refs are NOT accepted keys → invalid-argument.
     assertExactPayload(data, ["tournamentid", "winneruid"]);
     const tournamentid = normalizeTournamentId(data.tournamentid);
+
+    // QUEM OPERA É A ORGANIZAÇÃO DONA. Ver `assertTournamentOperator`.
+    await assertOperatorOfTournament(
+      context,
+      tournamentid,
+      "Você não faz parte da organização deste campeonato."
+    );
     const winneruid = normalizeWinnerUid(data.winneruid);
 
     const tournamentRef = db.collection("tournaments").doc(tournamentid);
@@ -2043,14 +2134,17 @@ export const setTournamentRoomHandler = async (
   context: any
 ): Promise<Record<string, unknown>> => {
   try {
-    assertAdmin(
-      context,
-      "Você precisa estar logado para publicar a sala.",
-      "Apenas admin pode publicar a sala."
-    );
+    assertSignedIn(context, "Você precisa estar logado.");
 
     const { tournamentid, roomid, roompassword } =
       validateSetRoomPayload(data);
+
+    // QUEM OPERA É A ORGANIZAÇÃO DONA. Ver `assertTournamentOperator`.
+    await assertOperatorOfTournament(
+      context,
+      tournamentid,
+      "Você não faz parte da organização deste campeonato."
+    );
 
     const tournamentRef = db.collection("tournaments").doc(tournamentid);
     const roomRef = db.collection("tournament_rooms").doc(tournamentid);
@@ -2232,15 +2326,21 @@ export const cancelTournamentHandler = async (
   context: any
 ): Promise<Record<string, unknown>> => {
   try {
-    const callerAuth = assertAdmin(
+    const callerAuth = assertSignedIn(
       context,
-      "Você precisa estar logado para cancelar o torneio.",
-      "Apenas admin pode cancelar o torneio."
+      "Você precisa estar logado para cancelar o torneio."
     );
 
     // Exactly `{ tournamentid }`; any extra key is invalid-argument.
     assertExactPayload(data, ["tournamentid"]);
     const tournamentid = normalizeTournamentId(data.tournamentid);
+
+    // QUEM OPERA É A ORGANIZAÇÃO DONA. Ver `assertTournamentOperator`.
+    await assertOperatorOfTournament(
+      context,
+      tournamentid,
+      "Você não faz parte da organização deste campeonato."
+    );
 
     const tournamentRef = db.collection("tournaments").doc(tournamentid);
     const prizeTxRef = db
@@ -5366,14 +5466,17 @@ export const declareMatchResultHandler = async (
   context: any
 ): Promise<Record<string, unknown>> => {
   try {
-    assertAdmin(
-      context as any,
-      "Você precisa estar logado.",
-      "Apenas admin pode lançar resultados."
-    );
+    assertSignedIn(context as any, "Você precisa estar logado.");
     assertExactPayload(data, DECLARE_MATCH_KEYS);
 
     const tournamentid = String(data.tournamentid || "").trim();
+
+    // QUEM OPERA É A ORGANIZAÇÃO DONA. Ver `assertTournamentOperator`.
+    await assertOperatorOfTournament(
+      context,
+      tournamentid,
+      "Você não faz parte da organização deste campeonato."
+    );
     if (!tournamentid || tournamentid.includes("/")) {
       throw new DomainError("invalid-argument", "Campeonato inválido.");
     }
@@ -5475,14 +5578,17 @@ export const settleTournamentByPointsHandler = async (
   context: any
 ): Promise<Record<string, unknown>> => {
   try {
-    assertAdmin(
-      context as any,
-      "Você precisa estar logado.",
-      "Apenas admin pode encerrar campeonatos."
-    );
+    assertSignedIn(context as any, "Você precisa estar logado.");
     assertExactPayload(data, SETTLE_BY_POINTS_KEYS);
 
     const tournamentid = String(data.tournamentid || "").trim();
+
+    // QUEM OPERA É A ORGANIZAÇÃO DONA. Ver `assertTournamentOperator`.
+    await assertOperatorOfTournament(
+      context,
+      tournamentid,
+      "Você não faz parte da organização deste campeonato."
+    );
     if (!tournamentid || tournamentid.includes("/")) {
       throw new DomainError("invalid-argument", "Campeonato inválido.");
     }
@@ -5922,14 +6028,17 @@ export const drawCupBracketHandler = async (
   context: any
 ): Promise<Record<string, unknown>> => {
   try {
-    assertAdmin(
-      context,
-      "Você precisa estar logado para sortear o chaveamento.",
-      "Apenas admin pode sortear o chaveamento."
-    );
+    assertSignedIn(context, "Você precisa estar logado.");
 
     assertExactPayload(data, ["tournamentid"]);
     const tournamentid = normalizeTournamentId(data.tournamentid);
+
+    // QUEM OPERA É A ORGANIZAÇÃO DONA. Ver `assertTournamentOperator`.
+    await assertOperatorOfTournament(
+      context,
+      tournamentid,
+      "Você não faz parte da organização deste campeonato."
+    );
 
     const tournamentRef = db.collection("tournaments").doc(tournamentid);
 
@@ -6035,14 +6144,17 @@ export const declareCupMatchHandler = async (
   context: any
 ): Promise<Record<string, unknown>> => {
   try {
-    assertAdmin(
-      context,
-      "Você precisa estar logado para lançar um confronto.",
-      "Apenas admin pode lançar um confronto."
-    );
+    assertSignedIn(context, "Você precisa estar logado.");
 
     assertExactPayload(data, ["tournamentid", "match_number", "winner_uid"]);
     const tournamentid = normalizeTournamentId(data.tournamentid);
+
+    // QUEM OPERA É A ORGANIZAÇÃO DONA. Ver `assertTournamentOperator`.
+    await assertOperatorOfTournament(
+      context,
+      tournamentid,
+      "Você não faz parte da organização deste campeonato."
+    );
     const matchNumber = Number(data.match_number);
     const winnerUid = normalizeWinnerUid(data.winner_uid);
 
@@ -7211,14 +7323,17 @@ export const declareTournamentResultWithKillsHandler = async (
   context: any
 ): Promise<Record<string, unknown>> => {
   try {
-    assertAdmin(
-      context,
-      "Você precisa estar logado para declarar o resultado.",
-      "Apenas admin pode declarar o resultado."
-    );
+    assertSignedIn(context, "Você precisa estar logado.");
     assertExactPayload(data, DECLARE_WITH_KILLS_KEYS);
 
     const tournamentid = normalizeTournamentId(data.tournamentid);
+
+    // QUEM OPERA É A ORGANIZAÇÃO DONA. Ver `assertTournamentOperator`.
+    await assertOperatorOfTournament(
+      context,
+      tournamentid,
+      "Você não faz parte da organização deste campeonato."
+    );
     const winneruid = normalizeWinnerUid(data.winneruid);
     const reports = normalizeKillReports(data.kills);
 
@@ -7917,10 +8032,9 @@ export const deleteTournamentHandler = async (
   context: any
 ): Promise<Record<string, unknown>> => {
   try {
-    const callerAuth = assertAdmin(
+    const callerAuth = assertSignedIn(
       context,
-      "Você precisa estar logado para apagar o campeonato.",
-      "Apenas admin pode apagar o campeonato."
+      "Você precisa estar logado para apagar o campeonato."
     );
 
     assertExactPayload(data, ["tournamentid"]);
@@ -7932,11 +8046,26 @@ export const deleteTournamentHandler = async (
     // JÁ NÃO EXISTE É SUCESSO. Apagar é idempotente por natureza: quem chama de
     // novo quer o mesmo fim do mundo, e ele já está em vigor. Um not-found aqui
     // faria a tela mostrar erro para uma operação que deu certo.
+    //
+    // ESTA CHECAGEM VEM ANTES DA AUTORIZAÇÃO, e é a única do arquivo que vem.
+    // O portão comum recusa com "não encontrado" quando o campeonato sumiu, e
+    // pô-lo acima daqui transformava a segunda chamada — a repetição inofensiva
+    // de quem tocou duas vezes — num erro. Não há o que proteger num documento
+    // que não existe: a resposta não conta nada sobre ele que já não seja
+    // "não existe".
     if (!tournamentSnap.exists) {
       return { success: true, already_gone: true, refunded_registrations: 0 };
     }
 
     const tournamentData = tournamentSnap.data() ?? {};
+
+    // QUEM OPERA É A ORGANIZAÇÃO DONA. Ver `assertTournamentOperator`. Usa o
+    // documento já lido, em vez de lê-lo de novo.
+    await assertTournamentOperator(
+      context,
+      tournamentData,
+      "Você não faz parte da organização deste campeonato."
+    );
     const status = String(tournamentData.status || "")
       .trim()
       .toLowerCase();

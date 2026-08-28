@@ -133,19 +133,19 @@ describe("legacy contract rejected at runtime (no Firestore hit)", () => {
     );
   });
 
-  it("both reject an authenticated non-admin with permission-denied", async () => {
-    const userCtx = { auth: { uid: "u1", token: {} } };
-    await expectHttpsCode(
-      () =>
-        declareTournamentResultHandler(
-          { tournamentid: "t1", winneruid: "w1" },
-          userCtx
-        ),
-      "permission-denied"
-    );
-    await expectHttpsCode(
-      () => startTournamentHandler({ tournamentid: "t1" }, userCtx),
-      "permission-denied"
-    );
-  });
+  /**
+   * A RECUSA DE QUEM ESTÁ LOGADO MAS NÃO PODE MUDOU DE CAMADA.
+   *
+   * Este teste exigia `permission-denied` sem tocar no Firestore, e conseguia
+   * porque a resposta vinha só do token: sem a claim de plataforma, negado.
+   *
+   * Quem opera um campeonato passou a ser quem faz parte da ORGANIZAÇÃO DONA
+   * dele — e isso não se responde sem ler o campeonato. Provar a recusa exige
+   * agora um Firestore de verdade, e é o e2e que prova, em
+   * `functions/test/e2e/organizations.e2e.test.ts`.
+   *
+   * O que este arquivo continua provando é o que ele sabe provar sem banco: a
+   * ORDEM. Payload inválido e falta de sessão são recusados antes de qualquer
+   * leitura — os dois testes acima.
+   */
 });
