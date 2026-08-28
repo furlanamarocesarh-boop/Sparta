@@ -62,6 +62,7 @@ let perfilOrg: Handler;
 let iniciar: Handler;
 let publicarSala: Handler;
 let cancelar: Handler;
+let declarar: Handler;
 
 let orgId = "";
 
@@ -100,6 +101,7 @@ before(async () => {
   iniciar = mod.startTournamentHandler;
   publicarSala = mod.setTournamentRoomHandler;
   cancelar = mod.cancelTournamentHandler;
+  declarar = mod.declareTournamentResultHandler;
 
   await limpar();
   for (const u of [DONO, CONVIDADO, OUTRO, ESTRANHO]) {
@@ -672,5 +674,120 @@ describe("E2E — quem pode operar o campeonato", () => {
           ),
         /não faz parte da organização/i
       );
+    });
+});
+
+/**
+ * O REPASSE AO CRIADOR, contra um Firestore real.
+ *
+ * A regra de produto: "a sobra é do criador, a gente só tem a taxa mesmo". A
+ * plataforma retém 7,5% do arrecadado e o resto vai para o DONO da organização.
+ *
+ * O que só o emulador prova, e é o que mais importa: que taxa + repasse dão
+ * exatamente a margem, contra saldos de verdade. Um centavo criado ou perdido
+ * aqui é dinheiro que não existe — e não há de onde recontar.
+ */
+describe("E2E — o repasse ao criador", () => {
+  const JOGADOR = "e2e-payout-jogador";
+  let tid = "";
+
+  before(async () => {
+    await db.collection("users").doc(JOGADOR).set({ username: "Jogador" });
+    // Carteira do dono zerada, para a conta ser lida sem ruído.
+    await db.collection("wallets").doc(DONO).set({ balance: 0, total_won: 0 });
+    await db.collection("house").doc("cash").set({
+      balance_centavos: 0,
+      economy_type: "cash",
+    });
+
+    const criado = await criarCampeonato(
+      {
+        name: "Copa com repasse",
+        entry_fee: 100,
+        prize: 50,
+        max_players: 8,
+        game_mode: "solo",
+        economy_type: "cash",
+      },
+      ctx(DONO)
+    );
+    tid = criado.tournament_id;
+
+    // Uma inscrição paga de R$ 100 — o arrecadado do campeonato.
+    const tRef = db.collection("tournaments").doc(tid);
+    await db
+      .collection("registrations")
+      .doc(`${JOGADOR}_${tid}`)
+      .set({
+        user_ref: db.collection("users").doc(JOGADOR),
+        tournament_ref: tRef,
+        status: "registered",
+        entry_fee_snapshot: 100,
+        economy_type: "cash",
+      });
+    await db.collection("wallets").doc(JOGADOR).set({ balance: 0, total_won: 0 });
+    await tRef.update({ current_participants: 1, status: "in_progress" });
+  });
+
+  after(async () => {
+    await Promise.all([
+      db.collection("tournaments").doc(tid).delete(),
+      db.collection("registrations").doc(`${JOGADOR}_${tid}`).delete(),
+      db.collection("users").doc(JOGADOR).delete(),
+      db.collection("wallets").doc(JOGADOR).delete(),
+      db.collection("wallets").doc(DONO).delete(),
+      db.collection("transactions").doc(`house_${tid}`).delete(),
+      db.collection("transactions").doc(`creator_payout_${tid}`).delete(),
+      db.collection("transactions").doc(`prize_${tid}`).delete(),
+    ]);
+  });
+
+  it("a liquidação reparte: taxa para a casa, sobra para o dono da org",
+    async () => {
+      // Arrecadou R$ 100, premiou R$ 50 → margem R$ 50.
+      // Taxa: 7,5% de R$ 100 = R$ 7,50. Sobra do criador: R$ 42,50.
+      const r = await declarar({ tournamentid: tid, winneruid: JOGADOR }, ctx(DONO));
+      assert.equal(r.success, true);
+
+      const dono = await db.collection("wallets").doc(DONO).get();
+      assert.equal(dono.get("balance"), 42.5, "sobra do criador");
+
+      const casa = await db.collection("house").doc("cash").get();
+      assert.equal(casa.get("balance_centavos"), 750, "a casa fica só com a taxa");
+    });
+
+  it("taxa + repasse dão EXATAMENTE a margem", async () => {
+    // A invariante que vale mais que todas as outras juntas.
+    const casa = await db.collection("house").doc("cash").get();
+    const dono = await db.collection("wallets").doc(DONO).get();
+    const taxa = casa.get("balance_centavos");
+    const repasse = Math.round(dono.get("balance") * 100);
+
+    assert.equal(taxa + repasse, 50_00, "margem de R$ 50, ao centavo");
+  });
+
+  it("o repasse tem linha de razão própria, e NÃO conta como prêmio",
+    async () => {
+      const linha = await db
+        .collection("transactions")
+        .doc(`creator_payout_${tid}`)
+        .get();
+      assert.equal(linha.exists, true);
+      assert.equal(linha.get("category"), "creator_payout");
+      assert.equal(linha.get("amount"), 42.5);
+      assert.equal(linha.get("fee_centavos"), 750);
+
+      // `total_won` é "prêmios recebidos", e o perfil o mostra com esse nome.
+      // Repasse de organizador não é prêmio.
+      const dono = await db.collection("wallets").doc(DONO).get();
+      assert.equal(dono.get("total_won"), 0);
+    });
+
+  it("a linha da casa registra o que a casa FICOU, não a margem inteira",
+    async () => {
+      const linha = await db.collection("transactions").doc(`house_${tid}`).get();
+      assert.equal(linha.get("amount_centavos"), 750);
+      // A margem continua legível: arrecadado menos pago.
+      assert.equal(linha.get("pool_centavos") - linha.get("paid_centavos"), 50_00);
     });
 });

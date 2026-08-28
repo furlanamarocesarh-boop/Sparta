@@ -176,6 +176,22 @@ export const CATEGORY_SPECS: Readonly<Record<string, CategorySpec>> = {
     label: "Margem da casa (beta)",
     signed: true,
   },
+  /**
+   * O REPASSE AO CRIADOR — dinheiro SAINDO da plataforma para uma pessoa.
+   *
+   * `out`, e não `internal`: `house_margin` é interno porque a margem só troca
+   * de bolso dentro da casa. Este valor atravessa para a carteira de quem
+   * organizou e deixa de ser da plataforma, que é a definição de saída.
+   *
+   * Em reais, e não centavos, porque a linha carrega `amount` como toda
+   * transação de carteira — o razão da casa é que usa `amount_centavos`.
+   */
+  creator_payout: {
+    economy: ECONOMY_CASH,
+    shape: "reais",
+    direction: "out",
+    label: "Repasse ao criador",
+  },
   commission_accrued: {
     profitRole: "commission",
     economy: ECONOMY_CASH,

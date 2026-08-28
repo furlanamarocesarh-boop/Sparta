@@ -62,6 +62,12 @@ import {
   type OrgRole,
 } from "./domain/organization.js";
 import {
+  CREATOR_PAYOUT_CATEGORY,
+  creatorPayoutId,
+  decideCreatorPayout,
+  type CreatorPayoutDecision,
+} from "./domain/creatorPayout.js";
+import {
   checkDeviceToken,
   checkPlatform,
   NOTIFICATION_ROOM_OPEN,
@@ -1119,6 +1125,54 @@ async function pushToUsers(
 }
 
 /**
+ * QUEM RECEBE O REPASSE deste campeonato — o DONO da organização dona dele.
+ *
+ * O campeonato é do time, e o administrador convidado organiza em nome dele:
+ * quem recebe é quem responde pela organização, e acerta com os seus por fora.
+ * Foi a decisão do dono do produto, e ela evita a receita de uma organização
+ * se espalhar por várias carteiras sem ninguém poder redistribuir.
+ *
+ * NULL QUANDO NÃO HÁ A QUEM PAGAR: campeonato anterior às organizações, ou
+ * organização apagada. Inventar destinatário para dinheiro é a última coisa
+ * que este arquivo faria — sem destinatário, a margem inteira fica com a casa,
+ * exatamente como era antes.
+ */
+async function creatorPayeeOf(
+  tournamentData: Record<string, unknown> | undefined
+): Promise<string | null> {
+  const organizationId =
+    typeof tournamentData?.organization_id === "string" &&
+    tournamentData.organization_id !== ""
+      ? tournamentData.organization_id
+      : null;
+  if (organizationId === null) return null;
+
+  const orgSnap = await db
+    .collection(ORGANIZATIONS_COLLECTION)
+    .doc(organizationId)
+    .get();
+  if (!orgSnap.exists) return null;
+
+  const owner = orgSnap.get("owner_uid");
+  return typeof owner === "string" && owner !== "" ? owner : null;
+}
+
+/**
+ * QUANTO O CAIXA RECEBE depois da repartição.
+ *
+ * Margem negativa é subsídio: a casa paga, inteira. Margem positiva vira taxa
+ * para a casa e sobra para o criador — e quando não há repasse (beta, sem dono,
+ * ou taxa maior que a margem) a `feeCentavos` já é a margem toda, então esta
+ * conta devolve o comportamento antigo sem um `if` a mais.
+ */
+function houseDeltaOf(
+  marginCentavos: number,
+  payout: CreatorPayoutDecision
+): number {
+  return marginCentavos < 0 ? marginCentavos : payout.feeCentavos;
+}
+
+/**
  * QUEM PODE OPERAR ESTE CAMPEONATO.
  *
  * O PROBLEMA QUE ISTO RESOLVE. Criar campeonato passou a depender de ser membro
@@ -1345,6 +1399,13 @@ export const declareTournamentResultHandler = async (
       .collection("transactions")
       .doc(prizeTransactionId(tournamentid));
 
+
+    // Resolvido FORA da transação: ele depende de duas leituras encadeadas
+    // (campeonato, depois organização) e uma transação não pode encadear
+    // leituras assim sem se estender à toa.
+    const tournamentForPayee = await tournamentRef.get();
+    const creatorPayee = await creatorPayeeOf(tournamentForPayee.data());
+
     await db.runTransaction(async (transaction) => {
       // ── Reads that gate the decision (before any write) ──
       const tournamentSnap = await transaction.get(tournamentRef);
@@ -1531,6 +1592,14 @@ export const declareTournamentResultHandler = async (
       const settlementHouseSnap = await transaction.get(settlementHouseRef);
       const settlementHouseBefore = readHouseBalance(settlementHouseSnap);
 
+      // A CARTEIRA DE QUEM RECEBE O REPASSE, lida junto das outras: toda
+      // leitura antes de qualquer escrita, como a transação exige. Null quando
+      // não há a quem pagar, e aí nada abaixo se move.
+      const creatorPayeeWallet =
+        creatorPayee === null
+          ? null
+          : await transaction.get(db.collection("wallets").doc(creatorPayee));
+
       // The winner's registration must have been paid under the SAME economy
       // the tournament settles in. A legacy (provenance-less) registration is
       // accepted only on the cash path; a beta tournament with a cash or
@@ -1585,12 +1654,30 @@ export const declareTournamentResultHandler = async (
       // commit resolves to the exact same time.
       const stampedAt = FieldValue.serverTimestamp();
 
+      /**
+       * A REPARTIÇÃO. A margem deixou de ser inteira da casa.
+       *
+       * A plataforma retém a TAXA e o resto vai para o dono da organização —
+       * "a sobra é do criador, a gente só tem a taxa". Nenhum centavo é criado
+       * aqui: é a mesma margem, repartida, e `houseDeltaOf` devolve o
+       * comportamento antigo sozinho quando não há repasse (beta, sem dono, ou
+       * taxa maior que a sobra).
+       */
+      const payout = decideCreatorPayout({
+        economy,
+        poolCentavos: settlementPool.centavos,
+        paidCentavos: prizeCentavos,
+        payeeUid: creatorPayee,
+      });
+      const houseDelta = houseDeltaOf(settlementFunding.marginCentavos, payout);
+      const houseAfter = settlementHouseBefore + houseDelta;
+
       // ── The treasury moves once, outside the economy branch, because the
       // decision above already resolved which economy's house it belongs to.
       transaction.set(
         settlementHouseRef,
         {
-          [HOUSE_BALANCE_FIELD]: settlementFunding.houseAfterCentavos,
+          [HOUSE_BALANCE_FIELD]: houseAfter,
           economy_type: economy,
           updated_at: stampedAt,
         },
@@ -1599,9 +1686,13 @@ export const declareTournamentResultHandler = async (
       transaction.create(
         db.collection("transactions").doc(`house_${tournamentid}`),
         {
-          amount_centavos: settlementFunding.marginCentavos,
+          // O QUE A CASA FICOU, e não mais a margem inteira: com repasse, esta
+          // linha passa a registrar só a taxa. A margem continua legível —
+          // `pool_centavos` menos `paid_centavos` — e o repasse tem linha
+          // própria logo abaixo, então nada some da auditoria.
+          amount_centavos: houseDelta,
           amount_unit: "centavos",
-          balance_after_centavos: settlementFunding.houseAfterCentavos,
+          balance_after_centavos: houseAfter,
           category: houseMarginCategoryFor(economy),
           economy_type: economy,
           pool_centavos: settlementPool.centavos,
@@ -1613,6 +1704,37 @@ export const declareTournamentResultHandler = async (
           status: "completed",
         }
       );
+
+      if (payout.kind === "pay" && creatorPayeeWallet !== null) {
+        const previousPayee = storedReaisToCentavos(
+          creatorPayeeWallet.data()?.balance ?? 0,
+          "saldo do criador"
+        );
+        const payeeAfter = credit(previousPayee, payout.creatorCentavos);
+
+        transaction.update(creatorPayeeWallet.ref, {
+          balance: centavosToReais(payeeAfter),
+          updated_at: stampedAt,
+        });
+        // NÃO MEXE EM `total_won`. Aquele campo é "prêmios recebidos", e o
+        // perfil o mostra com esse nome — repasse de organizador não é prêmio.
+        transaction.create(
+          db.collection("transactions").doc(creatorPayoutId(tournamentid)),
+          {
+            amount: centavosToReais(payout.creatorCentavos),
+            category: CREATOR_PAYOUT_CATEGORY,
+            user_ref: db.collection("users").doc(creatorPayee!),
+            display_name: "",
+            tournament_ref: tournamentRef,
+            previous_balance: centavosToReais(previousPayee),
+            balance_after: centavosToReais(payeeAfter),
+            fee_centavos: payout.feeCentavos,
+            timestamp: stampedAt,
+            status: "completed",
+            external_id: creatorPayoutId(tournamentid),
+          }
+        );
+      }
 
       if (economy === ECONOMY_BETA_CREDIT) {
         // ── BETA settlement: the prize is Beta Credits, credited EXCLUSIVELY
@@ -5602,6 +5724,11 @@ export const settleTournamentByPointsHandler = async (
         .get(),
     ]);
 
+
+    // O destinatário do repasse, resolvido fora da transação.
+    const tournamentForPayee = await tournamentRef.get();
+    const creatorPayee = await creatorPayeeOf(tournamentForPayee.data());
+
     const result = await db.runTransaction(async (transaction) => {
       const tournamentSnap = await transaction.get(tournamentRef);
       if (!tournamentSnap.exists) {
@@ -5778,6 +5905,12 @@ export const settleTournamentByPointsHandler = async (
         );
       }
 
+      // A carteira de quem recebe o repasse, lida antes de qualquer escrita.
+      const creatorPayeeWallet =
+        creatorPayee === null
+          ? null
+          : await transaction.get(db.collection("wallets").doc(creatorPayee));
+
       // ── Read every wallet before writing any ────────────────────────────
       const wallets = await Promise.all(
         split.awards.map((award) =>
@@ -5853,10 +5986,27 @@ export const settleTournamentByPointsHandler = async (
         }
       });
 
+
+      /**
+       * A REPARTIÇÃO — a mesma do formato de vencedor único.
+       *
+       * A plataforma retém a TAXA e o resto vai para o dono da organização.
+       * `houseDeltaOf` devolve o comportamento antigo sozinho quando não há
+       * repasse: beta, sem dono, ou taxa maior que a sobra.
+       */
+      const payout = decideCreatorPayout({
+        economy,
+        poolCentavos: pool.centavos,
+        paidCentavos: split.paidCentavos,
+        payeeUid: creatorPayee,
+      });
+      const houseDelta = houseDeltaOf(funding.marginCentavos, payout);
+      const houseAfter = readHouseBalance(houseSnap) + houseDelta;
+
       transaction.set(
         houseRef,
         {
-          [HOUSE_BALANCE_FIELD]: funding.houseAfterCentavos,
+          [HOUSE_BALANCE_FIELD]: houseAfter,
           economy_type: economy,
           updated_at: stampedAt,
         },
@@ -5866,9 +6016,11 @@ export const settleTournamentByPointsHandler = async (
       transaction.create(
         db.collection("transactions").doc(`house_${tournamentid}`),
         {
-          amount_centavos: funding.marginCentavos,
+          // O QUE A CASA FICOU. A margem continua legível — arrecadado menos
+          // pago — e o repasse tem linha própria.
+          amount_centavos: houseDelta,
           amount_unit: "centavos",
-          balance_after_centavos: funding.houseAfterCentavos,
+          balance_after_centavos: houseAfter,
           category: houseMarginCategoryFor(economy),
           economy_type: economy,
           pool_centavos: pool.centavos,
@@ -5879,6 +6031,37 @@ export const settleTournamentByPointsHandler = async (
           status: "completed",
         }
       );
+
+      if (payout.kind === "pay" && creatorPayeeWallet !== null) {
+        const previousPayee = storedReaisToCentavos(
+          creatorPayeeWallet.data()?.balance ?? 0,
+          "saldo do criador"
+        );
+        const payeeAfter = credit(previousPayee, payout.creatorCentavos);
+
+        transaction.update(creatorPayeeWallet.ref, {
+          balance: centavosToReais(payeeAfter),
+          updated_at: stampedAt,
+        });
+        // NÃO MEXE EM `total_won`: repasse de organizador não é prêmio.
+        transaction.create(
+          db.collection("transactions").doc(creatorPayoutId(tournamentid)),
+          {
+            amount: centavosToReais(payout.creatorCentavos),
+            category: CREATOR_PAYOUT_CATEGORY,
+            user_ref: db.collection("users").doc(creatorPayee!),
+            display_name: "",
+            tournament_ref: tournamentRef,
+            previous_balance: centavosToReais(previousPayee),
+            balance_after: centavosToReais(payeeAfter),
+            fee_centavos: payout.feeCentavos,
+            timestamp: stampedAt,
+            status: "completed",
+            external_id: creatorPayoutId(tournamentid),
+          }
+        );
+      }
+
 
       transaction.update(tournamentRef, {
         status: "completed",
@@ -7339,6 +7522,11 @@ export const declareTournamentResultWithKillsHandler = async (
 
     const tournamentRef = db.collection("tournaments").doc(tournamentid);
 
+
+    // O destinatário do repasse, resolvido fora da transação.
+    const tournamentForPayee = await tournamentRef.get();
+    const creatorPayee = await creatorPayeeOf(tournamentForPayee.data());
+
     await db.runTransaction(async (transaction) => {
       // ── Every read first: Firestore requires it, and it also means the
       // decision below sees one consistent snapshot.
@@ -7478,6 +7666,11 @@ export const declareTournamentResultWithKillsHandler = async (
       const walletRefs = decision.payouts.map((p) =>
         db.collection("wallets").doc(p.uid)
       );
+      const creatorPayeeWallet =
+        creatorPayee === null
+          ? null
+          : await transaction.get(db.collection("wallets").doc(creatorPayee));
+
       const walletSnaps = await Promise.all(
         walletRefs.map((ref) => transaction.get(ref))
       );
@@ -7572,13 +7765,29 @@ export const declareTournamentResultWithKillsHandler = async (
         });
       });
 
+      /**
+       * A REPARTIÇÃO — a mesma dos outros dois formatos.
+       *
+       * A plataforma retém a TAXA e o resto vai para o dono da organização.
+       * `houseDeltaOf` devolve o comportamento antigo sozinho quando não há
+       * repasse: beta, sem dono, ou taxa maior que a sobra.
+       */
+      const creatorPayout = decideCreatorPayout({
+        economy,
+        poolCentavos: pool.centavos,
+        paidCentavos: decision.totalCentavos,
+        payeeUid: creatorPayee,
+      });
+      const houseDelta = houseDeltaOf(funding.marginCentavos, creatorPayout);
+      const houseAfter = readHouseBalance(houseSnap) + houseDelta;
+
       // ── The treasury moves by exactly what this tournament kept or spent.
       // `set` with merge, because the very first settlement of an economy is
       // what brings its house document into existence.
       transaction.set(
         houseRef,
         {
-          [HOUSE_BALANCE_FIELD]: funding.houseAfterCentavos,
+          [HOUSE_BALANCE_FIELD]: houseAfter,
           economy_type: economy,
           updated_at: stampedAt,
         },
@@ -7592,9 +7801,11 @@ export const declareTournamentResultWithKillsHandler = async (
       transaction.create(
         db.collection("transactions").doc(`house_${tournamentid}`),
         {
-          amount_centavos: funding.marginCentavos,
+          // O QUE A CASA FICOU. A margem continua legível — arrecadado menos
+          // pago — e o repasse tem linha própria.
+          amount_centavos: houseDelta,
           amount_unit: "centavos",
-          balance_after_centavos: funding.houseAfterCentavos,
+          balance_after_centavos: houseAfter,
           category: houseMarginCategoryFor(economy),
           economy_type: economy,
           pool_centavos: pool.centavos,
@@ -7607,6 +7818,37 @@ export const declareTournamentResultWithKillsHandler = async (
           status: "completed",
         }
       );
+
+      if (creatorPayout.kind === "pay" && creatorPayeeWallet !== null) {
+        const previousPayee = storedReaisToCentavos(
+          creatorPayeeWallet.data()?.balance ?? 0,
+          "saldo do criador"
+        );
+        const payeeAfter = credit(previousPayee, creatorPayout.creatorCentavos);
+
+        transaction.update(creatorPayeeWallet.ref, {
+          balance: centavosToReais(payeeAfter),
+          updated_at: stampedAt,
+        });
+        // NÃO MEXE EM `total_won`: repasse de organizador não é prêmio.
+        transaction.create(
+          db.collection("transactions").doc(creatorPayoutId(tournamentid)),
+          {
+            amount: centavosToReais(creatorPayout.creatorCentavos),
+            category: CREATOR_PAYOUT_CATEGORY,
+            user_ref: db.collection("users").doc(creatorPayee!),
+            display_name: "",
+            tournament_ref: tournamentRef,
+            previous_balance: centavosToReais(previousPayee),
+            balance_after: centavosToReais(payeeAfter),
+            fee_centavos: creatorPayout.feeCentavos,
+            timestamp: stampedAt,
+            status: "completed",
+            external_id: creatorPayoutId(tournamentid),
+          }
+        );
+      }
+
 
       // VENCEU. No formato por abate TODAS as linhas de razão têm categoria
       // `kill_prize`, inclusive a do campeão — então não há como um gatilho

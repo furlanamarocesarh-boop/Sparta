@@ -70,8 +70,12 @@ describe("a tabela de categorias é fechada e verdadeira", () => {
     );
   });
 
-  it("a tabela cobre as dezessete, em ordem estável", () => {
-    assert.equal(KNOWN_CATEGORIES.length, 17);
+  it("a tabela cobre as dezoito, em ordem estável", () => {
+    // ERAM DEZESSETE. A que entrou é `creator_payout`: a plataforma deixou de
+    // ficar com a margem inteira e passa a repassar ao criador o que sobra
+    // depois da taxa. Ela é `out` e não `internal` — o dinheiro atravessa para
+    // a carteira de uma pessoa e deixa de ser da casa.
+    assert.equal(KNOWN_CATEGORIES.length, 18);
     assert.deepEqual([...KNOWN_CATEGORIES].sort(), [...KNOWN_CATEGORIES]);
   });
 
