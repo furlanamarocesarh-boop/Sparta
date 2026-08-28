@@ -325,6 +325,80 @@ describe("E2E — contabilidade", () => {
     assert.equal(JSON.stringify(r).includes("total_centavos"), false);
   });
 
+  it("campeonato ABERTO não vira lucro — vira dinheiro RETIDO", async () => {
+    /**
+     * O defeito mais caro que esta auditoria achou, e ele estava vivo.
+     *
+     * A soma era "arrecadado de tudo menos pago do que já pagou", e um
+     * campeonato aberto arrecada sem ter pago nada. Dez campeonatos abertos de
+     * R$ 10 com 20 inscritos apareciam como "Lucro R$ 2.000" sobre dinheiro
+     * ainda REEMBOLSÁVEL — cancelar devolve tudo.
+     */
+    const criado = await criarCampeonato(
+      {
+        name: "Aberto e cheio",
+        entry_fee: 10,
+        prize: 50,
+        max_players: 8,
+        game_mode: "solo",
+        economy_type: "beta_credit",
+      },
+      ctx(DONO)
+    );
+    await db
+      .collection("tournaments")
+      .doc(criado.tournament_id)
+      .update({ current_participants: 5 });
+
+    const r = await contabilidade(
+      { organization_id: orgId, from_ms: null, to_ms: null },
+      ctx(DONO)
+    );
+    const beta = r.economies.find((e: any) => e.economy === "beta_credit");
+
+    assert.equal(beta.held_centavos, 5000, "5 x R$ 10 ficam retidos");
+    assert.equal(beta.open_tournaments, 1);
+    assert.equal(
+      beta.collected_centavos,
+      0,
+      "nada arrecadado ainda: o campeonato não liquidou"
+    );
+    assert.equal(beta.profit_centavos, 0, "e portanto lucro nenhum");
+
+    await db.collection("tournaments").doc(criado.tournament_id).delete();
+  });
+
+  it("um documento estragado NÃO derruba a contabilidade inteira", async () => {
+    // `resolveTournamentEconomy` lança numa economia irreconhecível, e a
+    // chamada estava fora de qualquer proteção por documento.
+    const ruim = db.collection("tournaments").doc();
+    await ruim.set({
+      name: "Corrompido",
+      organization_id: orgId,
+      economy_type: "moeda_que_nao_existe",
+      entry_fee: 10,
+      current_participants: 3,
+      created_at: admin.firestore.Timestamp.now(),
+    });
+
+    const r = await contabilidade(
+      { organization_id: orgId, from_ms: null, to_ms: null },
+      ctx(DONO)
+    );
+    assert.equal(r.skipped_tournaments, 1, "pulado e DECLARADO");
+    assert.ok(Array.isArray(r.economies), "a resposta continua inteira");
+
+    await ruim.delete();
+  });
+
+  it("a resposta declara se a leitura bateu no teto", async () => {
+    const r = await contabilidade(
+      { organization_id: orgId, from_ms: null, to_ms: null },
+      ctx(DONO)
+    );
+    assert.equal(r.truncated, false);
+  });
+
   it("um período que começa depois de terminar é recusado", async () => {
     await assert.rejects(
       () =>

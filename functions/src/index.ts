@@ -5799,6 +5799,21 @@ export const settleTournamentByPointsHandler = async (
             amount: centavosToReais(a.centavos),
           })),
           unclaimed: centavosToReais(split.unclaimedCentavos),
+
+          /**
+           * QUANTO ENTROU E QUANTO SAIU, gravados no resultado.
+           *
+           * Faltavam, e a falta não era inofensiva: toda contabilidade que
+           * pergunta "quanto este campeonato pagou" lê `total_paid ?? prize`, e
+           * nos formatos de pontos e Copa as duas chaves eram ausentes. O
+           * resultado era um campeonato que arrecadou e não pagou nada — ou
+           * seja, a arrecadação inteira aparecendo como lucro.
+           *
+           * `total_paid` é o que foi REALMENTE distribuído, sem o não
+           * reclamado: um prêmio de posição que ninguém ocupou não saiu daqui.
+           */
+          pool: centavosToReais(pool.centavos),
+          total_paid: centavosToReais(split.paidCentavos),
         },
         updated_at: stampedAt,
       });
@@ -8636,47 +8651,95 @@ export const getOrganizationAccountingHandler = async (
       .limit(ORG_ACCOUNTING_READ_LIMIT)
       .get();
 
-    const zero = () => ({ collectedCentavos: 0, paidCentavos: 0, tournaments: 0 });
+    const zero = () => ({
+      collectedCentavos: 0,
+      paidCentavos: 0,
+      tournaments: 0,
+      /** Arrecadado em campeonatos que AINDA NÃO liquidaram. Ver abaixo. */
+      heldCentavos: 0,
+      openTournaments: 0,
+    });
     const totals: Record<string, ReturnType<typeof zero>> = {
       cash: zero(),
       beta_credit: zero(),
     };
     let undated = 0;
+    let skipped = 0;
 
     for (const doc of snapshot.docs) {
-      const createdAt = doc.get("created_at");
-      const createdMs =
-        createdAt instanceof Timestamp ? createdAt.toMillis() : null;
-      if (createdMs === null) {
-        // Sem data não entra em janela nenhuma — nem na de "sempre", onde
-        // entraria calado e inflaria justamente o número mais olhado.
-        undated += 1;
-        continue;
-      }
-      if (fromMs !== null && createdMs < fromMs) continue;
-      if (toMs !== null && createdMs > toMs) continue;
+      /**
+       * UM DOCUMENTO ESTRAGADO NÃO DERRUBA A CONTABILIDADE INTEIRA.
+       *
+       * `resolveTournamentEconomy` LANÇA quando a economia não é reconhecida, e
+       * a chamada estava fora de qualquer proteção por documento: um único
+       * campeonato com o campo corrompido transformava a tela toda em erro. O
+       * comentário logo abaixo já prometia o contrário — agora a promessa é
+       * cumprida, e o que foi pulado é declarado em vez de sumir calado.
+       */
+      try {
+        const createdAt = doc.get("created_at");
+        const createdMs =
+          createdAt instanceof Timestamp ? createdAt.toMillis() : null;
+        if (createdMs === null) {
+          // Sem data não entra em janela nenhuma — nem na de "sempre", onde
+          // entraria calado e inflaria justamente o número mais olhado.
+          undated += 1;
+          continue;
+        }
+        if (fromMs !== null && createdMs < fromMs) continue;
+        if (toMs !== null && createdMs > toMs) continue;
 
-      const economy = resolveTournamentEconomy(doc.data() ?? {});
-      const bucket = totals[economy];
-      bucket.tournaments += 1;
+        const economy = resolveTournamentEconomy(doc.data() ?? {});
+        const bucket = totals[economy];
+        bucket.tournaments += 1;
 
-      // `inspectReais` em vez de `toCentavos`: um valor corrompido num
-      // campeonato antigo não pode derrubar a contabilidade inteira da
-      // organização. Ele é ignorado nesta linha e a soma segue — o oposto de
-      // uma liquidação, onde um valor ruim TEM que travar tudo.
-      const entryFee = inspectReais(doc.get("entry_fee"), { allowZero: true });
-      const players = Number(doc.get("current_participants") ?? 0);
-      if (entryFee.ok && Number.isSafeInteger(players) && players > 0) {
-        bucket.collectedCentavos += entryFee.centavos * players;
-      }
+        // `inspectReais` em vez de `toCentavos`: um valor corrompido num
+        // campeonato antigo não pode derrubar a contabilidade inteira da
+        // organização. Ele é ignorado nesta linha e a soma segue — o oposto de
+        // uma liquidação, onde um valor ruim TEM que travar tudo.
+        const entryFee = inspectReais(doc.get("entry_fee"), { allowZero: true });
+        const players = Number(doc.get("current_participants") ?? 0);
+        const collected =
+          entryFee.ok && Number.isSafeInteger(players) && players > 0
+            ? entryFee.centavos * players
+            : 0;
 
-      const result = doc.get("result");
-      if (result && typeof result === "object") {
+        /**
+         * SÓ CAMPEONATO LIQUIDADO ENTRA NA CONTA. Este é o conserto que mais
+         * importa neste arquivo.
+         *
+         * A soma antes era "arrecadado de TUDO menos pago do que já pagou" — e
+         * um campeonato aberto arrecada sem ter pago nada. Dez campeonatos
+         * abertos de R$ 10 com 20 inscritos apareciam como "Lucro R$ 2.000"
+         * sobre dinheiro que ainda é REEMBOLSÁVEL: cancelar devolve tudo.
+         *
+         * Agora o dinheiro de quem ainda não liquidou vai para uma linha
+         * própria, `held`, que é o que ele é — dinheiro retido, não ganho. É a
+         * mesma leitura que o painel do criador já fazia, e as duas telas
+         * discordavam justamente no estado mais comum que um campeonato tem.
+         */
+        const result = doc.get("result");
+        const settled =
+          doc.get("status") === "completed" &&
+          result !== null &&
+          typeof result === "object";
+
+        if (!settled) {
+          bucket.heldCentavos += collected;
+          bucket.openTournaments += 1;
+          continue;
+        }
+
+        bucket.collectedCentavos += collected;
+
         const paid = inspectReais(
           (result as any).total_paid ?? (result as any).prize,
           { allowZero: true }
         );
         if (paid.ok) bucket.paidCentavos += paid.centavos;
+      } catch (error) {
+        skipped += 1;
+        console.error("accounting: campeonato ignorado", doc.id, error);
       }
     }
 
@@ -8685,12 +8748,24 @@ export const getOrganizationAccountingHandler = async (
       from_ms: fromMs,
       to_ms: toMs,
       undated_tournaments: undated,
+      // Documentos que não deu para ler. Declarados em vez de sumirem: um
+      // número menor sem explicação é pior que um número menor explicado.
+      skipped_tournaments: skipped,
+      /**
+       * A LEITURA BATEU NO TETO. Sem isto, a organização que passa de mil
+       * campeonatos vê um total menor e não tem como saber disso — e o número
+       * mais olhado da tela vira uma amostra apresentada como fato.
+       */
+      truncated: snapshot.size >= ORG_ACCOUNTING_READ_LIMIT,
       economies: Object.entries(totals).map(([economy, t]) => ({
         economy,
         tournaments: t.tournaments,
         collected_centavos: t.collectedCentavos,
         paid_centavos: t.paidCentavos,
-        // O lucro é derivado aqui e não no cliente: duas contas para o mesmo
+        // O que ainda não liquidou, à parte. Nunca somado com o resto.
+        held_centavos: t.heldCentavos,
+        open_tournaments: t.openTournaments,
+        // O saldo é derivado aqui e não no cliente: duas contas para o mesmo
         // número acabam discordando, e a que a tela mostra tem que ser a que
         // o servidor sabe defender.
         profit_centavos: t.collectedCentavos - t.paidCentavos,
