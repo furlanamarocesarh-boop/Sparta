@@ -63,6 +63,7 @@ let iniciar: Handler;
 let publicarSala: Handler;
 let cancelar: Handler;
 let declarar: Handler;
+let declararAbates: Handler;
 
 let orgId = "";
 
@@ -102,6 +103,7 @@ before(async () => {
   publicarSala = mod.setTournamentRoomHandler;
   cancelar = mod.cancelTournamentHandler;
   declarar = mod.declareTournamentResultHandler;
+  declararAbates = mod.declareTournamentResultWithKillsHandler;
 
   await limpar();
   for (const u of [DONO, CONVIDADO, OUTRO, ESTRANHO]) {
@@ -790,4 +792,84 @@ describe("E2E — o repasse ao criador", () => {
       // A margem continua legível: arrecadado menos pago.
       assert.equal(linha.get("pool_centavos") - linha.get("paid_centavos"), 50_00);
     });
+});
+
+/**
+ * O REPASSE VALE NOS TRÊS FORMATOS, e este prova o de ABATE.
+ *
+ * Os três caminhos de liquidação em dinheiro chamam a mesma decisão, mas cada
+ * um tem a sua transação — e "compila igual" não é prova de que o dinheiro
+ * chega. Foi exatamente esse raciocínio que deixou o contador de vitórias
+ * cobrindo um formato de quatro.
+ */
+describe("E2E — o repasse no formato POR ABATE", () => {
+  const P1 = "e2e-payout-abate-1";
+  let tid = "";
+
+  before(async () => {
+    await db.collection("users").doc(P1).set({ username: "Abatedor" });
+    await db.collection("wallets").doc(P1).set({ balance: 0, total_won: 0 });
+    await db.collection("wallets").doc(DONO).set({ balance: 0, total_won: 0 });
+    await db.collection("house").doc("cash").set({
+      balance_centavos: 0,
+      economy_type: "cash",
+    });
+
+    const criado = await criarCampeonato(
+      {
+        name: "Copa por abate",
+        entry_fee: 100,
+        prize: 0,
+        kill_prize: 10,
+        max_players: 8,
+        game_mode: "solo",
+        economy_type: "cash",
+      },
+      ctx(DONO)
+    );
+    tid = criado.tournament_id;
+
+    const tRef = db.collection("tournaments").doc(tid);
+    await db.collection("registrations").doc(`${P1}_${tid}`).set({
+      user_ref: db.collection("users").doc(P1),
+      tournament_ref: tRef,
+      status: "registered",
+      entry_fee_snapshot: 100,
+      economy_type: "cash",
+    });
+    await tRef.update({ current_participants: 1, status: "in_progress" });
+  });
+
+  after(async () => {
+    await Promise.all([
+      db.collection("tournaments").doc(tid).delete(),
+      db.collection("registrations").doc(`${P1}_${tid}`).delete(),
+      db.collection("users").doc(P1).delete(),
+      db.collection("wallets").doc(P1).delete(),
+      db.collection("wallets").doc(DONO).delete(),
+      db.collection("transactions").doc(`house_${tid}`).delete(),
+      db.collection("transactions").doc(`creator_payout_${tid}`).delete(),
+    ]);
+  });
+
+  it("taxa para a casa, sobra para o dono — também aqui", async () => {
+    // Arrecadou R$ 100. Um jogador com 2 abates a R$ 10 leva R$ 20.
+    // Margem R$ 80; taxa 7,5% de R$ 100 = R$ 7,50; sobra R$ 72,50.
+    const r = await declararAbates(
+      { tournamentid: tid, winneruid: P1, kills: [{ uid: P1, kills: 2 }] },
+      ctx(DONO)
+    );
+    assert.equal(r.success, true);
+
+    const dono = await db.collection("wallets").doc(DONO).get();
+    const casa = await db.collection("house").doc("cash").get();
+
+    assert.equal(casa.get("balance_centavos"), 750, "a casa fica só com a taxa");
+    assert.equal(dono.get("balance"), 72.5, "sobra do criador");
+    assert.equal(
+      casa.get("balance_centavos") + Math.round(dono.get("balance") * 100),
+      80_00,
+      "taxa + repasse = margem, ao centavo"
+    );
+  });
 });
