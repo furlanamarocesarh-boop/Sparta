@@ -785,6 +785,26 @@ describe("E2E — o repasse ao criador", () => {
       assert.equal(dono.get("total_won"), 0);
     });
 
+  it("a contabilidade da organização mostra a divisão, lida do resultado",
+    async () => {
+      // Lida do que foi GRAVADO na liquidação, nunca recalculada: recalcular
+      // daria um número que nunca aconteceu para todo campeonato liquidado
+      // antes de o repasse existir.
+      const r = await contabilidade(
+        { organization_id: orgId, from_ms: null, to_ms: null },
+        ctx(DONO)
+      );
+      const cash = r.economies.find((e: any) => e.economy === "cash");
+
+      assert.equal(cash.fee_centavos, 750, "a taxa da plataforma");
+      assert.equal(cash.payout_centavos, 42_50, "o repasse ao criador");
+      assert.equal(
+        cash.fee_centavos + cash.payout_centavos,
+        cash.profit_centavos,
+        "taxa + repasse = margem, também na contabilidade"
+      );
+    });
+
   it("a linha da casa registra o que a casa FICOU, não a margem inteira",
     async () => {
       const linha = await db.collection("transactions").doc(`house_${tid}`).get();

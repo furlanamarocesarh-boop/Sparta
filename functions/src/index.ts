@@ -1779,6 +1779,18 @@ export const declareTournamentResultHandler = async (
             prize: prizeReais,
             transaction_ref: prizeTxRef,
             economy_type: ECONOMY_BETA_CREDIT,
+            /**
+             * A DIVISÃO, GRAVADA NO RESULTADO.
+             *
+             * A contabilidade precisa dizer quanto foi taxa e quanto foi repasse, e
+             * recalcular isso depois seria adivinhar: um campeonato liquidado ANTES
+             * de o repasse existir daria um número que nunca aconteceu. Gravado
+             * aqui, quem não tem os campos é justamente quem ficou inteiro com a
+             * casa — que é a verdade sobre ele.
+             */
+            platform_fee_centavos: payout.feeCentavos,
+            creator_payout_centavos:
+              payout.kind === "pay" ? payout.creatorCentavos : 0,
             declared_at: stampedAt,
             paid_at: stampedAt,
           },
@@ -1837,6 +1849,18 @@ export const declareTournamentResultHandler = async (
           registration_ref: registrationRef,
           prize: prizeReais,
           transaction_ref: prizeTxRef,
+          /**
+           * A DIVISÃO, GRAVADA NO RESULTADO.
+           *
+           * A contabilidade precisa dizer quanto foi taxa e quanto foi repasse, e
+           * recalcular isso depois seria adivinhar: um campeonato liquidado ANTES
+           * de o repasse existir daria um número que nunca aconteceu. Gravado
+           * aqui, quem não tem os campos é justamente quem ficou inteiro com a
+           * casa — que é a verdade sobre ele.
+           */
+          platform_fee_centavos: payout.feeCentavos,
+          creator_payout_centavos:
+            payout.kind === "pay" ? payout.creatorCentavos : 0,
           declared_at: stampedAt,
           paid_at: stampedAt,
         },
@@ -6103,6 +6127,10 @@ export const settleTournamentByPointsHandler = async (
            */
           pool: centavosToReais(pool.centavos),
           total_paid: centavosToReais(split.paidCentavos),
+          // A divisão, gravada. Ver a nota no formato de vencedor único.
+          platform_fee_centavos: payout.feeCentavos,
+          creator_payout_centavos:
+            payout.kind === "pay" ? payout.creatorCentavos : 0,
         },
         updated_at: stampedAt,
       });
@@ -7860,6 +7888,10 @@ export const declareTournamentResultWithKillsHandler = async (
         result: {
           mode: "per_kill",
           winner_uid: winneruid,
+          // A divisão, gravada. Ver a nota no formato de vencedor único.
+          platform_fee_centavos: creatorPayout.feeCentavos,
+          creator_payout_centavos:
+            creatorPayout.kind === "pay" ? creatorPayout.creatorCentavos : 0,
           winner_ref: db.collection("users").doc(winneruid),
           economy_type: economy,
           kill_prize: centavosToReais(killPrize.centavos),
@@ -9025,6 +9057,10 @@ export const getOrganizationAccountingHandler = async (
     const zero = () => ({
       collectedCentavos: 0,
       paidCentavos: 0,
+      /** O que ficou com a plataforma. */
+      feeCentavos: 0,
+      /** O que foi repassado a quem organizou. */
+      payoutCentavos: 0,
       tournaments: 0,
       /** Arrecadado em campeonatos que AINDA NÃO liquidaram. Ver abaixo. */
       heldCentavos: 0,
@@ -9108,6 +9144,27 @@ export const getOrganizationAccountingHandler = async (
           { allowZero: true }
         );
         if (paid.ok) bucket.paidCentavos += paid.centavos;
+
+        /**
+         * A DIVISÃO VEM GRAVADA, e não é recalculada.
+         *
+         * Recalcular daria um número que nunca aconteceu para todo campeonato
+         * liquidado antes de o repasse existir. Ausente significa exatamente o
+         * que significa: a margem inteira ficou com a casa, e é isso que a
+         * conta abaixo devolve.
+         */
+        const feeRaw = (result as any).platform_fee_centavos;
+        const payoutRaw = (result as any).creator_payout_centavos;
+        const temDivisao =
+          Number.isSafeInteger(feeRaw) && Number.isSafeInteger(payoutRaw);
+
+        if (temDivisao) {
+          bucket.feeCentavos += Math.max(0, feeRaw as number);
+          bucket.payoutCentavos += Math.max(0, payoutRaw as number);
+        } else {
+          const margem = collected - (paid.ok ? paid.centavos : 0);
+          if (margem > 0) bucket.feeCentavos += margem;
+        }
       } catch (error) {
         skipped += 1;
         console.error("accounting: campeonato ignorado", doc.id, error);
@@ -9136,6 +9193,10 @@ export const getOrganizationAccountingHandler = async (
         // O que ainda não liquidou, à parte. Nunca somado com o resto.
         held_centavos: t.heldCentavos,
         open_tournaments: t.openTournaments,
+        // A repartição da margem: o que ficou com a plataforma e o que foi
+        // repassado. Os dois somados dão `profit_centavos`.
+        fee_centavos: t.feeCentavos,
+        payout_centavos: t.payoutCentavos,
         // O saldo é derivado aqui e não no cliente: duas contas para o mesmo
         // número acabam discordando, e a que a tela mostra tem que ser a que
         // o servidor sabe defender.
