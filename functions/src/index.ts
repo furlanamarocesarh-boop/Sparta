@@ -9249,19 +9249,24 @@ export const getOrganizationProfileHandler = async (
       throw new DomainError("invalid-argument", "Organização inválida.");
     }
 
-    const orgSnap = await db
-      .collection(ORGANIZATIONS_COLLECTION)
-      .doc(orgId)
-      .get();
-    if (!orgSnap.exists) {
-      throw new DomainError("not-found", "Organização não encontrada.");
-    }
-
     const ofThisOrg = db
       .collection("tournaments")
       .where("organization_id", "==", orgId);
 
-    const [memberSnap, tournamentSnap, countSnap] = await Promise.all([
+    /**
+     * TUDO DE UMA VEZ, e a existência conferida depois.
+     *
+     * Isto era uma ida ao banco pela organização, e SÓ ENTÃO as outras três em
+     * paralelo — duas viagens em série numa página que se abre por toque. As
+     * quatro não dependem uma da outra: as três de baixo são consultas por
+     * `orgId`, que já veio no pedido, e devolvem vazio sozinhas se a
+     * organização não existir.
+     *
+     * O custo de errar é nulo: uma organização inexistente faz três consultas
+     * que não acham nada e a recusa sai igual, logo abaixo.
+     */
+    const [orgSnap, memberSnap, tournamentSnap, countSnap] = await Promise.all([
+      db.collection(ORGANIZATIONS_COLLECTION).doc(orgId).get(),
       db
         .collection(ORG_MEMBERS_COLLECTION)
         .where("org_id", "==", orgId)
@@ -9278,6 +9283,10 @@ export const getOrganizationProfileHandler = async (
        */
       ofThisOrg.count().get(),
     ]);
+
+    if (!orgSnap.exists) {
+      throw new DomainError("not-found", "Organização não encontrada.");
+    }
 
     // Uma leitura por membro, e o teto é nove. O apelido e o pseudônimo moram
     // em coleções diferentes, então são dois documentos por pessoa — dezoito
